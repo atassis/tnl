@@ -101,7 +101,11 @@ mod tests {
 
     #[test]
     fn control_msg_roundtrip_simple_variants() {
-        for msg in [ControlMsg::Heartbeat, ControlMsg::HeartbeatAck, ControlMsg::Close] {
+        for msg in [
+            ControlMsg::Heartbeat,
+            ControlMsg::HeartbeatAck,
+            ControlMsg::Close,
+        ] {
             let s = serde_json::to_string(&msg).unwrap();
             let back: ControlMsg = serde_json::from_str(&s).unwrap();
             assert_eq!(msg, back);
@@ -127,7 +131,9 @@ mod tests {
 
     #[test]
     fn control_msg_roundtrip_closing() {
-        let msg = ControlMsg::Closing { reason: "server restart".into() };
+        let msg = ControlMsg::Closing {
+            reason: "server restart".into(),
+        };
         let back: ControlMsg = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
         assert_eq!(msg, back);
     }

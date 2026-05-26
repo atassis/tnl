@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -25,7 +26,8 @@ pub trait Session: Send + Sync {
     /// Returns `None` when the session is closed.
     async fn accept_stream(&mut self) -> anyhow::Result<Option<Pin<Box<dyn Stream>>>>;
 
-    /// Send a ping and await pong; returns the round-trip time.
+    /// Best-effort liveness check: opens a substream and shuts it down,
+    /// returning approximate local elapsed time. Not a true round-trip RTT.
     async fn ping(&mut self) -> anyhow::Result<Duration>;
 
     /// Gracefully close the session.
@@ -44,10 +46,27 @@ pub struct YamuxSession {
     open_tx: mpsc::UnboundedSender<oneshot::Sender<yamux::Result<yamux::Stream>>>,
     /// Receiver side for inbound streams surfaced by the driver task.
     inbound_rx: mpsc::UnboundedReceiver<yamux::Stream>,
-    /// Sender for close signal to driver.
+    /// Sender for close signal to driver (explicit graceful close).
     close_tx: Option<oneshot::Sender<()>>,
-    /// Driver task handle (kept to ensure the task outlives the session).
-    _driver: JoinHandle<()>,
+    /// Driver task handle.  Dropping `YamuxSession` closes all channel senders,
+    /// which the driver detects and uses to perform a graceful yamux `poll_close`
+    /// before exiting.  We keep the handle (rather than calling `abort()`) so
+    /// that buffered writes can be flushed; the driver cannot deadlock after
+    /// the C1 fix.
+    #[allow(dead_code)]
+    driver: JoinHandle<()>,
+}
+
+impl Drop for YamuxSession {
+    fn drop(&mut self) {
+        // Dropping `close_tx` and `open_tx` (via field drop after this impl runs)
+        // signals the driver to call poll_close and exit gracefully.  We do NOT
+        // call self.driver.abort() here because that would race with the yamux
+        // write-buffer flush: bytes written to a stream and shutdown()-ed would be
+        // silently discarded if the driver task is cancelled before the frames
+        // reach the underlying IO.  The driver is guaranteed to exit because C1 is
+        // fixed (no deadlock path remains) and both channel senders are being dropped.
+    }
 }
 
 impl std::fmt::Debug for YamuxSession {
@@ -65,7 +84,9 @@ impl YamuxSession {
         // wrap the tokio IO resource with the tokio_util compat adapter.
         let conn = Connection::new(io.compat(), Config::default(), mode);
 
-        let (open_tx, open_rx) = mpsc::unbounded_channel::<oneshot::Sender<yamux::Result<yamux::Stream>>>();
+        let (open_tx, open_rx) =
+            mpsc::unbounded_channel::<oneshot::Sender<yamux::Result<yamux::Stream>>>();
+        // SAFETY: unbounded acceptable for v0.1.0-alpha — auth gates session, one substream per HTTP request, bounded rate.
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<yamux::Stream>();
         let (close_tx, close_rx) = oneshot::channel::<()>();
 
@@ -75,7 +96,7 @@ impl YamuxSession {
             open_tx,
             inbound_rx,
             close_tx: Some(close_tx),
-            _driver: driver,
+            driver,
         }
     }
 
@@ -109,23 +130,74 @@ async fn driver_task<T>(
 ) where
     T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    // Pending open requests that are waiting for the connection to be ready.
-    let mut pending_open: Vec<oneshot::Sender<yamux::Result<yamux::Stream>>> = Vec::new();
+    // VecDeque for O(1) push_front/pop_front used in the C1 deadlock fix.
+    let mut pending_open: VecDeque<oneshot::Sender<yamux::Result<yamux::Stream>>> = VecDeque::new();
 
     loop {
         // Drain any new open requests into pending_open without blocking.
         while let Ok(req) = open_rx.try_recv() {
-            pending_open.push(req);
+            pending_open.push_back(req);
         }
 
-        // If there are pending open requests, try to fulfill them one per loop
-        // iteration to avoid starving inbound polling.
-        if !pending_open.is_empty() {
-            let result =
-                std::future::poll_fn(|cx: &mut Context<'_>| conn.poll_new_outbound(cx)).await;
-            let requester = pending_open.remove(0);
-            // If the requester dropped their receiver, just ignore the error.
-            let _ = requester.send(result);
+        // If there are pending open requests, race poll_new_outbound against
+        // poll_next_inbound so that ACK frames continue to be ingested and the
+        // yamux waker fires even when ack_backlog >= MAX_ACK_BACKLOG (256).
+        // Without driving inbound concurrently the driver would deadlock: outbound
+        // blocks waiting for an ACK, but the ACK can only arrive via inbound.
+        //
+        // We implement the race safely with a combined future that polls both
+        // operations in a single poll call: try outbound first; if it's pending,
+        // try inbound so ACK frames are processed and the outbound waker is stored.
+        if let Some(requester) = pending_open.pop_front() {
+            enum PendingAction {
+                Outbound(yamux::Result<yamux::Stream>),
+                Inbound(Option<yamux::Result<yamux::Stream>>),
+            }
+
+            tokio::select! {
+                biased;
+
+                // Explicit `close()` was called → graceful poll_close, exit.
+                _ = &mut close_rx => {
+                    std::future::poll_fn(|cx: &mut Context<'_>| {
+                        conn.poll_close(cx).map_err(|_| ())
+                    }).await.ok();
+                    return;
+                }
+
+                // Combined future: tries outbound; if pending, drives inbound.
+                // This is safe: both polls happen sequentially within a single
+                // future::poll invocation — only one exclusive borrow at a time.
+                action = std::future::poll_fn(|cx: &mut Context<'_>| {
+                    match conn.poll_new_outbound(cx) {
+                        Poll::Ready(result) => Poll::Ready(PendingAction::Outbound(result)),
+                        Poll::Pending => match conn.poll_next_inbound(cx) {
+                            Poll::Ready(inbound) => Poll::Ready(PendingAction::Inbound(inbound)),
+                            Poll::Pending => Poll::Pending,
+                        },
+                    }
+                }) => {
+                    match action {
+                        PendingAction::Outbound(result) => {
+                            let _ = requester.send(result);
+                        }
+                        PendingAction::Inbound(inbound) => {
+                            // Re-queue the requester so the next iteration still serves it.
+                            pending_open.push_front(requester);
+                            match inbound {
+                                Some(Ok(stream)) => {
+                                    let _ = inbound_tx.send(stream);
+                                }
+                                Some(Err(e)) => {
+                                    tracing::debug!(error = %e, "yamux connection error while awaiting outbound, terminating driver");
+                                    return;
+                                }
+                                None => return,
+                            }
+                        }
+                    }
+                }
+            }
             continue;
         }
 
@@ -133,11 +205,12 @@ async fn driver_task<T>(
         // We select between:
         // 1. poll_next_inbound  (drives the connection)
         // 2. a new open request arriving
-        // 3. close signal
+        // 3. close signal (explicit graceful close via close())
+        // 4. open_rx closed (session dropped — forceful shutdown)
         tokio::select! {
             biased;
 
-            // Close signal takes priority.
+            // Explicit `close()` was called → graceful poll_close, exit.
             _ = &mut close_rx => {
                 std::future::poll_fn(|cx: &mut Context<'_>| {
                     conn.poll_close(cx).map_err(|_| ())
@@ -146,11 +219,12 @@ async fn driver_task<T>(
             }
 
             // New open request arrives while we are waiting on inbound.
-            req = open_rx.recv() => {
-                if let Some(r) = req {
-                    pending_open.push(r);
+            // None means open_tx was dropped (session dropped) → also exit.
+            maybe_req = open_rx.recv() => {
+                if let Some(r) = maybe_req {
+                    pending_open.push_back(r);
                 } else {
-                    // Session handle dropped; shut down.
+                    // Session was dropped or open_tx closed → forceful shutdown.
                     std::future::poll_fn(|cx: &mut Context<'_>| {
                         conn.poll_close(cx).map_err(|_| ())
                     }).await.ok();
@@ -166,8 +240,8 @@ async fn driver_task<T>(
                         // If the receiver is gone, just drop the stream.
                         let _ = inbound_tx.send(stream);
                     }
-                    Some(Err(_e)) => {
-                        // Connection error; shut down driver.
+                    Some(Err(e)) => {
+                        tracing::warn!(error = %e, "yamux connection error, terminating driver");
                         return;
                     }
                     None => {
@@ -203,8 +277,7 @@ impl Session for YamuxSession {
 
     async fn ping(&mut self) -> anyhow::Result<Duration> {
         use tokio::io::AsyncWriteExt as _;
-        // yamux 0.13 does not expose application-level ping; we open a substream
-        // with empty payload and close it immediately as a liveness check.
+        // yamux 0.13 has no app-level ping; we approximate via open+shutdown.
         let start = std::time::Instant::now();
         let mut s = self.open_stream().await?;
         s.shutdown().await?;
@@ -304,5 +377,38 @@ mod yamux_tests {
         assert_eq!(&ack, b"ack");
 
         cli_handle.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_then_accept_returns_none() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let mut daemon = YamuxSession::new_client(a);
+        let mut cli = YamuxSession::new_server(b);
+
+        // Daemon closes gracefully.
+        daemon.close().await.unwrap();
+
+        // CLI's next accept should now resolve to None.
+        let next = tokio::time::timeout(std::time::Duration::from_secs(2), cli.accept_stream())
+            .await
+            .expect("accept did not resolve");
+        assert!(
+            matches!(next, Ok(None)),
+            "expected Ok(None) after graceful close"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_terminates_driver_promptly() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let daemon = YamuxSession::new_client(a);
+        let mut cli = YamuxSession::new_server(b);
+        // Drop the daemon side without an explicit close.
+        drop(daemon);
+        // CLI's accept should resolve (Err or Ok(None)) within reasonable time;
+        // do not assert which — implementation detail.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), cli.accept_stream())
+            .await
+            .expect("accept did not resolve after peer drop");
     }
 }
