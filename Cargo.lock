@@ -1874,6 +1874,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tnl-e2e"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "reqwest",
+ "tempfile",
+ "tnl",
+ "tnl-protocol",
+ "tnld",
+ "tokio",
+ "toml",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "tnl-protocol"
 version = "0.1.0-alpha.1"
 dependencies = [

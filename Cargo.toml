@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/tnl-protocol", "crates/tnld", "crates/tnl"]
+members = ["crates/tnl-protocol", "crates/tnld", "crates/tnl", "crates/tnl-e2e"]
 
 [workspace.package]
 version = "0.1.0-alpha.1"
