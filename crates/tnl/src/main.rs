@@ -51,8 +51,9 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Config(ConfigCmd::Show) => tnl::commands::config::run_show(),
-        Cmd::Auth(AuthCmd::Login { endpoint, token: _ }) => {
-            anyhow::bail!("tnl auth login not yet implemented (endpoint={endpoint}, token=...)");
+        Cmd::Auth(AuthCmd::Login { endpoint, token }) => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(tnl::commands::auth::run_login(&endpoint, &token))
         }
         Cmd::Http { port, subdomain } => {
             anyhow::bail!("tnl http not yet implemented (port={port}, sub={subdomain})");
