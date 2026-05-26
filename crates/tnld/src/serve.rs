@@ -75,6 +75,7 @@ fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .merge(authed)
+        .fallback(crate::data_plane::handler)
         .with_state(state)
 }
 
