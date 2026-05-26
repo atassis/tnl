@@ -56,7 +56,8 @@ fn main() -> anyhow::Result<()> {
             rt.block_on(tnl::commands::auth::run_login(&endpoint, &token))
         }
         Cmd::Http { port, subdomain } => {
-            anyhow::bail!("tnl http not yet implemented (port={port}, sub={subdomain})");
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(tnl::commands::http::run(port, &subdomain))
         }
     }
 }
