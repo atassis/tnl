@@ -23,7 +23,14 @@ fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::HashPassword { plaintext } => tnld::hash_password::run(&plaintext),
         Cmd::Serve { config } => {
-            anyhow::bail!("`serve` not yet implemented (config path: {config})")
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(async move {
+                let cfg = tnld::config::Config::load(std::path::Path::new(&config))?;
+                let handle = tnld::serve::spawn_server(cfg).await?;
+                eprintln!("tnld listening on http://{}", handle.local_addr);
+                handle.join.await?;
+                Ok::<_, anyhow::Error>(())
+            })
         }
     }
 }
