@@ -327,6 +327,27 @@ pub fn client_session_from_ws(ws: WebSocketStream<TokioAdapter<TcpStream>>) -> Y
     YamuxSession::new_server(WsStream::new(ws))
 }
 
+/// Build a yamux session in **daemon role** from any `WebSocketStream`.
+///
+/// Used by `tnld` when the WebSocket was obtained via axum's extractor
+/// (which gives a `TokioAdapter<DuplexStream>` after the bridge).
+pub fn server_session_from_ws_generic<S>(ws: WebSocketStream<S>) -> YamuxSession
+where
+    S: futures::io::AsyncRead + futures::io::AsyncWrite + Send + Unpin + 'static,
+{
+    YamuxSession::new_client(WsStream::new(ws))
+}
+
+/// Build a yamux session in **CLI role** from any `WebSocketStream`.
+///
+/// Mirror of [`client_session_from_ws`] for non-`TcpStream` inner IO.
+pub fn client_session_from_ws_generic<S>(ws: WebSocketStream<S>) -> YamuxSession
+where
+    S: futures::io::AsyncRead + futures::io::AsyncWrite + Send + Unpin + 'static,
+{
+    YamuxSession::new_server(WsStream::new(ws))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Adapter wrapping `yamux::Stream` to expose tokio's `AsyncRead+AsyncWrite`.

@@ -47,3 +47,6 @@ tnl-protocol = { path = "../tnl-protocol" }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 reqwest = { workspace = true, features = ["rustls"] }
+http = "1"
+async-tungstenite = { workspace = true }
+futures = { workspace = true }

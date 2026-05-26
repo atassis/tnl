@@ -69,6 +69,7 @@ pub async fn spawn_server(cfg: Config) -> anyhow::Result<ServerHandle> {
 fn build_router(state: AppState) -> Router {
     let authed = Router::new()
         .route("/whoami", get(whoami))
+        .route("/control", get(crate::control::handler))
         .layer(middleware::from_fn_with_state(state.clone(), bearer_auth));
 
     Router::new()
