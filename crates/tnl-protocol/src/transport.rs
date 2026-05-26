@@ -292,6 +292,43 @@ impl Session for YamuxSession {
     }
 }
 
+// ─── WebSocket helpers ────────────────────────────────────────────────────────
+//
+// `ws_stream_tungstenite::WsStream` adapts an `async_tungstenite::WebSocketStream`
+// (message-level Sink+Stream) to a byte-level `AsyncRead+AsyncWrite` suitable for
+// yamux.  We use `async-tungstenite` (with the `tokio-runtime` feature) rather than
+// `tokio-tungstenite` because `WsStream` was written against `async_tungstenite`'s
+// `WebSocketStream` type.  The two crates share the same underlying `tungstenite`
+// library but expose incompatible wrapper types.
+//
+// Role mapping (repeated here for visibility):
+//   • tnld daemon  → yamux `Mode::Client` (opens substreams) → `new_client`
+//   • tnl CLI      → yamux `Mode::Server` (accepts substreams) → `new_server`
+
+use async_tungstenite::{tokio::TokioAdapter, WebSocketStream};
+use tokio::net::TcpStream;
+use ws_stream_tungstenite::WsStream;
+
+/// Build a yamux session in **daemon role** (opens substreams) from a server-accepted
+/// WebSocket connection on a plain TCP stream.
+///
+/// The caller is expected to have performed the WebSocket handshake already
+/// (e.g. via `async_tungstenite::tokio::accept_async`).
+pub fn server_session_from_ws(ws: WebSocketStream<TokioAdapter<TcpStream>>) -> YamuxSession {
+    YamuxSession::new_client(WsStream::new(ws))
+}
+
+/// Build a yamux session in **CLI role** (accepts substreams) from a client-dialed
+/// WebSocket connection.
+///
+/// The caller is expected to have performed the WebSocket handshake already
+/// (e.g. via `async_tungstenite::tokio::connect_async`).
+pub fn client_session_from_ws(ws: WebSocketStream<TokioAdapter<TcpStream>>) -> YamuxSession {
+    YamuxSession::new_server(WsStream::new(ws))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Adapter wrapping `yamux::Stream` to expose tokio's `AsyncRead+AsyncWrite`.
 struct YamuxStreamCompat {
     inner: tokio_util::compat::Compat<yamux::Stream>,
@@ -396,6 +433,46 @@ mod yamux_tests {
             matches!(next, Ok(None)),
             "expected Ok(None) after graceful close"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn yamux_over_wss_localhost_roundtrip() {
+        use async_tungstenite::tokio::{accept_async, connect_async};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}/control");
+
+        // Oneshot: client signals server it has read the payload, server then drops its session.
+        // This keeps the underlying WebSocket connection alive until the client is done,
+        // preventing a race where the server closes TCP before the client can respond to
+        // the yamux RTT Ping (which would cause a Broken-pipe write error in the client driver).
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server_task = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let ws = accept_async(sock).await.unwrap();
+            let mut session = crate::transport::server_session_from_ws(ws); // daemon role
+            let mut s = session.open_stream().await.unwrap();
+            s.write_all(b"hello from daemon").await.unwrap();
+            s.shutdown().await.unwrap();
+            // Wait until the client confirms it finished reading before the session drops.
+            let _ = done_rx.await;
+        });
+
+        let (ws, _) = connect_async(url).await.unwrap();
+        // `ws` is `WebSocketStream<TokioAdapter<TcpStream>>` (plain ws://, no TLS).
+        // Build a CLI-side yamux session.
+        let mut session = crate::transport::client_session_from_ws(ws); // cli role
+        let mut s = session.accept_stream().await.unwrap().unwrap();
+        let mut buf = vec![0u8; b"hello from daemon".len()];
+        AsyncReadExt::read_exact(&mut s, &mut buf).await.unwrap();
+        assert_eq!(buf, b"hello from daemon");
+        // Signal the server that the client is done; the server session can now drop.
+        let _ = done_tx.send(());
+
+        server_task.await.expect("server task panicked");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

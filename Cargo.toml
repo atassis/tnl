@@ -50,5 +50,6 @@ tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = "1"
-ws_stream_tungstenite = "0.15"
+async-tungstenite = { version = "0.29", features = ["tokio-runtime"] }
+ws_stream_tungstenite = { version = "0.15", features = ["tokio_io"] }
 yamux = "0.13"

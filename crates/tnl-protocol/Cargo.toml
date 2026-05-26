@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-tungstenite.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
@@ -26,4 +27,5 @@ ws_stream_tungstenite.workspace = true
 yamux.workspace = true
 
 [dev-dependencies]
+async-tungstenite.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
