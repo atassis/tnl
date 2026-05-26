@@ -76,6 +76,20 @@ async fn end_to_end_http_request_reaches_local_backend() {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        content_type.starts_with("text/plain"),
+        "expected text/plain content-type, got: {content_type:?}"
+    );
     let body = resp.text().await.unwrap();
-    assert!(body.contains("pong from local backend"), "got: {body}");
+    assert!(
+        !body.contains("HTTP/1."),
+        "body must not contain backend status line, got: {body:?}"
+    );
+    assert_eq!(body, "pong from local backend\n", "got: {body:?}");
 }

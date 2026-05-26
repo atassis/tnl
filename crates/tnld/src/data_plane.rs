@@ -2,8 +2,8 @@ use std::fmt::Write as _;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::Response;
-use axum::http::StatusCode;
+use axum::http::header::{HeaderName, HeaderValue};
+use axum::http::{HeaderMap, Response, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, warn};
 
@@ -80,11 +80,13 @@ pub async fn handler(State(state): State<AppState>, req: Request) -> Response<Bo
         }
     }
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "application/octet-stream")
-        .body(Body::from(resp_buf))
-        .unwrap()
+    match build_response_from_raw(&resp_buf) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "parse backend response");
+            text(StatusCode::BAD_GATEWAY, "bad backend response\n")
+        }
+    }
 }
 
 fn serialize_http1_request_head(parts: &axum::http::request::Parts) -> String {
@@ -114,4 +116,134 @@ fn text(code: StatusCode, msg: &str) -> Response<Body> {
         .status(code)
         .body(Body::from(msg.to_owned()))
         .unwrap()
+}
+
+fn build_response_from_raw(buf: &[u8]) -> Result<Response<Body>, String> {
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut parsed = httparse::Response::new(&mut headers);
+    let header_end = match parsed.parse(buf).map_err(|e| e.to_string())? {
+        httparse::Status::Complete(n) => n,
+        httparse::Status::Partial => return Err("partial response from backend".into()),
+    };
+    let code = parsed.code.ok_or("missing status code")?;
+    let status = StatusCode::from_u16(code).map_err(|e| e.to_string())?;
+
+    let mut chunked = false;
+    let mut out_headers = HeaderMap::new();
+    for h in parsed.headers.iter() {
+        let name_lc = h.name.to_ascii_lowercase();
+        // Hop-by-hop and framing headers we must not forward verbatim; axum/hyper
+        // sets Content-Length itself based on the body bytes we hand it.
+        match name_lc.as_str() {
+            "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "upgrade"
+            | "content-length" => continue,
+            "transfer-encoding" => {
+                if h.value.eq_ignore_ascii_case(b"chunked") {
+                    chunked = true;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        let name = HeaderName::from_bytes(h.name.as_bytes()).map_err(|e| e.to_string())?;
+        let value = HeaderValue::from_bytes(h.value).map_err(|e| e.to_string())?;
+        out_headers.append(name, value);
+    }
+
+    let raw_body = &buf[header_end..];
+    let body_bytes = if chunked {
+        decode_chunked(raw_body)?
+    } else {
+        raw_body.to_vec()
+    };
+
+    let mut resp = Response::builder().status(status);
+    if let Some(hs) = resp.headers_mut() {
+        *hs = out_headers;
+    }
+    resp.body(Body::from(body_bytes)).map_err(|e| e.to_string())
+}
+
+fn decode_chunked(input: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    loop {
+        let crlf = input
+            .get(i..)
+            .and_then(|s| s.windows(2).position(|w| w == b"\r\n"))
+            .ok_or_else(|| "missing CRLF in chunk size line".to_string())?;
+        let size_line = std::str::from_utf8(&input[i..i + crlf]).map_err(|e| e.to_string())?;
+        let size_hex = size_line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_hex, 16)
+            .map_err(|e| format!("bad chunk size {size_hex:?}: {e}"))?;
+        i += crlf + 2;
+        if size == 0 {
+            break;
+        }
+        if i + size > input.len() {
+            return Err("truncated chunk body".into());
+        }
+        out.extend_from_slice(&input[i..i + size]);
+        i += size;
+        if input.get(i..i + 2) != Some(b"\r\n") {
+            return Err("missing CRLF after chunk body".into());
+        }
+        i += 2;
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_simple_http10_response() {
+        let raw = b"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: 5\r\n\r\nhello";
+        let resp = build_response_from_raw(raw).expect("parse ok");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .map(axum::http::HeaderValue::as_bytes),
+            Some(b"text/html".as_ref())
+        );
+        // Content-Length must NOT be forwarded; axum sets it.
+        assert!(resp.headers().get("content-length").is_none());
+    }
+
+    #[test]
+    fn decodes_chunked_body() {
+        let raw =
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let resp = build_response_from_raw(raw).expect("parse ok");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("transfer-encoding").is_none());
+    }
+
+    #[test]
+    fn propagates_non_200_status() {
+        let raw = b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nnope";
+        let resp = build_response_from_raw(raw).expect("parse ok");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn rejects_partial() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type:";
+        assert!(build_response_from_raw(raw).is_err());
+    }
+
+    #[test]
+    fn chunked_decode_matches() {
+        let body = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let decoded = decode_chunked(body).expect("decode ok");
+        assert_eq!(decoded, b"hello world");
+    }
 }
