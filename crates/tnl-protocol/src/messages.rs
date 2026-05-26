@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
+use std::time::SystemTime;
 
+/// Wire format: serde's internally-tagged enum representation (`tag = "type"`).
+///
+/// Newtype-struct payloads (`CreateTunnel(CreateTunnelReq)`) flatten their
+/// fields next to `"type"`. Do not add tuple-newtype variants over primitives
+/// — `serde_json` cannot flatten them and will panic at serialize time.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum ControlMsg {
@@ -30,6 +37,28 @@ pub enum ErrorCode {
     TunnelNotFound,
     Unauthorized,
     Internal,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct LogLine {
+    pub timestamp_unix_ms: u64,
+    pub method: String,
+    pub path: String,
+    pub status: Option<u16>,
+    pub duration_ms: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub remote_ip: Option<IpAddr>,
+}
+
+impl LogLine {
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn now() -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
@@ -75,5 +104,37 @@ mod tests {
             let back: ControlMsg = serde_json::from_str(&s).unwrap();
             assert_eq!(msg, back);
         }
+    }
+
+    #[test]
+    fn log_line_roundtrip() {
+        let log = LogLine {
+            timestamp_unix_ms: 1_700_000_000_000,
+            method: "GET".into(),
+            path: "/api/me".into(),
+            status: Some(200),
+            duration_ms: 23,
+            bytes_in: 320,
+            bytes_out: 1024,
+            remote_ip: Some("1.2.3.4".parse().unwrap()),
+        };
+        let s = serde_json::to_string(&log).unwrap();
+        let back: LogLine = serde_json::from_str(&s).unwrap();
+        assert_eq!(log, back);
+    }
+
+    #[test]
+    fn control_msg_roundtrip_closing() {
+        let msg = ControlMsg::Closing { reason: "server restart".into() };
+        let back: ControlMsg = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn control_msg_wire_format_pinned() {
+        // Pin the on-wire tag so an accidental switch to `untagged` or
+        // `rename_all = "snake_case"` is caught by tests.
+        let s = serde_json::to_string(&ControlMsg::Heartbeat).unwrap();
+        assert_eq!(s, r#"{"type":"Heartbeat"}"#);
     }
 }
