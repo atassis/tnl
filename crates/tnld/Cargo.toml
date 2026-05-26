@@ -17,6 +17,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 arc-swap.workspace = true
 argon2.workspace = true
+rand_core = { version = "0.6", features = ["getrandom"] }
 async-trait.workspace = true
 axum.workspace = true
 bytes.workspace = true
