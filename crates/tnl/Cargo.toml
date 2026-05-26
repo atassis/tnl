@@ -34,3 +34,6 @@ ws_stream_tungstenite.workspace = true
 yamux.workspace = true
 
 tnl-protocol = { path = "../tnl-protocol" }
+
+[dev-dependencies]
+tempfile = "3"
