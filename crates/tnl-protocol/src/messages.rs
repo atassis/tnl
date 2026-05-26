@@ -52,8 +52,10 @@ pub struct LogLine {
 }
 
 impl LogLine {
+    /// Current wall-clock time as UNIX milliseconds. Saturates to 0 if the
+    /// system clock is set before `UNIX_EPOCH`.
     #[allow(clippy::cast_possible_truncation)]
-    pub fn now() -> u64 {
+    pub fn now_unix_ms() -> u64 {
         SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
