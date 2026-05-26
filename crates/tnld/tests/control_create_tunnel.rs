@@ -1,10 +1,10 @@
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tnl_protocol::{ControlMsg, CreateTunnelReq, Session as _, TunnelCreatedResp};
 use tnld::auth::{hash_plaintext, TokenEntry, TokensFile};
 use tnld::config::Config;
 use tnld::serve::spawn_server;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_creates_tunnel_via_control_channel() {

@@ -119,8 +119,9 @@ async fn control_loop(
         };
 
         let out = serde_json::to_vec(&response)?;
-        let len =
-            u32::try_from(out.len()).context("response too large")?.to_be_bytes();
+        let len = u32::try_from(out.len())
+            .context("response too large")?
+            .to_be_bytes();
         stream.write_all(&len).await?;
         stream.write_all(&out).await?;
         stream.flush().await?;

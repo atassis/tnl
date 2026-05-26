@@ -23,8 +23,7 @@ async fn end_to_end_http_request_reaches_local_backend() {
         "/api/ping",
         axum::routing::get(|| async { "pong from local backend\n" }),
     );
-    let backend_listener =
-        tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         axum::serve(backend_listener, backend).await.unwrap();
@@ -50,13 +49,10 @@ async fn end_to_end_http_request_reaches_local_backend() {
     let tnld_addr = tnld_handle.local_addr.to_string();
 
     // 3. Spawn tnl client: connect + create tunnel + run accept loop
-    let session = tnl::client::connect_and_create(
-        &format!("http://{tnld_addr}"),
-        "tnl_E2ESECRET",
-        "smoke",
-    )
-    .await
-    .unwrap();
+    let session =
+        tnl::client::connect_and_create(&format!("http://{tnld_addr}"), "tnl_E2ESECRET", "smoke")
+            .await
+            .unwrap();
     assert_eq!(session.hostname, "smoke.t.example.com");
     let session_box = session.session;
     let _ctrl = session.control;

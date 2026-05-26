@@ -27,7 +27,10 @@ pub async fn handler(State(state): State<AppState>, req: Request) -> Response<Bo
 
     let session_id = &tunnel.session_id;
     let Some(handle) = state.session_handles.get(session_id).map(|h| h.clone()) else {
-        return text(StatusCode::SERVICE_UNAVAILABLE, "client session not ready\n");
+        return text(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "client session not ready\n",
+        );
     };
 
     let mut session_guard = handle.lock().await;
@@ -35,7 +38,10 @@ pub async fn handler(State(state): State<AppState>, req: Request) -> Response<Bo
         Ok(s) => s,
         Err(e) => {
             error!(?e, "open_stream failed");
-            return text(StatusCode::SERVICE_UNAVAILABLE, "could not open substream\n");
+            return text(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "could not open substream\n",
+            );
         }
     };
     drop(session_guard);
@@ -83,10 +89,7 @@ pub async fn handler(State(state): State<AppState>, req: Request) -> Response<Bo
 
 fn serialize_http1_request_head(parts: &axum::http::request::Parts) -> String {
     let mut s = String::with_capacity(256);
-    let path = parts
-        .uri
-        .path_and_query()
-        .map_or("/", |p| p.as_str());
+    let path = parts.uri.path_and_query().map_or("/", |p| p.as_str());
     let _ = write!(s, "{} {} {:?}\r\n", parts.method, path, parts.version);
     s.push_str("Connection: close\r\n");
     // Inject Host header (use original host header) so the downstream server sees it.
