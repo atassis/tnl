@@ -1,0 +1,20 @@
+# Drop into /opt/tnld/compose.yaml on the gateway host (alongside the
+# Caddy compose, not inside it). Adjust the image tag if you tagged
+# differently when `docker load`-ing.
+#
+# Host network is required so the binary keeps binding 127.0.0.1:7777 —
+# the same loopback address that the host's Caddy reverse-proxies to.
+
+services:
+  tnld:
+    image: tnld:0.1.0-alpha.1
+    container_name: tnld
+    restart: always
+    network_mode: host
+    environment:
+      RUST_LOG: "info,tnld=debug"
+    volumes:
+      - /etc/tnld:/etc/tnld:ro
+    # Optional: cap container resources. tnld is light; defaults are fine.
+    # mem_limit: 128m
+    # cpus: "0.5"

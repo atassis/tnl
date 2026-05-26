@@ -1,0 +1,9 @@
+target/
+.git/
+docs/
+deploy/
+README.md
+RUNBOOK.md
+CLAUDE.md
+*.md
+**/*.tmp

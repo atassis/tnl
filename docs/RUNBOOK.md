@@ -174,8 +174,10 @@ Goal: expose `https://<sub>.t.example.com` for real, with TLS, from any client
 machine. ~30–60 minutes the first time, mostly waiting for Caddy to rebuild and
 LE to issue a wildcard cert.
 
-There is **no Dockerfile yet** (v0.1.0 scope). For v0.1.0-alpha you'll run
-`tnld` directly on the host (under tmux or as a quick systemd unit).
+`tnld` runs as a docker compose service on the gateway. The image is built
+from the repo root `Dockerfile` (multi-stage musl, ~21 MB) and shipped to the
+host via `docker save | ssh … docker load` (no registry required for
+v0.1.0-alpha).
 
 ### 2.1. What you need to do manually (out of Claude scope)
 
@@ -305,35 +307,41 @@ curl -sIv https://nonexistent-tunnel.t.example.com/ 2>&1 | grep -E "subject|issu
 You'll get a 502 from Caddy because `tnld` isn't running yet — that's expected.
 The important thing is the TLS handshake succeeded.
 
-#### e. Get `tnld` binary onto your-gateway
+#### e. Build the `tnld` Docker image on your laptop and ship it to your-gateway
 
-Build a musl-static binary on your laptop and scp it:
+The image is a multi-stage musl build (alpine builder → alpine runtime, ~21 MB).
+No registry is required for v0.1.0-alpha; we just stream the image over SSH.
 
 ```bash
-# from laptop
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --workspace --target x86_64-unknown-linux-musl
+# from laptop, in the repo root
+docker build -t tnld:0.1.0-alpha.1 .
 
-scp target/x86_64-unknown-linux-musl/release/tnld your-gateway:/tmp/tnld
-
-# on your-gateway
-sudo mv /tmp/tnld /usr/local/bin/tnld
-sudo chmod +x /usr/local/bin/tnld
+# pipe straight into docker load on the remote — no intermediate file needed
+docker save tnld:0.1.0-alpha.1 | ssh your-gateway 'sudo docker load'
 ```
 
-(If musl build fails because of any C dep, fall back to `cargo build --release`
-and scp the glibc-linked binary. your-gateway is Debian 13, glibc 2.36-ish; the
-binary should run.)
+On your-gateway, confirm:
+```bash
+sudo docker images tnld
+# REPOSITORY   TAG               IMAGE ID       CREATED         SIZE
+# tnld         0.1.0-alpha.1     …              …               21.4MB
+```
 
 #### f. Set up tokens + config on your-gateway
 
+The container runs as a non-root `tnld` user (UID created inside the image).
+Mount `/etc/tnld` read-only; the files need to be world-readable (mode 644) so
+the in-container UID can read them. If you want stricter perms, switch the
+compose to `user: 0:0` and rely on the container being read-only.
+
 ```bash
+# on your-gateway
 sudo mkdir -p /etc/tnld
 sudo chown root:root /etc/tnld
 
 # Generate a real token (save the plaintext somewhere safe — bitwarden, etc.)
 PLAINTEXT="tnl_$(openssl rand -base64 18 | tr -d '+/=' | cut -c1-26)"
-HASH=$(tnld hash-password "$PLAINTEXT")
+HASH=$(sudo docker run --rm tnld:0.1.0-alpha.1 hash-password "$PLAINTEXT")
 echo "Plaintext token (save this!): $PLAINTEXT"
 
 sudo tee /etc/tnld/tokens.toml >/dev/null <<EOF
@@ -341,7 +349,7 @@ sudo tee /etc/tnld/tokens.toml >/dev/null <<EOF
 name = "laptop"
 hash = "$HASH"
 EOF
-sudo chmod 600 /etc/tnld/tokens.toml
+sudo chmod 644 /etc/tnld/tokens.toml
 
 sudo tee /etc/tnld/config.toml >/dev/null <<'EOF'
 listen        = "127.0.0.1:7777"
@@ -349,59 +357,48 @@ public_url    = "https://tnl-api.t.example.com"
 hostname_root = "t.example.com"
 tokens_file   = "/etc/tnld/tokens.toml"
 EOF
+sudo chmod 644 /etc/tnld/config.toml
 ```
 
-#### g. Run `tnld` (tmux for v0.1.0-alpha; systemd later)
+#### g. Run `tnld` as a docker compose service
 
-Quick path (tmux):
+Copy the compose snippet from the repo:
 ```bash
-sudo apt install -y tmux
-sudo tmux new-session -d -s tnld 'RUST_LOG=info,tnld=debug tnld serve --config /etc/tnld/config.toml'
-sudo tmux ls
-# tnld: 1 windows (created …)
+# from laptop
+scp deploy/tnld-compose.yaml.example your-gateway:/tmp/tnld-compose.yaml
 
-# attach if you want to watch:
-sudo tmux attach -t tnld
-# Ctrl-B, D to detach
+# on your-gateway
+sudo mkdir -p /opt/tnld
+sudo mv /tmp/tnld-compose.yaml /opt/tnld/compose.yaml
 ```
 
-Verify:
+Bring it up:
+```bash
+sudo docker compose -f /opt/tnld/compose.yaml up -d
+sudo docker compose -f /opt/tnld/compose.yaml logs --tail 20
+```
+
+Expected last line: `tnld listening on http://127.0.0.1:7777`.
+
+Verify locally on the host (loopback, before TLS):
+```bash
+curl -sf http://127.0.0.1:7777/healthz
+# → ok
+```
+
+…and through Caddy (this is the path the laptop will use):
 ```bash
 curl -sf https://tnl-api.t.example.com/healthz
 # → ok
 ```
 
-Hardened path (systemd one-liner):
+To upgrade later (new image tag, e.g. v0.1.0-alpha.2):
 ```bash
-sudo tee /etc/systemd/system/tnld.service >/dev/null <<'EOF'
-[Unit]
-Description=tnl tunneling daemon
-After=network-online.target docker.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=tnld
-Group=tnld
-Environment=RUST_LOG=info,tnld=debug
-ExecStart=/usr/local/bin/tnld serve --config /etc/tnld/config.toml
-Restart=on-failure
-RestartSec=5s
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/log/tnld
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo useradd -r -s /usr/sbin/nologin tnld
-sudo chown tnld:tnld /etc/tnld/tokens.toml /etc/tnld/config.toml
-sudo systemctl daemon-reload
-sudo systemctl enable --now tnld
-sudo systemctl status tnld --no-pager
-sudo journalctl -u tnld -n 40 --no-pager
+# laptop
+docker build -t tnld:0.1.0-alpha.2 .
+docker save tnld:0.1.0-alpha.2 | ssh your-gateway 'sudo docker load'
+# your-gateway — edit /opt/tnld/compose.yaml's image: tag, then
+sudo docker compose -f /opt/tnld/compose.yaml up -d
 ```
 
 ### 2.2. Use it from your laptop
@@ -451,11 +448,11 @@ your-laptop ← yamux ← WSS ← Caddy ← TLS ← internet ← Caddy:443 ← `
 
 To revert your-gateway to its pre-tnl state:
 ```bash
-sudo systemctl disable --now tnld 2>/dev/null
-sudo tmux kill-session -t tnld 2>/dev/null
+sudo docker compose -f /opt/tnld/compose.yaml down 2>/dev/null
+sudo docker image rm tnld:0.1.0-alpha.1 2>/dev/null
+sudo rm -rf /opt/tnld /etc/tnld
 sudo rm -f /opt/caddy/sites/tnl.caddy /opt/caddy/sites/tnl-api.caddy
 sudo docker exec caddy caddy reload --config /etc/caddy/Caddyfile
-sudo rm -rf /etc/tnld /usr/local/bin/tnld
 ```
 
 Cloudflare DNS record and API token: delete from the Cloudflare dashboard if
