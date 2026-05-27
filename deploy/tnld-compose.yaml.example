@@ -15,6 +15,12 @@ services:
       RUST_LOG: "info,tnld=debug"
     volumes:
       - /etc/tnld:/etc/tnld:ro
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/tnld", "healthcheck", "--config", "/etc/tnld/config.toml"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
     # Optional: cap container resources. tnld is light; defaults are fine.
     # mem_limit: 128m
     # cpus: "0.5"

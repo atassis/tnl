@@ -42,5 +42,7 @@ COPY --from=builder /src/target/release/tnld /usr/local/bin/tnld
 
 USER tnld
 EXPOSE 7777
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["/usr/local/bin/tnld", "healthcheck", "--config", "/etc/tnld/config.toml"]
 ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/tnld"]
 CMD ["serve", "--config", "/etc/tnld/config.toml"]

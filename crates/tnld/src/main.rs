@@ -22,6 +22,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TokenCmd,
     },
+    /// Probe the local daemon's /healthz; exit 0 on 2xx, nonzero otherwise.
+    Healthcheck {
+        #[arg(short, long, default_value = "/etc/tnld/config.toml")]
+        config: std::path::PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -29,6 +34,10 @@ fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::HashPassword { plaintext } => tnld::hash_password::run(&plaintext),
         Cmd::Token { cmd } => tnld::commands::token::run(cmd),
+        Cmd::Healthcheck { config } => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(tnld::commands::healthcheck::run(config))
+        }
         Cmd::Serve { config } => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async move {
