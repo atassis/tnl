@@ -70,29 +70,30 @@ pub struct ReattachReq {
     pub subdomain: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PairCreateReq {
     pub name: String,
-    /// Server clamps to [60, 900].
+    /// Requested lifetime in seconds. Servers SHOULD clamp this to [60, 900].
     pub expires_in_sec: u32,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PairCreateResp {
     /// Human-formatted: e.g. "AB-12-CD".
     pub code: String,
-    pub expires_at: std::time::SystemTime,
+    /// UNIX timestamp (seconds since epoch) at which this code expires.
+    pub expires_at_unix: u64,
     /// Shareable URL embedding endpoint + code. UX device, not a server route.
     pub invite_url: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PairRedeemReq {
-    /// Normalised: uppercase, dashes and spaces stripped, e.g. "AB12CD".
+    /// Caller-normalised before construction: uppercase, dashes and spaces stripped, e.g. "AB12CD".
     pub code: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PairRedeemResp {
     pub token: String,
     pub endpoint: String,
@@ -198,13 +199,13 @@ mod tests {
     fn pair_create_resp_round_trip_json() {
         let resp = PairCreateResp {
             code: "AB-12-CD".to_string(),
-            expires_at: std::time::SystemTime::UNIX_EPOCH
-                + std::time::Duration::from_secs(1_900_000_000),
+            expires_at_unix: 1_900_000_000,
             invite_url: "https://x.example.com/invite/AB-12-CD".to_string(),
         };
         let s = serde_json::to_string(&resp).unwrap();
         let back: PairCreateResp = serde_json::from_str(&s).unwrap();
         assert_eq!(back.code, "AB-12-CD");
+        assert_eq!(back.expires_at_unix, 1_900_000_000);
         assert_eq!(back.invite_url, resp.invite_url);
     }
 
