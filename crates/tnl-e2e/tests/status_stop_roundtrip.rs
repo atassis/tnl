@@ -55,7 +55,11 @@ async fn status_and_stop_round_trip() {
         .await
         .unwrap();
     let tunnels: Vec<tnl_protocol::messages::TunnelInfo> = resp.json().await.unwrap();
-    assert_eq!(tunnels.len(), 1, "expected exactly one tunnel, got {tunnels:?}");
+    assert_eq!(
+        tunnels.len(),
+        1,
+        "expected exactly one tunnel, got {tunnels:?}"
+    );
     assert_eq!(tunnels[0].subdomain, "demo");
     assert!(
         tunnels[0].active,

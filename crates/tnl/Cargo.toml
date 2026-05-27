@@ -35,6 +35,7 @@ ws_stream_tungstenite.workspace = true
 yamux.workspace = true
 
 tnl-protocol = { path = "../tnl-protocol" }
+nu-ansi-term = "0.50"
 url = "2"
 
 [dev-dependencies]

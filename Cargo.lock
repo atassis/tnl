@@ -2033,6 +2033,7 @@ dependencies = [
  "clap",
  "futures",
  "http",
+ "nu-ansi-term",
  "reqwest",
  "serde",
  "serde_json",

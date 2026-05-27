@@ -2,5 +2,6 @@ pub mod client;
 pub mod commands;
 pub mod config;
 pub mod forwarder;
+pub mod inspector;
 pub mod invite;
 pub mod reconnect;
