@@ -3,7 +3,7 @@ use tnld::config::Config;
 use tnld::serve::spawn_server;
 
 #[tokio::test]
-async fn unknown_host_returns_502() {
+async fn unknown_host_returns_404_with_component_header() {
     let hash = hash_plaintext("tnl_TESTSECRET").unwrap();
     let tokens = TokensFile {
         tokens: vec![TokenEntry {
@@ -28,5 +28,18 @@ async fn unknown_host_returns_502() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), 502);
+    assert_eq!(resp.status().as_u16(), 404);
+    assert_eq!(
+        resp.headers()
+            .get("x-tnl-component")
+            .and_then(|v| v.to_str().ok()),
+        Some("registry"),
+    );
+    assert!(resp.headers().get("x-tnl-request-id").is_some());
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+    );
 }

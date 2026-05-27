@@ -9,32 +9,107 @@ use tracing::{debug, error, info, warn};
 
 use crate::serve::AppState;
 
+#[allow(clippy::too_many_lines)]
 pub async fn handler(State(state): State<AppState>, req: Request) -> Response<Body> {
+    use tnl_protocol::error_page::{parse_accept, Component, ErrorContext};
+    use ulid::Ulid;
+
+    let req_id = Ulid::new();
+    let version = env!("CARGO_PKG_VERSION");
+
+    // ---- Accept negotiation -------------------------------------------------
+    let accept_h = req
+        .headers()
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+    let ua_h = req
+        .headers()
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+    let accept = parse_accept(accept_h.as_deref(), ua_h.as_deref());
+
+    // ---- Host lookup --------------------------------------------------------
     let host = req
         .headers()
         .get("Host")
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string);
     let Some(host) = host else {
-        return text(StatusCode::BAD_REQUEST, "missing Host header");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            Component::Registry,
+            &ErrorContext {
+                component: Component::Registry,
+                kind: None,
+                tunnel: None,
+                target: None,
+                reason: "Missing Host header",
+                hint: "Caddy strips this; check the reverse proxy config.",
+                req_id,
+                version,
+            },
+            accept,
+            None,
+        );
     };
     let host_no_port = host.split(':').next().unwrap_or(&host).to_string();
 
     let Some(tunnel) = state.registry.find_by_hostname(&host_no_port) else {
         debug!(%host, "no tunnel registered for host");
-        return text(StatusCode::BAD_GATEWAY, "no such tunnel\n");
+        return error_response(
+            StatusCode::NOT_FOUND,
+            Component::Registry,
+            &ErrorContext {
+                component: Component::Registry,
+                kind: None,
+                tunnel: Some(&host_no_port),
+                target: None,
+                reason: "No tunnel is currently registered for this host.",
+                hint: "Start the tunnel with `tnl http <TARGET> <SUBDOMAIN>`.",
+                req_id,
+                version,
+            },
+            accept,
+            None,
+        );
     };
 
     let Some(session_id) = state.registry.current_session_id(&tunnel.id) else {
-        return text(
+        return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            "tunnel disconnected, awaiting reattach\n",
+            Component::Daemon,
+            &ErrorContext {
+                component: Component::Daemon,
+                kind: None,
+                tunnel: Some(&tunnel.subdomain),
+                target: None,
+                reason: "Tunnel is in grace window awaiting reattach.",
+                hint: "Try again in a moment; the client should reconnect automatically.",
+                req_id,
+                version,
+            },
+            accept,
+            Some("1"),
         );
     };
     let Some(handle) = state.session_handles.get(&session_id).map(|h| h.clone()) else {
-        return text(
+        return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            "client session not ready\n",
+            Component::Daemon,
+            &ErrorContext {
+                component: Component::Daemon,
+                kind: None,
+                tunnel: Some(&tunnel.subdomain),
+                target: None,
+                reason: "Tunnel session handle not yet ready.",
+                hint: "Try again in a moment.",
+                req_id,
+                version,
+            },
+            accept,
+            Some("1"),
         );
     };
 
@@ -43,9 +118,30 @@ pub async fn handler(State(state): State<AppState>, req: Request) -> Response<Bo
         Ok(s) => s,
         Err(e) => {
             error!(?e, "open_stream failed");
-            return text(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "could not open substream\n",
+            warn!(
+                target: "tnl::data_plane::server_failure",
+                component = "transport",
+                method = %req.method(),
+                path = %req.uri().path(),
+                tunnel = %tunnel.subdomain,
+                req_id = %req_id,
+                "served 502 from daemon: open_stream"
+            );
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                Component::Transport,
+                &ErrorContext {
+                    component: Component::Transport,
+                    kind: Some("yamux-open-failed"),
+                    tunnel: Some(&tunnel.subdomain),
+                    target: None,
+                    reason: &format!("Could not open a tunnel substream: {e}"),
+                    hint: "Daemon transport is degraded; check `tnld` logs.",
+                    req_id,
+                    version,
+                },
+                accept,
+                None,
             );
         }
     };
@@ -54,21 +150,71 @@ pub async fn handler(State(state): State<AppState>, req: Request) -> Response<Bo
     let (parts, body) = req.into_parts();
     let head = serialize_http1_request_head(&parts);
     if let Err(e) = substream.write_all(head.as_bytes()).await {
-        warn!(?e, "write head to substream");
-        return text(StatusCode::BAD_GATEWAY, "write upstream failed\n");
+        warn!(
+            target: "tnl::data_plane::server_failure",
+            component = "transport",
+            req_id = %req_id,
+            "served 502 from daemon: write head"
+        );
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            Component::Transport,
+            &ErrorContext {
+                component: Component::Transport,
+                kind: Some("write-head"),
+                tunnel: Some(&tunnel.subdomain),
+                target: None,
+                reason: &format!("Could not forward request head: {e}"),
+                hint: "Daemon transport is degraded.",
+                req_id,
+                version,
+            },
+            accept,
+            None,
+        );
     }
 
     let body_bytes = match axum::body::to_bytes(body, 100 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
             warn!(?e, "read upstream body");
-            return text(StatusCode::BAD_GATEWAY, "read req body failed\n");
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                Component::Transport,
+                &ErrorContext {
+                    component: Component::Transport,
+                    kind: Some("read-end-user-body"),
+                    tunnel: Some(&tunnel.subdomain),
+                    target: None,
+                    reason: &format!("Could not read end-user body: {e}"),
+                    hint: "End-user disconnected mid-upload.",
+                    req_id,
+                    version,
+                },
+                accept,
+                None,
+            );
         }
     };
     if !body_bytes.is_empty() {
         if let Err(e) = substream.write_all(&body_bytes).await {
             warn!(?e, "write body to substream");
-            return text(StatusCode::BAD_GATEWAY, "write body failed\n");
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                Component::Transport,
+                &ErrorContext {
+                    component: Component::Transport,
+                    kind: Some("write-body"),
+                    tunnel: Some(&tunnel.subdomain),
+                    target: None,
+                    reason: &format!("Could not forward request body: {e}"),
+                    hint: "Daemon transport is degraded.",
+                    req_id,
+                    version,
+                },
+                accept,
+                None,
+            );
         }
     }
 
@@ -79,13 +225,33 @@ pub async fn handler(State(state): State<AppState>, req: Request) -> Response<Bo
             Ok(0) => break,
             Ok(n) => resp_buf.extend_from_slice(&tmp[..n]),
             Err(e) => {
-                warn!(?e, "read substream resp");
-                return text(StatusCode::BAD_GATEWAY, "read resp failed\n");
+                warn!(
+                    target: "tnl::data_plane::server_failure",
+                    component = "transport",
+                    req_id = %req_id,
+                    error = %e,
+                    "served 502 from daemon: read resp",
+                );
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    Component::Transport,
+                    &ErrorContext {
+                        component: Component::Transport,
+                        kind: Some("read-resp"),
+                        tunnel: Some(&tunnel.subdomain),
+                        target: None,
+                        reason: &format!("Could not read tunnel response: {e}"),
+                        hint: "Daemon transport is degraded.",
+                        req_id,
+                        version,
+                    },
+                    accept,
+                    None,
+                );
             }
         }
     }
 
-    // Bump per-tunnel stats (best-effort; relaxed ordering is fine for counters).
     tunnel
         .stats
         .requests
@@ -105,6 +271,7 @@ pub async fn handler(State(state): State<AppState>, req: Request) -> Response<Bo
         path = %parts.uri.path(),
         status = ?parsed_status_for_log(&resp_buf),
         bytes_resp = resp_buf.len(),
+        req_id = %req_id,
         "data-plane request"
     );
 
@@ -112,9 +279,46 @@ pub async fn handler(State(state): State<AppState>, req: Request) -> Response<Bo
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "parse backend response");
-            text(StatusCode::BAD_GATEWAY, "bad backend response\n")
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                Component::Client,
+                &ErrorContext {
+                    component: Component::Client,
+                    kind: Some("client-malformed-response"),
+                    tunnel: Some(&tunnel.subdomain),
+                    target: None,
+                    reason: "Client emitted a response that could not be parsed.",
+                    hint: "Update to tnl >= 0.1.0-beta.1; older clients can produce this.",
+                    req_id,
+                    version,
+                },
+                accept,
+                None,
+            )
         }
     }
+}
+
+fn error_response(
+    status: StatusCode,
+    component: tnl_protocol::error_page::Component,
+    ctx: &tnl_protocol::error_page::ErrorContext<'_>,
+    accept: tnl_protocol::error_page::Accept,
+    retry_after_secs: Option<&str>,
+) -> Response<Body> {
+    use tnl_protocol::error_page::render;
+    let body = render(ctx, accept);
+    let mut builder = Response::builder()
+        .status(status)
+        .header("Content-Type", accept.content_type())
+        .header("Cache-Control", "no-store")
+        .header("Connection", "close")
+        .header("X-Tnl-Component", component.as_header())
+        .header("X-Tnl-Request-Id", ctx.req_id.to_string());
+    if let Some(s) = retry_after_secs {
+        builder = builder.header("Retry-After", s);
+    }
+    builder.body(Body::from(body)).unwrap()
 }
 
 fn serialize_http1_request_head(parts: &axum::http::request::Parts) -> String {
@@ -137,13 +341,6 @@ fn serialize_http1_request_head(parts: &axum::http::request::Parts) -> String {
     }
     s.push_str("\r\n");
     s
-}
-
-fn text(code: StatusCode, msg: &str) -> Response<Body> {
-    Response::builder()
-        .status(code)
-        .body(Body::from(msg.to_owned()))
-        .unwrap()
 }
 
 fn build_response_from_raw(buf: &[u8]) -> Result<Response<Body>, String> {
