@@ -53,6 +53,13 @@ pub struct ServerHandle {
 }
 
 pub async fn spawn_server(cfg: Config) -> anyhow::Result<ServerHandle> {
+    let (handle, _state) = spawn_server_with_state(cfg).await?;
+    Ok(handle)
+}
+
+/// Like [`spawn_server`] but also returns the [`AppState`] so tests can
+/// pre-populate the registry or session handles before sending requests.
+pub async fn spawn_server_with_state(cfg: Config) -> anyhow::Result<(ServerHandle, AppState)> {
     let tokens = Arc::new(TokenStore::load(std::path::Path::new(&cfg.tokens_file))?);
     let registry = Arc::new(Registry::new(cfg.hostname_root.clone()));
     let pair_registry = Arc::new(crate::pair::PairRegistry::new());
@@ -89,7 +96,7 @@ pub async fn spawn_server(cfg: Config) -> anyhow::Result<ServerHandle> {
         session_grace_sec: cfg.session_grace_sec,
     };
 
-    let router = build_router(state);
+    let router = build_router(state.clone());
 
     let listener = TcpListener::bind(&cfg.listen).await?;
     let local_addr = listener.local_addr()?;
@@ -101,7 +108,7 @@ pub async fn spawn_server(cfg: Config) -> anyhow::Result<ServerHandle> {
         .await
         .ok();
     });
-    Ok(ServerHandle { local_addr, join })
+    Ok((ServerHandle { local_addr, join }, state))
 }
 
 fn build_router(state: AppState) -> Router {
