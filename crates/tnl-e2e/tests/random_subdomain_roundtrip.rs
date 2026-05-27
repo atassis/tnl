@@ -56,10 +56,15 @@ async fn server_picks_subdomain_when_client_omits() {
     let hostname = session.hostname.clone();
     let session_box = session.session;
     let _ctrl_keep = session.control;
+    let subdomain = session.subdomain.clone();
     let _accept = tokio::spawn(tnl::client::run_accept_loop(
         session_box,
-        backend_port,
-        None,
+        tnl::target::Target::LocalhostPort(backend_port),
+        tnl::forwarder::ForwardCtx {
+            tunnel: subdomain,
+            log_tx: None,
+            version: env!("CARGO_PKG_VERSION"),
+        },
     ));
     tokio::time::sleep(Duration::from_millis(250)).await;
 

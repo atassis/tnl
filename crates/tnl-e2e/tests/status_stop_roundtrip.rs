@@ -45,8 +45,12 @@ async fn status_and_stop_round_trip() {
     let _ctrl_keep = session.control;
     let _accept = tokio::spawn(tnl::client::run_accept_loop(
         session.session,
-        backend_port,
-        None,
+        tnl::target::Target::LocalhostPort(backend_port),
+        tnl::forwarder::ForwardCtx {
+            tunnel: "demo".into(),
+            log_tx: None,
+            version: env!("CARGO_PKG_VERSION"),
+        },
     ));
     tokio::time::sleep(Duration::from_millis(150)).await;
 

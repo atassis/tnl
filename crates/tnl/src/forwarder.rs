@@ -62,6 +62,7 @@ pub mod peek {
 
     /// Parse the first HTTP/1.x request line `METHOD PATH HTTP/x.y` plus
     /// optional `Accept` and `User-Agent` headers.
+    #[allow(clippy::type_complexity)]
     pub fn parse_request_line(bytes: &[u8]) -> Option<(String, String, Option<(String, String)>)> {
         let s = std::str::from_utf8(bytes).ok()?;
         let mut lines = s.lines();
@@ -169,8 +170,7 @@ pub async fn forward(
                     bytes_out: u64::try_from(synth.len()).unwrap_or(0),
                     failure_kind: Some(e.to_kind().to_string()),
                 },
-            )
-            .await;
+            );
             return Ok(());
         }
     };
@@ -356,8 +356,7 @@ pub async fn forward(
             bytes_out: bytes_out.load(Ordering::Relaxed),
             failure_kind: None,
         },
-    )
-    .await;
+    );
     Ok(())
 }
 
@@ -406,17 +405,14 @@ async fn synth_phase2(
             bytes_out: u64::try_from(synth.len()).unwrap_or(0),
             failure_kind: Some(kind.to_string()),
         },
-    )
-    .await;
+    );
     Ok(())
 }
 
 fn parse_head_for_synth(head: &[u8]) -> (String, String, Accept) {
     let parsed = self::peek::parse_request_line(head);
     let (method, path, headers) = parsed.unwrap_or_else(|| ("?".into(), "?".into(), None));
-    let (accept_h, ua_h) = headers
-        .map(|(a, u)| (Some(a), Some(u)))
-        .unwrap_or((None, None));
+    let (accept_h, ua_h) = headers.map_or((None, None), |(a, u)| (Some(a), Some(u)));
     let accept = parse_accept(accept_h.as_deref(), ua_h.as_deref());
     (method, path, accept)
 }
@@ -425,7 +421,7 @@ fn ms_since(t: Instant) -> u64 {
     u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-async fn emit_log(ctx: &ForwardCtx, line: LogLine) {
+fn emit_log(ctx: &ForwardCtx, line: LogLine) {
     if let Some(tx) = &ctx.log_tx {
         if let Err(e) = tx.try_send(line) {
             warn!(error = ?e, "inspector channel full or closed; dropping log line");

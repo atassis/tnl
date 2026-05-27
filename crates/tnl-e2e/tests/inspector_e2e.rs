@@ -46,8 +46,12 @@ async fn inspector_emits_one_log_per_request() {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<tnl::inspector::LogLine>(8);
     let _accept = tokio::spawn(tnl::client::run_accept_loop(
         session.session,
-        backend_port,
-        Some(tx),
+        tnl::target::Target::LocalhostPort(backend_port),
+        tnl::forwarder::ForwardCtx {
+            tunnel: "demo".into(),
+            log_tx: Some(tx),
+            version: env!("CARGO_PKG_VERSION"),
+        },
     ));
     tokio::time::sleep(Duration::from_millis(150)).await;
 

@@ -59,8 +59,12 @@ async fn end_to_end_http_request_reaches_local_backend() {
     let _ctrl = session.control;
     let _accept = tokio::spawn(tnl::client::run_accept_loop(
         session_box,
-        backend_port,
-        None,
+        tnl::target::Target::LocalhostPort(backend_port),
+        tnl::forwarder::ForwardCtx {
+            tunnel: "smoke".into(),
+            log_tx: None,
+            version: env!("CARGO_PKG_VERSION"),
+        },
     ));
 
     // give the daemon a moment to register

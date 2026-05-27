@@ -8,8 +8,6 @@ use tnl_protocol::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
-use crate::forwarder::{forward, forward_with_inspection};
-
 pub struct ConnectedSession {
     pub session: Box<dyn tnl_protocol::Session>,
     pub control: Pin<Box<dyn tnl_protocol::Stream>>,
@@ -182,19 +180,16 @@ pub async fn connect_and_reattach(
 
 pub async fn run_accept_loop(
     mut session: Box<dyn tnl_protocol::Session>,
-    port: u16,
-    log_tx: Option<tokio::sync::mpsc::Sender<crate::inspector::LogLine>>,
+    target: crate::target::Target,
+    ctx: crate::forwarder::ForwardCtx,
 ) -> anyhow::Result<()> {
     loop {
         match session.accept_stream().await {
             Ok(Some(stream)) => {
-                let tx_opt = log_tx.clone();
+                let t = target.clone();
+                let ctx2 = ctx.clone();
                 tokio::spawn(async move {
-                    let result = match tx_opt {
-                        Some(tx) => Box::pin(forward_with_inspection(stream, port, tx)).await,
-                        None => forward(stream, port).await,
-                    };
-                    if let Err(e) = result {
+                    if let Err(e) = Box::pin(crate::forwarder::forward(stream, t, ctx2)).await {
                         warn!(?e, "forward failed");
                     }
                 });

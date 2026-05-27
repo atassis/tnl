@@ -45,7 +45,7 @@ pub async fn run(
     endpoint: &str,
     token: &str,
     subdomain: Option<&str>,
-    local_port: u16,
+    target: crate::target::Target,
     mut hooks: Hooks,
 ) -> anyhow::Result<()> {
     let mut backoff_ms: u64 = 1_000;
@@ -113,7 +113,7 @@ pub async fn run(
             println!("┌─ tnl ─────────────────────────────────────────");
             println!("│ Tunnel:    https://{}", session.hostname);
             println!("│ Subdomain: {}", session.subdomain);
-            println!("│ Forward:   127.0.0.1:{local_port}");
+            println!("│ Forward:   {}", target.display());
             println!("│ Press Ctrl-C to stop.");
             println!("└────────────────────────────────────────────────");
         }
@@ -121,11 +121,15 @@ pub async fn run(
         let cancel = hooks.cancel_first_session.take();
         // Keep the control stream alive for the duration of the session.
         let _ctrl_keep = session.control;
-        let log_tx = hooks.log_tx.clone();
+        let ctx = crate::forwarder::ForwardCtx {
+            tunnel: session.subdomain.clone(),
+            log_tx: hooks.log_tx.clone(),
+            version: env!("CARGO_PKG_VERSION"),
+        };
         let accept = tokio::spawn(crate::client::run_accept_loop(
             session.session,
-            local_port,
-            log_tx,
+            target.clone(),
+            ctx,
         ));
 
         tokio::select! {

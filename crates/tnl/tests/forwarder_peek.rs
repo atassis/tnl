@@ -3,7 +3,7 @@ use tnl::forwarder::peek::{parse_request_line, parse_response_status};
 #[test]
 fn parses_request_line() {
     let bytes = b"GET /api/foo HTTP/1.1\r\nHost: x\r\n\r\nbody";
-    let (m, p) = parse_request_line(bytes).unwrap();
+    let (m, p, _host_req) = parse_request_line(bytes).unwrap();
     assert_eq!(m, "GET");
     assert_eq!(p, "/api/foo");
 }

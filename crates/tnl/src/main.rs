@@ -205,7 +205,7 @@ fn real_main() -> anyhow::Result<()> {
             };
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(tnl::commands::http::run(
-                port,
+                tnl::target::Target::LocalhostPort(port),
                 subdomain.as_deref(),
                 verbosity,
                 format,
