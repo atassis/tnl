@@ -54,3 +54,4 @@ reqwest = { workspace = true, features = ["rustls"] }
 http = "1"
 async-tungstenite = { workspace = true }
 futures = { workspace = true }
+regex = "1"

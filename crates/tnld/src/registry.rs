@@ -106,6 +106,16 @@ impl Registry {
         let subdomain = host.strip_suffix(&format!(".{}", self.hostname_root))?;
         self.by_subdomain.get(subdomain).map(|t| t.clone())
     }
+
+    pub fn find_by_subdomain(&self, subdomain: &str) -> Option<Arc<Tunnel>> {
+        self.by_subdomain.get(subdomain).map(|t| t.clone())
+    }
+}
+
+impl crate::random_subdomain::Reserved for Registry {
+    fn contains(&self, s: &str) -> bool {
+        self.find_by_subdomain(s).is_some()
+    }
 }
 
 pub fn valid_subdomain(s: &str) -> bool {
