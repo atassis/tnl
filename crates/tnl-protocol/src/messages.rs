@@ -106,6 +106,20 @@ pub struct PairRedeemResp {
     pub name: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TunnelInfo {
+    pub subdomain: String,
+    pub hostname: String,
+    pub owner_token: String,
+    /// UNIX timestamp (seconds since epoch) when this tunnel was created.
+    pub created_at_unix: u64,
+    pub requests: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    /// True if the daemon currently has a live control session for this tunnel.
+    pub active: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,5 +298,22 @@ mod tests {
         let s = serde_json::to_string(&resp).unwrap();
         let back: TunnelCreatedResp = serde_json::from_str(&s).unwrap();
         assert_eq!(back.subdomain, "happy-otter-12");
+    }
+
+    #[test]
+    fn tunnel_info_round_trip_json() {
+        let info = TunnelInfo {
+            subdomain: "foo".into(),
+            hostname: "foo.t.example.com".into(),
+            owner_token: "laptop".into(),
+            created_at_unix: 1_700_000_000,
+            requests: 5,
+            bytes_in: 1024,
+            bytes_out: 2048,
+            active: true,
+        };
+        let s = serde_json::to_string(&info).unwrap();
+        let back: TunnelInfo = serde_json::from_str(&s).unwrap();
+        assert_eq!(info, back);
     }
 }

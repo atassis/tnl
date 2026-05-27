@@ -1,7 +1,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use axum::extract::{ConnectInfo, Json, State};
+use std::collections::HashMap;
+
+use axum::extract::{ConnectInfo, Json, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -18,6 +20,11 @@ pub fn router() -> Router<AppState> {
         .route("/pair", post(pair_create))
         .route("/pair/redeem", post(pair_redeem))
         .route("/pair/list", get(pair_list))
+        .route("/tunnels", get(tunnels_list))
+        .route(
+            "/tunnels/{subdomain}",
+            axum::routing::delete(tunnels_delete),
+        )
 }
 
 fn require_bearer(
@@ -148,4 +155,47 @@ async fn pair_list(State(state): State<AppState>, headers: HeaderMap) -> axum::r
         })
         .collect();
     (StatusCode::OK, Json(items)).into_response()
+}
+
+async fn tunnels_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> axum::response::Response {
+    let owner = match require_bearer(&state, &headers) {
+        Ok(n) => n,
+        Err(e) => return e.into_response(),
+    };
+    let all = params.get("all").is_some_and(|v| v == "true");
+    let infos = state.registry.snapshot_infos();
+    let filtered: Vec<_> = if all {
+        infos
+    } else {
+        infos
+            .into_iter()
+            .filter(|i| i.owner_token == owner)
+            .collect()
+    };
+    (StatusCode::OK, Json(filtered)).into_response()
+}
+
+async fn tunnels_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(subdomain): Path<String>,
+) -> axum::response::Response {
+    let owner = match require_bearer(&state, &headers) {
+        Ok(n) => n,
+        Err(e) => return e.into_response(),
+    };
+    match state.registry.close_by_subdomain(&subdomain, &owner) {
+        Ok(()) => (StatusCode::NO_CONTENT, Json(json!({}))).into_response(),
+        Err("not_found") => {
+            (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"}))).into_response()
+        }
+        Err("not_owner") => {
+            (StatusCode::FORBIDDEN, Json(json!({"error": "not_owner"}))).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+    }
 }

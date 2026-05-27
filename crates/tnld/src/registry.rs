@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -8,6 +9,14 @@ use ulid::Ulid;
 pub type TunnelId = String;
 pub type SessionId = String;
 
+/// Per-tunnel request/byte counters. Use atomics for lock-free data-plane updates.
+#[derive(Debug, Default)]
+pub struct TunnelStats {
+    pub requests: AtomicU64,
+    pub bytes_in: AtomicU64,
+    pub bytes_out: AtomicU64,
+}
+
 /// Immutable tunnel descriptor — everything set at creation time.
 #[derive(Debug)]
 pub struct Tunnel {
@@ -16,6 +25,9 @@ pub struct Tunnel {
     pub hostname: String,
     /// Token name of the session that originally created this tunnel.
     pub created_by: String,
+    /// UNIX timestamp (seconds since epoch) when this tunnel was created.
+    pub created_at_unix: u64,
+    pub stats: TunnelStats,
 }
 
 /// Connection state of a tunnel (stored separately from the immutable Tunnel).
@@ -152,11 +164,16 @@ impl Registry {
             return Err(RegistryError::SubdomainTaken(subdomain.into()));
         }
         let hostname = format!("{subdomain}.{}", self.hostname_root);
+        let created_at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
         let tunnel = Arc::new(Tunnel {
             id: Ulid::new().to_string(),
             subdomain: subdomain.into(),
             hostname,
             created_by: token_name.into(),
+            created_at_unix,
+            stats: TunnelStats::default(),
         });
         self.by_id.insert(tunnel.id.clone(), tunnel.clone());
         self.by_subdomain
@@ -229,6 +246,49 @@ impl Registry {
 
     pub fn find_by_subdomain(&self, subdomain: &str) -> Option<Arc<Tunnel>> {
         self.by_subdomain.get(subdomain).map(|t| t.clone())
+    }
+
+    /// Snapshot all tunnels as `TunnelInfo` values for the REST list endpoint.
+    pub fn snapshot_infos(&self) -> Vec<tnl_protocol::messages::TunnelInfo> {
+        self.by_id
+            .iter()
+            .map(|kv| {
+                let t = kv.value();
+                let active = self
+                    .tunnel_state
+                    .get(&t.id)
+                    .is_some_and(|b| matches!(b.state, TunnelState::Active));
+                tnl_protocol::messages::TunnelInfo {
+                    subdomain: t.subdomain.clone(),
+                    hostname: t.hostname.clone(),
+                    owner_token: t.created_by.clone(),
+                    created_at_unix: t.created_at_unix,
+                    requests: t.stats.requests.load(Ordering::Relaxed),
+                    bytes_in: t.stats.bytes_in.load(Ordering::Relaxed),
+                    bytes_out: t.stats.bytes_out.load(Ordering::Relaxed),
+                    active,
+                }
+            })
+            .collect()
+    }
+
+    /// Remove a tunnel from the registry by subdomain.
+    ///
+    /// Returns `Err("not_found")` if no such tunnel exists, `Err("not_owner")`
+    /// if the caller's token doesn't match. Sessions linger; clients discover
+    /// the closure naturally on their next request.
+    pub fn close_by_subdomain(&self, subdomain: &str, owner: &str) -> Result<(), &'static str> {
+        // Clone Arc so we don't hold the DashMap guard while mutating.
+        let tunnel = self.by_subdomain.get(subdomain).ok_or("not_found")?.clone();
+        if tunnel.created_by != owner {
+            return Err("not_owner");
+        }
+        let id = tunnel.id.clone();
+        drop(tunnel);
+        self.by_subdomain.remove(subdomain);
+        self.by_id.remove(&id);
+        self.tunnel_state.remove(&id);
+        Ok(())
     }
 }
 

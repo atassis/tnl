@@ -85,6 +85,20 @@ pub async fn handler(State(state): State<AppState>, req: Request) -> Response<Bo
         }
     }
 
+    // Bump per-tunnel stats (best-effort; relaxed ordering is fine for counters).
+    tunnel
+        .stats
+        .requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tunnel.stats.bytes_in.fetch_add(
+        body_bytes.len() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    tunnel
+        .stats
+        .bytes_out
+        .fetch_add(resp_buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
     info!(
         host = %host_no_port,
         method = %parts.method,
