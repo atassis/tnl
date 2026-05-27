@@ -50,7 +50,7 @@ async fn create_tunnel(
     subdomain: &str,
 ) -> ControlMsg {
     let msg = ControlMsg::CreateTunnel(CreateTunnelReq {
-        subdomain: subdomain.into(),
+        subdomain: Some(subdomain.into()),
     });
     let payload = serde_json::to_vec(&msg).unwrap();
     let len = u32::try_from(payload.len()).unwrap().to_be_bytes();
