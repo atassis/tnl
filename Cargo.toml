@@ -33,7 +33,7 @@ async-trait = "0.1"
 axum = { version = "0.8", features = ["ws", "macros"] }
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
-clap_complete = "4"
+clap_complete = { version = "4", features = ["unstable-dynamic"] }
 dashmap = "6"
 dialoguer = { version = "0.11", default-features = false, features = ["history", "password"] }
 futures = "0.3"

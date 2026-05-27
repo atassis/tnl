@@ -1,5 +1,32 @@
 use clap::{CommandFactory, Parser, Subcommand};
-use clap_complete::Shell;
+use clap_complete::engine::ArgValueCompleter;
+use clap_complete::env::{Bash, Elvish, EnvCompleter, Fish, Powershell, Zsh};
+use clap_complete::CompleteEnv;
+
+/// Shell names accepted by `tnl completion`.
+///
+/// A hand-rolled enum so we don't depend on `clap_complete::aot::Shell` for
+/// the derive macro while still giving clap a `ValueEnum` for argument parsing.
+#[derive(Clone, Debug, clap::ValueEnum)]
+enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+    Elvish,
+    Powershell,
+}
+
+impl CompletionShell {
+    fn env_completer(&self) -> &'static dyn EnvCompleter {
+        match self {
+            Self::Bash => &Bash,
+            Self::Zsh => &Zsh,
+            Self::Fish => &Fish,
+            Self::Elvish => &Elvish,
+            Self::Powershell => &Powershell,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "tnl", version, about = "tnl tunneling client")]
@@ -53,6 +80,7 @@ enum Cmd {
     /// Close a tunnel by subdomain.
     Stop {
         /// Subdomain to close, e.g. `foo` (not the full hostname).
+        #[arg(add = ArgValueCompleter::new(tnl::completion::complete_live_subdomains))]
         subdomain: String,
     },
     /// Self-diagnostic: check config, daemon connectivity, token validity, clock skew.
@@ -60,10 +88,20 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Print shell-completion script for the given shell on stdout.
+    /// Print dynamic shell-completion script for the given shell on stdout.
+    ///
+    /// Source the output in your shell init file to enable TAB completion.
+    /// The emitted script calls back into `tnl` on every TAB so that
+    /// completions are always live (e.g. `tnl stop <TAB>` fetches real tunnel
+    /// names from the daemon).
+    ///
+    /// Example (zsh):
+    ///   echo 'source <(COMPLETE=zsh tnl --)' >> ~/.zshrc
+    ///   # or use this subcommand for a one-time print:
+    ///   source <(tnl completion zsh)
     Completion {
         /// Shell name (bash, zsh, fish, elvish, powershell).
-        shell: Shell,
+        shell: CompletionShell,
     },
     /// First-run wizard (interactive in a TTY; flag-driven otherwise).
     Init {
@@ -114,6 +152,12 @@ enum ConfigCmd {
 }
 
 fn main() {
+    // Must be called before argument parsing so that completion requests
+    // (COMPLETE=<shell> tnl -- …) are intercepted before any real CLI logic
+    // runs.  CompleteEnv::complete() is a no-op when the COMPLETE env var is
+    // absent, so it is safe to call unconditionally.
+    CompleteEnv::with_factory(Cli::command).complete();
+
     let result = real_main();
     if let Err(e) = result {
         eprintln!("error: {e:#}");
@@ -180,9 +224,16 @@ fn real_main() -> anyhow::Result<()> {
             rt.block_on(tnl::commands::doctor::run(json))
         }
         Cmd::Completion { shell } => {
-            let mut cmd = Cli::command();
-            clap_complete::generate(shell, &mut cmd, "tnl", &mut std::io::stdout());
-            Ok(())
+            // Emit the dynamic registration script.  The emitted function
+            // calls back into `tnl` on every TAB via COMPLETE=<shell>, so
+            // custom completers (e.g. live subdomain list for `tnl stop`) are
+            // exercised at completion time.
+            let completer = shell.env_completer();
+            let bin_path = std::env::current_exe()
+                .map_or_else(|_| "tnl".to_owned(), |p| p.to_string_lossy().into_owned());
+            completer
+                .write_registration("COMPLETE", "tnl", "tnl", &bin_path, &mut std::io::stdout())
+                .map_err(|e| anyhow::anyhow!("write completion script: {e}"))
         }
         Cmd::Init {
             invite,

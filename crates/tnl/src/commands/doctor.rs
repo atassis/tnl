@@ -137,10 +137,7 @@ pub async fn run(json: bool) -> anyhow::Result<()> {
                     if skew > Duration::from_secs(300) {
                         report.push(Check::fail(
                             "clock_skew",
-                            format!(
-                                "local clock is off by {} seconds vs server",
-                                skew.as_secs()
-                            ),
+                            format!("local clock is off by {} seconds vs server", skew.as_secs()),
                             "synchronise your clock (systemd-timesyncd, chrony, ntpd)",
                         ));
                     } else if skew > Duration::from_secs(30) {
@@ -296,10 +293,7 @@ mod tests {
     fn parses_known_http_date() {
         // Sun, 06 Nov 1994 08:49:37 GMT = 784111777 seconds since epoch
         let t = parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
-        let secs = t
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let secs = t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
         assert_eq!(secs, 784_111_777);
     }
 
