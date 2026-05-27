@@ -4,6 +4,7 @@ pub mod config;
 pub mod control;
 pub mod data_plane;
 pub mod hash_password;
+pub mod pair;
 pub mod random_subdomain;
 pub mod registry;
 pub mod serve;
