@@ -33,6 +33,32 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PairCmd,
     },
+    /// First-run server wizard. Writes config.toml; optionally mints an initial token.
+    Init {
+        /// Output path for config.toml.
+        #[arg(short = 'c', long, default_value = "/etc/tnld/config.toml")]
+        config: std::path::PathBuf,
+        #[arg(long)]
+        listen: Option<String>,
+        #[arg(long)]
+        public_url: Option<String>,
+        #[arg(long)]
+        hostname_root: Option<String>,
+        #[arg(long)]
+        tokens_file: Option<std::path::PathBuf>,
+        /// If set, generate an initial token of this name and print the plaintext.
+        #[arg(long)]
+        admin_token_name: Option<String>,
+        /// Override the default 30s grace window.
+        #[arg(long)]
+        session_grace_sec: Option<u32>,
+        /// Overwrite an existing config.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Emit a JSON summary instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -48,6 +74,27 @@ fn main() -> anyhow::Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(tnld::commands::pair::run(cmd))
         }
+        Cmd::Init {
+            config,
+            listen,
+            public_url,
+            hostname_root,
+            tokens_file,
+            admin_token_name,
+            session_grace_sec,
+            yes,
+            json,
+        } => tnld::commands::init::run(tnld::commands::init::InitArgs {
+            config,
+            listen,
+            public_url,
+            hostname_root,
+            tokens_file,
+            admin_token_name,
+            session_grace_sec,
+            yes,
+            json,
+        }),
         Cmd::Serve { config } => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async move {

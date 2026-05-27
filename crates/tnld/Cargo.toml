@@ -25,6 +25,7 @@ axum.workspace = true
 bytes.workspace = true
 clap.workspace = true
 dashmap.workspace = true
+dialoguer.workspace = true
 futures.workspace = true
 governor = "0.7"
 http.workspace = true

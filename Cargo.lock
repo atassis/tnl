@@ -2165,6 +2165,7 @@ dependencies = [
  "bytes",
  "clap",
  "dashmap",
+ "dialoguer",
  "futures",
  "governor",
  "http",
