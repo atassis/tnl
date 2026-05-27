@@ -30,7 +30,7 @@ pub struct CreateTunnelReq {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct TunnelCreatedResp {
-    pub tunnel_id: String,
+    pub tunnel_id: ulid::Ulid,
     pub hostname: String,
     /// Echoes the subdomain actually assigned (may be server-generated).
     pub subdomain: String,
@@ -122,7 +122,7 @@ mod tests {
     #[test]
     fn control_msg_roundtrip_tunnel_created() {
         let msg = ControlMsg::TunnelCreated(TunnelCreatedResp {
-            tunnel_id: ulid::Ulid::nil().to_string(),
+            tunnel_id: ulid::Ulid::nil(),
             hostname: "foo.t.example.com".into(),
             subdomain: "foo".into(),
         });
@@ -278,7 +278,7 @@ mod tests {
         let resp = TunnelCreatedResp {
             hostname: "happy-otter-12.t.example.com".to_string(),
             subdomain: "happy-otter-12".to_string(),
-            tunnel_id: ulid::Ulid::nil().to_string(),
+            tunnel_id: ulid::Ulid::nil(),
         };
         let s = serde_json::to_string(&resp).unwrap();
         let back: TunnelCreatedResp = serde_json::from_str(&s).unwrap();

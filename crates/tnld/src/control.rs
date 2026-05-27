@@ -90,48 +90,35 @@ async fn control_loop(
         debug!(?msg, "control msg in");
 
         let response = match msg {
-            ControlMsg::CreateTunnel(req) => {
-                #[allow(clippy::option_if_let_else)]
-                if let Some(s) = req.subdomain {
-                    match registry.create_tunnel(&s, session_id, token_name) {
-                        Ok(t) => {
-                            let tunnel_id =
-                                t.id.parse::<ulid::Ulid>()
-                                    .context("registry produced non-ulid tunnel id")
-                                    .unwrap_or_else(|_| {
-                                        error!("failed to parse tunnel id as ulid: {}", t.id);
-                                        ulid::Ulid::nil()
-                                    });
-                            ControlMsg::TunnelCreated(TunnelCreatedResp {
-                                tunnel_id: tunnel_id.to_string(),
-                                hostname: t.hostname.clone(),
-                                subdomain: t.subdomain.clone(),
-                            })
-                        }
-                        Err(crate::registry::RegistryError::SubdomainTaken(_)) => {
-                            ControlMsg::Error {
-                                code: ErrorCode::SubdomainTaken,
-                                message: format!("subdomain '{s}' already in use"),
-                            }
-                        }
-                        Err(crate::registry::RegistryError::InvalidSubdomain(_)) => {
-                            ControlMsg::Error {
-                                code: ErrorCode::InvalidSubdomain,
-                                message: format!("invalid subdomain '{s}'"),
-                            }
-                        }
-                        Err(e) => ControlMsg::Error {
-                            code: ErrorCode::Internal,
-                            message: e.to_string(),
-                        },
-                    }
-                } else {
-                    ControlMsg::Error {
+            ControlMsg::CreateTunnel(req) => match req.subdomain {
+                None => ControlMsg::Error {
+                    code: ErrorCode::InvalidSubdomain,
+                    message: "random subdomain not yet supported on this daemon".to_string(),
+                },
+                Some(subdomain) => match registry.create_tunnel(&subdomain, session_id, token_name)
+                {
+                    Ok(t) => ControlMsg::TunnelCreated(TunnelCreatedResp {
+                        tunnel_id: t
+                            .id
+                            .parse::<ulid::Ulid>()
+                            .context("registry produced non-ulid tunnel id")?,
+                        hostname: t.hostname.clone(),
+                        subdomain: t.subdomain.clone(),
+                    }),
+                    Err(crate::registry::RegistryError::SubdomainTaken(_)) => ControlMsg::Error {
+                        code: ErrorCode::SubdomainTaken,
+                        message: format!("subdomain '{subdomain}' already in use"),
+                    },
+                    Err(crate::registry::RegistryError::InvalidSubdomain(_)) => ControlMsg::Error {
                         code: ErrorCode::InvalidSubdomain,
-                        message: "random subdomain not yet supported on this daemon".to_string(),
-                    }
-                }
-            }
+                        message: format!("invalid subdomain '{subdomain}'"),
+                    },
+                    Err(e) => ControlMsg::Error {
+                        code: ErrorCode::Internal,
+                        message: e.to_string(),
+                    },
+                },
+            },
 
             ControlMsg::Heartbeat => ControlMsg::HeartbeatAck,
             ControlMsg::Close => return Ok(()),
