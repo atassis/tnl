@@ -30,6 +30,15 @@ pub enum TokenCmd {
         #[arg(long)]
         replace: bool,
     },
+    /// Remove a token by name.
+    Revoke {
+        name: String,
+        #[arg(long, default_value = "/etc/tnld/tokens.toml")]
+        tokens_file: PathBuf,
+        /// Skip the "are you sure?" confirmation.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Serialize)]
@@ -46,6 +55,11 @@ pub fn run(cmd: TokenCmd) -> Result<()> {
             tokens_file,
             replace,
         } => add(&name, &tokens_file, replace),
+        TokenCmd::Revoke {
+            name,
+            tokens_file,
+            yes,
+        } => revoke(&name, &tokens_file, yes),
     }
 }
 
@@ -100,6 +114,36 @@ fn add(name: &str, tokens_file: &PathBuf, replace: bool) -> Result<()> {
 
     eprintln!("✓ Token {:?} written to {}", name, tokens_file.display());
     println!("{plaintext}");
+    Ok(())
+}
+
+fn revoke(name: &str, tokens_file: &PathBuf, yes: bool) -> Result<()> {
+    let raw = std::fs::read_to_string(tokens_file)
+        .with_context(|| format!("read tokens file at {}", tokens_file.display()))?;
+    let mut tf: TokensFile = if raw.trim().is_empty() {
+        TokensFile { tokens: vec![] }
+    } else {
+        toml::from_str(&raw).context("parse tokens file")?
+    };
+    let before = tf.tokens.len();
+    tf.tokens.retain(|t| t.name != name);
+    if tf.tokens.len() == before {
+        anyhow::bail!("no such token: {name:?}");
+    }
+    if !yes {
+        use std::io::{stdin, BufRead};
+        eprint!("Revoke token {name:?}? Active sessions will be terminated. (y/N) ");
+        let mut line = String::new();
+        stdin()
+            .lock()
+            .read_line(&mut line)
+            .context("read confirmation")?;
+        if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
+            anyhow::bail!("aborted");
+        }
+    }
+    write_tokens_file_atomic(tokens_file, &tf)?;
+    eprintln!("✓ Token {name:?} revoked.");
     Ok(())
 }
 

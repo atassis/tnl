@@ -1,5 +1,7 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+use std::time::SystemTime;
 
 use anyhow::Context;
 use argon2::password_hash::{PasswordHash, PasswordVerifier, SaltString};
@@ -20,25 +22,41 @@ pub struct TokensFile {
 
 #[derive(Debug)]
 pub struct TokenStore {
+    path: PathBuf,
+    inner: RwLock<TokenStoreInner>,
+}
+
+#[derive(Debug)]
+struct TokenStoreInner {
     by_hash: HashMap<String, TokenEntry>,
+    mtime: Option<SystemTime>,
 }
 
 impl TokenStore {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("read tokens file at {}", path.display()))?;
-        let file: TokensFile = toml::from_str(&text).context("parse tokens.toml")?;
-        let mut by_hash = HashMap::new();
-        for tok in file.tokens {
-            by_hash.insert(tok.hash.clone(), tok);
-        }
-        Ok(Self { by_hash })
+        let inner = read_inner(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            inner: RwLock::new(inner),
+        })
     }
 
     /// Look up which token (if any) matches the given plaintext.
-    /// Returns the token name on match, `None` otherwise.
-    pub fn verify(&self, plaintext: &str) -> Option<&str> {
-        for (hash_str, entry) in &self.by_hash {
+    /// Re-reads tokens.toml first if its mtime has advanced.
+    pub fn verify(&self, plaintext: &str) -> Option<String> {
+        // Best-effort reload; if stat fails we keep the cached state.
+        let _ = self.reload_if_changed();
+        // Collect entries while holding the lock, then drop the lock before
+        // doing the expensive argon2 verification.
+        let entries: Vec<(String, String)> = self
+            .inner
+            .read()
+            .ok()?
+            .by_hash
+            .iter()
+            .map(|(h, e)| (h.clone(), e.name.clone()))
+            .collect();
+        for (hash_str, name) in &entries {
             let Ok(parsed) = PasswordHash::new(hash_str) else {
                 continue;
             };
@@ -46,15 +64,48 @@ impl TokenStore {
                 .verify_password(plaintext.as_bytes(), &parsed)
                 .is_ok()
             {
-                return Some(&entry.name);
+                return Some(name.clone());
             }
         }
         None
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_hash.is_empty()
+        self.inner
+            .read()
+            .map(|g| g.by_hash.is_empty())
+            .unwrap_or(true)
     }
+
+    fn reload_if_changed(&self) -> anyhow::Result<()> {
+        let meta = std::fs::metadata(&self.path)
+            .with_context(|| format!("stat {}", self.path.display()))?;
+        let new_mtime = meta.modified().ok();
+        let cached_mtime = self.inner.read().ok().and_then(|g| g.mtime);
+        if new_mtime > cached_mtime {
+            let fresh = read_inner(&self.path)?;
+            if let Ok(mut guard) = self.inner.write() {
+                *guard = fresh;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn read_inner(path: &Path) -> anyhow::Result<TokenStoreInner> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read tokens file at {}", path.display()))?;
+    let file: TokensFile = if text.trim().is_empty() {
+        TokensFile::default()
+    } else {
+        toml::from_str(&text).context("parse tokens.toml")?
+    };
+    let mut by_hash = HashMap::new();
+    for tok in file.tokens {
+        by_hash.insert(tok.hash.clone(), tok);
+    }
+    let mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+    Ok(TokenStoreInner { by_hash, mtime })
 }
 
 /// Hash a plaintext token with argon2id default parameters.
@@ -89,7 +140,7 @@ mod tests {
         tmp.write_all(toml_text.as_bytes()).unwrap();
 
         let store = TokenStore::load(tmp.path()).unwrap();
-        assert_eq!(store.verify("tnl_TESTSECRET"), Some("smoke"));
+        assert_eq!(store.verify("tnl_TESTSECRET"), Some("smoke".to_string()));
         assert_eq!(store.verify("wrong"), None);
     }
 }

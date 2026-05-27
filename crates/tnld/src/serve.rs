@@ -102,9 +102,7 @@ async fn bearer_auth(
     };
 
     if let Some(name) = state.tokens.verify(bearer) {
-        req.extensions_mut().insert(AuthedToken {
-            name: name.to_string(),
-        });
+        req.extensions_mut().insert(AuthedToken { name });
         next.run(req).await
     } else {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
