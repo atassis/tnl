@@ -51,6 +51,27 @@ enum Cmd {
         /// Subdomain to close, e.g. `foo` (not the full hostname).
         subdomain: String,
     },
+    /// First-run wizard (interactive in a TTY; flag-driven otherwise).
+    Init {
+        /// Redeem an invite URL.
+        #[arg(long)]
+        invite: Option<String>,
+        /// Endpoint URL (used with --token).
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Bearer token (used with --endpoint).
+        #[arg(long, env = "TNL_TOKEN")]
+        token: Option<String>,
+        /// Overwrite an existing config without prompting.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Emit a JSON status line at the end instead of human text.
+        #[arg(long)]
+        json: bool,
+        /// Skip the shell-completion offer.
+        #[arg(long)]
+        no_shell_completion: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -128,6 +149,24 @@ fn main() -> anyhow::Result<()> {
         Cmd::Stop { subdomain } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(tnl::commands::stop::run(&subdomain))
+        }
+        Cmd::Init {
+            invite,
+            endpoint,
+            token,
+            yes,
+            json,
+            no_shell_completion,
+        } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(tnl::commands::init::run(tnl::commands::init::InitArgs {
+                invite,
+                endpoint,
+                token,
+                yes,
+                json,
+                no_shell_completion,
+            }))
         }
     }
 }

@@ -191,9 +191,7 @@ pub async fn run_accept_loop(
                 let tx_opt = log_tx.clone();
                 tokio::spawn(async move {
                     let result = match tx_opt {
-                        Some(tx) => {
-                            Box::pin(forward_with_inspection(stream, port, tx)).await
-                        }
+                        Some(tx) => Box::pin(forward_with_inspection(stream, port, tx)).await,
                         None => forward(stream, port).await,
                     };
                     if let Err(e) = result {
