@@ -36,6 +36,11 @@ enum AuthCmd {
         #[arg(long, env = "TNL_TOKEN")]
         token: String,
     },
+    /// Redeem an invite URL (https://<endpoint>/invite/<code>) and save token.
+    Pair {
+        /// Full invite URL.
+        invite_url: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -55,6 +60,10 @@ fn main() -> anyhow::Result<()> {
         Cmd::Auth(AuthCmd::Login { endpoint, token }) => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(tnl::commands::auth::run_login(&endpoint, &token))
+        }
+        Cmd::Auth(AuthCmd::Pair { invite_url }) => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(tnl::commands::auth::run_pair(&invite_url))
         }
         Cmd::Http { port, subdomain } => {
             let rt = tokio::runtime::Runtime::new()?;
