@@ -21,8 +21,9 @@ enum Cmd {
     Http {
         /// Local port to forward (e.g. 3000).
         port: u16,
-        /// Subdomain under `<hostname_root>` to claim (e.g. "foo" → foo.t.example.com).
-        subdomain: String,
+        /// Subdomain under `<hostname_root>` to claim. If omitted, the daemon
+        /// picks a random adjective-noun-N name like "happy-otter-12".
+        subdomain: Option<String>,
     },
 }
 
@@ -57,7 +58,7 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::Http { port, subdomain } => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(tnl::commands::http::run(port, &subdomain))
+            rt.block_on(tnl::commands::http::run(port, subdomain.as_deref()))
         }
     }
 }
