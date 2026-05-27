@@ -125,9 +125,7 @@ fn mint_token(name: &str, tokens_file: &PathBuf) -> Result<()> {
     };
 
     let mut tf: TokensFile = match std::fs::read_to_string(tokens_file) {
-        Ok(raw) if !raw.trim().is_empty() => {
-            toml::from_str(&raw).context("parse tokens file")?
-        }
+        Ok(raw) if !raw.trim().is_empty() => toml::from_str(&raw).context("parse tokens file")?,
         _ => TokensFile { tokens: vec![] },
     };
     tf.tokens.push(entry);

@@ -61,7 +61,15 @@ enum Cmd {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() {
+    let result = real_main();
+    if let Err(e) = result {
+        eprintln!("error: {e:#}");
+        std::process::exit(tnld::exit::classify(&e));
+    }
+}
+
+fn real_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::HashPassword { plaintext } => tnld::hash_password::run(&plaintext),
