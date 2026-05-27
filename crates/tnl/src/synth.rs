@@ -14,6 +14,11 @@ pub struct SynthInput<'a> {
     /// Failure-kind string from `ConnectError::to_kind` or one of the
     /// phase-2 kinds ("local-eof", "local-malformed", "local-no-response").
     pub kind: &'a str,
+    /// One-sentence cause string — typically `format!("{e}")` of the
+    /// underlying error. Rendered in the "Reason" slot of the error body.
+    pub reason: &'a str,
+    /// Short remediation advice — typically `ConnectError::hint()` or a
+    /// phase-2-kind-specific string. Rendered in the highlighted fix slot.
     pub hint: &'a str,
     pub tunnel: &'a str,
     /// Target as the user typed it (or "localhost:<port>" for port-only).
@@ -33,7 +38,7 @@ pub fn synth_response_bytes(input: &SynthInput<'_>) -> Vec<u8> {
             kind: Some(input.kind),
             tunnel: Some(input.tunnel),
             target: Some(input.display_target),
-            reason: input.hint,
+            reason: input.reason,
             hint: input.hint,
             req_id: input.req_id,
             version: input.version,
