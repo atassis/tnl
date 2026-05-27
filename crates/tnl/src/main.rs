@@ -48,23 +48,21 @@ enum Cmd {
     /// Inspect or modify local CLI config.
     #[command(subcommand)]
     Config(ConfigCmd),
-    /// Open an HTTP tunnel forwarding to a local port.
+    /// Open an HTTP tunnel forwarding to a local port or host:port.
     Http {
-        /// Local port to forward (e.g. 3000).
-        port: u16,
-        /// Subdomain under `<hostname_root>` to claim. If omitted, the daemon
-        /// picks a random adjective-noun-N name like "happy-otter-12".
+        /// Local target: a bare port (forwards to localhost dual-stack), or
+        /// `IP:PORT`. Examples: `3000`, `127.0.0.1:3000`, `[::1]:8080`,
+        /// `192.168.1.50:80`. Hostnames are not accepted in alpha.3.
+        #[arg(value_name = "TARGET", value_parser = parse_target)]
+        target: tnl::target::Target,
+        /// Subdomain to claim. If omitted, the daemon assigns a random one.
         subdomain: Option<String>,
-        /// Suppress the per-request log (default emits a one-line summary per request).
         #[arg(long, conflicts_with_all = ["verbose", "very_verbose"])]
         quiet: bool,
-        /// More detail per request line.
         #[arg(short = 'v', long, conflicts_with = "very_verbose")]
         verbose: bool,
-        /// Even more detail (request body preview etc).
         #[arg(short = 'V', long = "very-verbose")]
         very_verbose: bool,
-        /// Emit each log line as JSON for piping into jq.
         #[arg(long)]
         json: bool,
     },
@@ -151,6 +149,11 @@ enum ConfigCmd {
     },
 }
 
+fn parse_target(s: &str) -> Result<tnl::target::Target, String> {
+    use std::str::FromStr as _;
+    tnl::target::Target::from_str(s).map_err(|e| format!("{e}"))
+}
+
 fn main() {
     // Must be called before argument parsing so that completion requests
     // (COMPLETE=<shell> tnl -- …) are intercepted before any real CLI logic
@@ -182,7 +185,7 @@ fn real_main() -> anyhow::Result<()> {
             rt.block_on(tnl::commands::auth::run_pair(&invite_url))
         }
         Cmd::Http {
-            port,
+            target,
             subdomain,
             quiet,
             verbose,
@@ -205,7 +208,7 @@ fn real_main() -> anyhow::Result<()> {
             };
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(tnl::commands::http::run(
-                tnl::target::Target::LocalhostPort(port),
+                target,
                 subdomain.as_deref(),
                 verbosity,
                 format,
