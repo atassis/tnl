@@ -61,7 +61,7 @@ pub async fn connect_and_create(
         .context("open control substream")?;
 
     let req = ControlMsg::CreateTunnel(CreateTunnelReq {
-        subdomain: subdomain.to_string(),
+        subdomain: Some(subdomain.to_string()),
     });
     let payload = serde_json::to_vec(&req)?;
     let len = u32::try_from(payload.len())

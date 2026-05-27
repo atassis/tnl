@@ -56,7 +56,7 @@ async fn cli_creates_tunnel_via_control_channel() {
 
     // ── send CreateTunnel ──────────────────────────────────────────
     let msg = ControlMsg::CreateTunnel(CreateTunnelReq {
-        subdomain: "foo".into(),
+        subdomain: Some("foo".into()),
     });
     let payload = serde_json::to_vec(&msg).unwrap();
     let len = u32::try_from(payload.len()).unwrap().to_be_bytes();

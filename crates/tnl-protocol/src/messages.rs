@@ -20,15 +20,20 @@ pub enum ControlMsg {
     Error { code: ErrorCode, message: String },
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CreateTunnelReq {
-    pub subdomain: String,
+    /// `None` means "server picks a random subdomain". Alpha clients always sent a String;
+    /// `#[serde(default)]` keeps the wire backward-compatible.
+    #[serde(default)]
+    pub subdomain: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct TunnelCreatedResp {
     pub tunnel_id: String,
     pub hostname: String,
+    /// Echoes the subdomain actually assigned (may be server-generated).
+    pub subdomain: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -107,7 +112,7 @@ mod tests {
     #[test]
     fn control_msg_roundtrip_create_tunnel() {
         let msg = ControlMsg::CreateTunnel(CreateTunnelReq {
-            subdomain: "foo".into(),
+            subdomain: Some("foo".into()),
         });
         let s = serde_json::to_string(&msg).unwrap();
         let back: ControlMsg = serde_json::from_str(&s).unwrap();
@@ -117,8 +122,9 @@ mod tests {
     #[test]
     fn control_msg_roundtrip_tunnel_created() {
         let msg = ControlMsg::TunnelCreated(TunnelCreatedResp {
-            tunnel_id: "01JCMR5XYZ".into(),
+            tunnel_id: ulid::Ulid::nil().to_string(),
             hostname: "foo.t.example.com".into(),
+            subdomain: "foo".into(),
         });
         let s = serde_json::to_string(&msg).unwrap();
         assert!(s.contains(r#""type":"TunnelCreated""#));
@@ -247,5 +253,35 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn create_tunnel_req_accepts_omitted_subdomain() {
+        // Alpha-style: subdomain always present.
+        let alpha = r#"{"subdomain":"demo"}"#;
+        let v: CreateTunnelReq = serde_json::from_str(alpha).unwrap();
+        assert_eq!(v.subdomain, Some("demo".to_string()));
+
+        // Beta-style: subdomain omitted entirely.
+        let beta = "{}";
+        let v: CreateTunnelReq = serde_json::from_str(beta).unwrap();
+        assert_eq!(v.subdomain, None);
+
+        // Beta-style: subdomain explicitly null.
+        let null_form = r#"{"subdomain":null}"#;
+        let v: CreateTunnelReq = serde_json::from_str(null_form).unwrap();
+        assert_eq!(v.subdomain, None);
+    }
+
+    #[test]
+    fn tunnel_created_resp_echoes_subdomain() {
+        let resp = TunnelCreatedResp {
+            hostname: "happy-otter-12.t.example.com".to_string(),
+            subdomain: "happy-otter-12".to_string(),
+            tunnel_id: ulid::Ulid::nil().to_string(),
+        };
+        let s = serde_json::to_string(&resp).unwrap();
+        let back: TunnelCreatedResp = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.subdomain, "happy-otter-12");
     }
 }
