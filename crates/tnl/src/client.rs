@@ -53,7 +53,7 @@ pub async fn connect_and_create(
         .with_context(|| format!("connect to {url}"))?;
     info!(%url, "connected via WSS");
 
-    let mut session = tnl_protocol::transport::client_session_from_ws(ws);
+    let mut session = tnl_protocol::transport::client_session_from_ws_generic(ws);
 
     let mut ctrl: Pin<Box<dyn tnl_protocol::Stream>> = session
         .open_stream()

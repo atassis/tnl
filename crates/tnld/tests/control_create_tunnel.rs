@@ -44,7 +44,7 @@ async fn cli_creates_tunnel_via_control_channel() {
     let (ws, _) = async_tungstenite::tokio::connect_async(req).await.unwrap();
 
     // wrap as yamux client session (CLI-role: yamux Server)
-    let mut session = tnl_protocol::transport::client_session_from_ws(ws);
+    let mut session = tnl_protocol::transport::client_session_from_ws_generic(ws);
 
     // ── open control substream ─────────────────────────────────────
     // CLI opens the control stream first; daemon's accept_stream picks it up.

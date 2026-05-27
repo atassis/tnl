@@ -485,7 +485,7 @@ mod yamux_tests {
         let (ws, _) = connect_async(url).await.unwrap();
         // `ws` is `WebSocketStream<TokioAdapter<TcpStream>>` (plain ws://, no TLS).
         // Build a CLI-side yamux session.
-        let mut session = crate::transport::client_session_from_ws(ws); // cli role
+        let mut session = crate::transport::client_session_from_ws_generic(ws); // cli role
         let mut s = session.accept_stream().await.unwrap().unwrap();
         let mut buf = vec![0u8; b"hello from daemon".len()];
         AsyncReadExt::read_exact(&mut s, &mut buf).await.unwrap();
