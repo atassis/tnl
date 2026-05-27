@@ -10,7 +10,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Print version and exit.
-    Version,
+    Version {
+        #[arg(long)]
+        json: bool,
+    },
     /// Authenticate with a tnld endpoint and store credentials locally.
     #[command(subcommand)]
     Auth(AuthCmd),
@@ -93,7 +96,10 @@ enum AuthCmd {
 #[derive(Subcommand)]
 enum ConfigCmd {
     /// Print the current config (token masked).
-    Show,
+    Show {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() {
@@ -107,11 +113,11 @@ fn main() {
 fn real_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Version => {
-            tnl::commands::version::run();
+        Cmd::Version { json } => {
+            tnl::commands::version::run(json);
             Ok(())
         }
-        Cmd::Config(ConfigCmd::Show) => tnl::commands::config::run_show(),
+        Cmd::Config(ConfigCmd::Show { json }) => tnl::commands::config::run_show(json),
         Cmd::Auth(AuthCmd::Login { endpoint, token }) => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(tnl::commands::auth::run_login(&endpoint, &token))

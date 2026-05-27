@@ -42,6 +42,9 @@ pub struct Inspector {
 
 impl Inspector {
     pub fn new(rx: mpsc::Receiver<LogLine>, verbosity: Verbosity, format: Format) -> Self {
+        // NO_COLOR support per https://no-color.org/: any non-empty value of the
+        // environment variable disables ANSI color output. We also gate on
+        // stdout.is_terminal() so piped invocations don't get escape sequences.
         let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout())
             && std::env::var_os("NO_COLOR").is_none();
         Self {

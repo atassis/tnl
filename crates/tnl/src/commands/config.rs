@@ -2,11 +2,22 @@ use std::path::PathBuf;
 
 use crate::config::Config;
 
-pub fn run_show() -> anyhow::Result<()> {
+pub fn run_show(json: bool) -> anyhow::Result<()> {
     let path = resolve_config_path()?;
     let cfg = Config::load_from(&path)?;
-    println!("endpoint: {}", cfg.endpoint);
-    println!("token:    {}", cfg.masked_token());
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "endpoint": cfg.endpoint,
+                "token_masked": cfg.masked_token(),
+                "path": path.display().to_string(),
+            })
+        );
+    } else {
+        println!("endpoint: {}", cfg.endpoint);
+        println!("token:    {}", cfg.masked_token());
+    }
     Ok(())
 }
 
