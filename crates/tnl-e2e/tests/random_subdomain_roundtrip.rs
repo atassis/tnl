@@ -56,7 +56,11 @@ async fn server_picks_subdomain_when_client_omits() {
     let hostname = session.hostname.clone();
     let session_box = session.session;
     let _ctrl_keep = session.control;
-    let _accept = tokio::spawn(tnl::client::run_accept_loop(session_box, backend_port));
+    let _accept = tokio::spawn(tnl::client::run_accept_loop(
+        session_box,
+        backend_port,
+        None,
+    ));
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let client = reqwest::Client::builder()

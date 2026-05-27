@@ -43,7 +43,11 @@ async fn status_and_stop_round_trip() {
             .await
             .unwrap();
     let _ctrl_keep = session.control;
-    let _accept = tokio::spawn(tnl::client::run_accept_loop(session.session, backend_port));
+    let _accept = tokio::spawn(tnl::client::run_accept_loop(
+        session.session,
+        backend_port,
+        None,
+    ));
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // GET /tunnels — exactly one active tunnel named "demo".

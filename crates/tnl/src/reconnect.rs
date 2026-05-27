@@ -20,6 +20,9 @@ pub struct Hooks {
     /// When this oneshot fires, the current accept loop is cancelled so the
     /// outer loop can attempt a reattach.
     pub cancel_first_session: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// If set, each forwarded substream tees its head into this channel
+    /// (consumed by Inspector for per-request log lines).
+    pub log_tx: Option<tokio::sync::mpsc::Sender<crate::inspector::LogLine>>,
 }
 
 impl std::fmt::Debug for Hooks {
@@ -29,6 +32,7 @@ impl std::fmt::Debug for Hooks {
                 "cancel_first_session",
                 &self.cancel_first_session.as_ref().map(|_| "<receiver>"),
             )
+            .field("log_tx", &self.log_tx.as_ref().map(|_| "<sender>"))
             .finish()
     }
 }
@@ -117,7 +121,12 @@ pub async fn run(
         let cancel = hooks.cancel_first_session.take();
         // Keep the control stream alive for the duration of the session.
         let _ctrl_keep = session.control;
-        let accept = tokio::spawn(crate::client::run_accept_loop(session.session, local_port));
+        let log_tx = hooks.log_tx.clone();
+        let accept = tokio::spawn(crate::client::run_accept_loop(
+            session.session,
+            local_port,
+            log_tx,
+        ));
 
         tokio::select! {
             r = accept => {

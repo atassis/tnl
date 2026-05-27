@@ -57,7 +57,11 @@ async fn end_to_end_http_request_reaches_local_backend() {
     assert_eq!(session.hostname, "smoke.t.example.com");
     let session_box = session.session;
     let _ctrl = session.control;
-    let _accept = tokio::spawn(tnl::client::run_accept_loop(session_box, backend_port));
+    let _accept = tokio::spawn(tnl::client::run_accept_loop(
+        session_box,
+        backend_port,
+        None,
+    ));
 
     // give the daemon a moment to register
     tokio::time::sleep(Duration::from_millis(100)).await;

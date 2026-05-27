@@ -24,6 +24,18 @@ enum Cmd {
         /// Subdomain under `<hostname_root>` to claim. If omitted, the daemon
         /// picks a random adjective-noun-N name like "happy-otter-12".
         subdomain: Option<String>,
+        /// Suppress the per-request log (default emits a one-line summary per request).
+        #[arg(long, conflicts_with_all = ["verbose", "very_verbose"])]
+        quiet: bool,
+        /// More detail per request line.
+        #[arg(short = 'v', long, conflicts_with = "very_verbose")]
+        verbose: bool,
+        /// Even more detail (request body preview etc).
+        #[arg(short = 'V', long = "very-verbose")]
+        very_verbose: bool,
+        /// Emit each log line as JSON for piping into jq.
+        #[arg(long)]
+        json: bool,
     },
     /// List active tunnels for the configured bearer.
     Status {
@@ -79,9 +91,35 @@ fn main() -> anyhow::Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(tnl::commands::auth::run_pair(&invite_url))
         }
-        Cmd::Http { port, subdomain } => {
+        Cmd::Http {
+            port,
+            subdomain,
+            quiet,
+            verbose,
+            very_verbose,
+            json,
+        } => {
+            let verbosity = if quiet {
+                tnl::inspector::Verbosity::Quiet
+            } else if very_verbose {
+                tnl::inspector::Verbosity::VeryVerbose
+            } else if verbose {
+                tnl::inspector::Verbosity::Verbose
+            } else {
+                tnl::inspector::Verbosity::Default
+            };
+            let format = if json {
+                tnl::inspector::Format::Json
+            } else {
+                tnl::inspector::Format::Text
+            };
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(tnl::commands::http::run(port, subdomain.as_deref()))
+            rt.block_on(tnl::commands::http::run(
+                port,
+                subdomain.as_deref(),
+                verbosity,
+                format,
+            ))
         }
         Cmd::Status { all, json } => {
             let rt = tokio::runtime::Runtime::new()?;

@@ -48,6 +48,7 @@ async fn client_reattaches_within_grace_window() {
             backend_port,
             tnl::reconnect::Hooks {
                 cancel_first_session: Some(cancel_rx),
+                log_tx: None,
             },
         )
         .await
