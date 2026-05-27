@@ -67,6 +67,7 @@ async fn run_session(socket: WebSocket, state: AppState, token: AuthedToken) {
     info!(session_id = %sess_id, "control session closed");
 }
 
+#[allow(clippy::too_many_lines)]
 async fn control_loop(
     mut stream: std::pin::Pin<Box<dyn tnl_protocol::Stream>>,
     registry: &Registry,
