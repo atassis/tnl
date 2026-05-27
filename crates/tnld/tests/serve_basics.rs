@@ -18,6 +18,7 @@ async fn boot_test_server() -> (ServerHandle, String /*token*/) {
         public_url: "http://test".into(),
         hostname_root: "t.example.com".into(),
         tokens_file: tmp_tokens.path().to_string_lossy().into_owned(),
+        session_grace_sec: 30,
     };
     let handle = spawn_server(cfg).await.unwrap();
     // Keep tmp_tokens alive for the duration of the test by leaking it (it's small).

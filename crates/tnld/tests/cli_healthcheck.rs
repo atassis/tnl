@@ -23,6 +23,7 @@ async fn healthcheck_exits_zero_when_daemon_up() {
         public_url: "http://x".into(),
         hostname_root: "t.x".into(),
         tokens_file: tmp.path().to_string_lossy().into_owned(),
+        session_grace_sec: 30,
     };
     let handle = spawn_server(cfg).await.unwrap();
     let addr = handle.local_addr.to_string();

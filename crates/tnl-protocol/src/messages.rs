@@ -41,6 +41,7 @@ pub enum ErrorCode {
     InvalidSubdomain,
     SubdomainTaken,
     TunnelNotFound,
+    TunnelLost,
     Unauthorized,
     Internal,
 }

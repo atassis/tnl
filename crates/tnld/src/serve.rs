@@ -26,6 +26,7 @@ pub struct AppState {
     pub session_handles: Arc<DashMap<String, SessionHandle>>,
     pub pair_registry: Arc<crate::pair::PairRegistry>,
     pub public_url: String,
+    pub session_grace_sec: u32,
 }
 
 impl std::fmt::Debug for AppState {
@@ -35,6 +36,7 @@ impl std::fmt::Debug for AppState {
             .field("registry", &self.registry)
             .field("session_handles_len", &self.session_handles.len())
             .field("public_url", &self.public_url)
+            .field("session_grace_sec", &self.session_grace_sec)
             .finish_non_exhaustive()
     }
 }
@@ -66,12 +68,25 @@ pub async fn spawn_server(cfg: Config) -> anyhow::Result<ServerHandle> {
         });
     }
 
+    // Background GC: sweep tunnels whose grace window has expired.
+    {
+        let reg = registry.clone();
+        let grace = std::time::Duration::from_secs(u64::from(cfg.session_grace_sec));
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                reg.gc_disconnected(grace);
+            }
+        });
+    }
+
     let state = AppState {
         tokens: tokens.clone(),
         registry: registry.clone(),
         session_handles: Arc::new(DashMap::new()),
         pair_registry,
         public_url: cfg.public_url.clone(),
+        session_grace_sec: cfg.session_grace_sec,
     };
 
     let router = build_router(state);

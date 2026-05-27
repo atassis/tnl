@@ -44,6 +44,7 @@ async fn end_to_end_http_request_reaches_local_backend() {
         public_url: "http://test".into(),
         hostname_root: "t.example.com".into(),
         tokens_file: tmp_tokens.path().to_string_lossy().into_owned(),
+        session_grace_sec: 30,
     };
     let tnld_handle = spawn_server(cfg).await.unwrap();
     let tnld_addr = tnld_handle.local_addr.to_string();

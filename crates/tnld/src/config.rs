@@ -8,6 +8,15 @@ pub struct Config {
     pub public_url: String,
     pub hostname_root: String,
     pub tokens_file: String,
+    /// Seconds a tunnel remains reserved after the control WS closes, before GC
+    /// removes it and the subdomain becomes available again. Default: 30.
+    /// Set to 0 to disable the grace window and remove immediately on disconnect.
+    #[serde(default = "default_session_grace_sec")]
+    pub session_grace_sec: u32,
+}
+
+const fn default_session_grace_sec() -> u32 {
+    30
 }
 
 impl Config {

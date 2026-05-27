@@ -24,6 +24,7 @@ async fn tnl_auth_pair_redeems_and_saves_config() {
         public_url: String::new(), // filled in after bind
         hostname_root: "t.x".into(),
         tokens_file: tmp.path().to_string_lossy().into_owned(),
+        session_grace_sec: 30,
     };
     let h = spawn_server(cfg).await.unwrap();
     let addr = h.local_addr;

@@ -18,6 +18,7 @@ async fn spawn() -> (String, tempfile::NamedTempFile) {
         public_url: "http://test.example".into(),
         hostname_root: "t.example.com".into(),
         tokens_file: tmp.path().to_string_lossy().into_owned(),
+        session_grace_sec: 30,
     };
     let h = spawn_server(cfg).await.unwrap();
     (h.local_addr.to_string(), tmp)

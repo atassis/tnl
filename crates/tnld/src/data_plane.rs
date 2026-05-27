@@ -25,8 +25,13 @@ pub async fn handler(State(state): State<AppState>, req: Request) -> Response<Bo
         return text(StatusCode::BAD_GATEWAY, "no such tunnel\n");
     };
 
-    let session_id = &tunnel.session_id;
-    let Some(handle) = state.session_handles.get(session_id).map(|h| h.clone()) else {
+    let Some(session_id) = state.registry.current_session_id(&tunnel.id) else {
+        return text(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tunnel disconnected, awaiting reattach\n",
+        );
+    };
+    let Some(handle) = state.session_handles.get(&session_id).map(|h| h.clone()) else {
         return text(
             StatusCode::SERVICE_UNAVAILABLE,
             "client session not ready\n",

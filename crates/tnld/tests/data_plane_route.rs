@@ -18,6 +18,7 @@ async fn unknown_host_returns_502() {
         public_url: "http://test".into(),
         hostname_root: "t.example.com".into(),
         tokens_file: tmp_tokens.path().to_string_lossy().into_owned(),
+        session_grace_sec: 30,
     };
     let handle = spawn_server(cfg).await.unwrap();
 

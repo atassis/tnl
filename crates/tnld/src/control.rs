@@ -5,7 +5,7 @@ use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::IntoResponse;
 use tnl_protocol::transport::server_session_from_ws_generic;
-use tnl_protocol::{ControlMsg, ErrorCode, Session, TunnelCreatedResp};
+use tnl_protocol::{ControlMsg, ErrorCode, ReattachReq, Session, TunnelCreatedResp};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, info, warn};
 
@@ -22,6 +22,7 @@ pub async fn handler(
 
 async fn run_session(socket: WebSocket, state: AppState, token: AuthedToken) {
     let registry = state.registry.clone();
+    let grace_sec = state.session_grace_sec;
     // Build async-tungstenite WS stream from axum WebSocket via the bridge.
     let ws_stream = match axum_ws_to_tungstenite(socket).await {
         Ok(ws) => ws,
@@ -41,12 +42,12 @@ async fn run_session(socket: WebSocket, state: AppState, token: AuthedToken) {
         Ok(Some(s)) => s,
         Ok(None) => {
             warn!("session closed before control stream");
-            registry.drop_session(&sess_id);
+            registry.drop_session(&sess_id, grace_sec);
             return;
         }
         Err(e) => {
             error!("accept control stream: {e}");
-            registry.drop_session(&sess_id);
+            registry.drop_session(&sess_id, grace_sec);
             return;
         }
     };
@@ -62,7 +63,7 @@ async fn run_session(socket: WebSocket, state: AppState, token: AuthedToken) {
     }
 
     state.session_handles.remove(&sess_id);
-    registry.drop_session(&sess_id);
+    registry.drop_session(&sess_id, grace_sec);
     info!(session_id = %sess_id, "control session closed");
 }
 
@@ -131,6 +132,31 @@ async fn control_loop(
                             },
                         }
                     }
+                }
+            }
+
+            ControlMsg::ReattachTunnel(ReattachReq {
+                tunnel_id,
+                subdomain,
+            }) => {
+                match registry.try_reattach(
+                    &tunnel_id.to_string(),
+                    &subdomain,
+                    token_name,
+                    session_id,
+                ) {
+                    Ok(t) => ControlMsg::TunnelCreated(TunnelCreatedResp {
+                        tunnel_id: t
+                            .id
+                            .parse::<ulid::Ulid>()
+                            .context("registry produced non-ulid tunnel id")?,
+                        hostname: t.hostname.clone(),
+                        subdomain: t.subdomain.clone(),
+                    }),
+                    Err(reason) => ControlMsg::Error {
+                        code: ErrorCode::TunnelLost,
+                        message: format!("reattach failed: {reason}"),
+                    },
                 }
             }
 
