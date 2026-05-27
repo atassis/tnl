@@ -214,23 +214,28 @@ Save the token — you'll add it to Caddy's env in step c.
 #### c. Rebuild Caddy on `your-gateway` with the Cloudflare DNS plugin
 
 The existing Caddy image (`caddy:2.8.4-alpine`) doesn't include DNS plugins.
-Replace it with a `xcaddy`-built image. SSH to `your-gateway`:
+Replace it with an `xcaddy`-built image. The canonical Dockerfile is checked
+into the repo at [`deploy/caddy.Dockerfile.example`](../deploy/caddy.Dockerfile.example).
+Smoke-tested locally: produces caddy `v2.11.3` with `dns.providers.cloudflare`
+loaded, ~155 MB image.
 
+> Note on the version: the Dockerfile pins `caddy:2-builder` (float) rather
+> than the running `2.8.4`. Hard-pinning older minors with `xcaddy build`
+> currently fails because `xcaddy` resolves `go.uber.org/zap` fresh and newer
+> zap dropped `zapslog.HandlerOptions`, which 2.8.4 references. 2.x → 2.11
+> is config-compatible.
+
+Ship and stage on `your-gateway`:
 ```bash
-cd /opt/caddy
-sudo tee Dockerfile <<'EOF'
-FROM caddy:2.8.4-builder AS builder
-RUN xcaddy build \
-    --with github.com/caddy-dns/cloudflare
+# from laptop
+scp deploy/caddy.Dockerfile.example your-gateway:/tmp/caddy.Dockerfile
 
-FROM caddy:2.8.4-alpine
-COPY --from=builder /usr/bin/caddy /usr/bin/caddy
-EOF
-
-sudo tee cloudflare.env <<EOF
+# on your-gateway
+sudo mv /tmp/caddy.Dockerfile /opt/caddy/Dockerfile
+sudo tee /opt/caddy/cloudflare.env >/dev/null <<'EOF'
 CF_API_TOKEN=<paste your CF token from step b>
 EOF
-sudo chmod 600 cloudflare.env
+sudo chmod 600 /opt/caddy/cloudflare.env
 ```
 
 Update `/opt/caddy/compose.yaml` to add `env_file: cloudflare.env` and use
