@@ -36,6 +36,29 @@ use crate::target::Target;
 
 pub const LOCAL_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Test-only override for the first-byte timeout, in milliseconds.
+///
+/// A value of `0` means "use the default `LOCAL_FIRST_BYTE_TIMEOUT`". Tests
+/// set this to a small value (e.g. 200 ms) before exercising a no-response
+/// path, then reset to 0 to leave shared process state unchanged.
+///
+/// This is a `pub` shared atomic because integration tests in
+/// `crates/tnl/tests/` compile as external crates and cannot access
+/// `pub(crate)` symbols, and `#[cfg(test)]` is not propagated to external
+/// test crates.
+#[doc(hidden)]
+pub static TEST_FIRST_BYTE_TIMEOUT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn first_byte_timeout() -> Duration {
+    let ms = TEST_FIRST_BYTE_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if ms == 0 {
+        LOCAL_FIRST_BYTE_TIMEOUT
+    } else {
+        Duration::from_millis(ms)
+    }
+}
+
 /// Context carried through one forwarded substream.
 #[derive(Clone)]
 pub struct ForwardCtx {
@@ -218,7 +241,7 @@ pub async fn forward(
     }
 
     // Phase 2: probe response first line.
-    let probe_res = peek_response_first_line(&mut tcp, LOCAL_FIRST_BYTE_TIMEOUT).await?;
+    let probe_res = peek_response_first_line(&mut tcp, first_byte_timeout()).await?;
     let prefix_bytes = match probe_res {
         ResponseProbe::LooksHttp(prefix) => prefix,
         ResponseProbe::Eof => {
