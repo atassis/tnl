@@ -129,11 +129,24 @@ content doesn't matter; we just need *something* to forward to.)
 ./target/release/tnl http 9999 demo
 ```
 
+`<TARGET>` accepts either a bare port (forwards to `localhost` via dual-stack
+`/etc/hosts` resolution — works for backends bound to `127.0.0.1:port` AND
+`[::1]:port`, e.g. Vite/uvicorn defaults) or an explicit `IP:PORT`:
+
+```bash
+./target/release/tnl http 5173 demo                # bare port (dual-stack)
+./target/release/tnl http 127.0.0.1:5173 demo      # explicit IPv4
+./target/release/tnl http "[::1]:5173" demo        # explicit IPv6
+./target/release/tnl http 192.168.1.50:8080 demo   # LAN host
+```
+
+Hostnames are not accepted in this release.
+
 Expected:
 ```
 ┌─ tnl ─────────────────────────────────────────
 │ Tunnel:    https://demo.t.example.com
-│ Forward:   127.0.0.1:9999
+│ Forward:   localhost:9999
 │ Press Ctrl-C to stop.
 └────────────────────────────────────────────────
 ```
@@ -151,7 +164,7 @@ curl -v -H "Host: demo.t.example.com" http://127.0.0.1:7777/
 Expected: the response body should contain the Python `http.server` directory
 listing (or whatever your backend serves).
 
-**If you see "no such tunnel"** the registration didn't land. Check terminal A
+**If you see a 404 with `X-Tnl-Component: registry`** the registration didn't land. Check terminal A
 for `tnld` logs and B for `tnl` errors.
 
 **If you see the directory listing** — congratulations, the reverse tunnel works
@@ -429,9 +442,15 @@ curl -sf https://demo.t.example.com/
 
 You should see the Python directory listing. The full path was:
 your-laptop ← yamux ← WSS ← Caddy ← TLS ← internet ← Caddy:443 ← `*.t.example.com` →
-`tnld:7777` → registry lookup → yamux substream back to laptop → `127.0.0.1:9999`.
+`tnld:7777` → registry lookup → yamux substream back to laptop → `localhost:9999`
+(dual-stack — tries `127.0.0.1` then `[::1]`).
 
 ### 2.3. Troubleshooting
+
+Every daemon-side error response carries an `X-Tnl-Component` header
+(`registry` / `daemon` / `transport` / `client`) attributing the failure, plus
+a content-negotiated body (HTML / JSON / plain text per `Accept`). Use
+`curl -i` to see the headers.
 
 - **`tnl auth login` says "connect to https://tnl-api.t.example.com: ..."** — Caddy
   site for `tnl-api.t.example.com` isn't there or DNS isn't propagated yet. Check
@@ -439,11 +458,21 @@ your-laptop ← yamux ← WSS ← Caddy ← TLS ← internet ← Caddy:443 ← `
 - **`tnl http …` says "server error (Unauthorized)"** — token mismatch. Re-run
   `tnld hash-password` on the same plaintext, replace the hash, restart `tnld`.
   Plaintext is required to match byte-for-byte.
-- **`curl https://demo.t.example.com/` returns 502 from Caddy with body "no such
-  tunnel"** — `tnl http` not running or `tnld` lost the session. Check the `tnl
-  http` terminal for errors.
-- **Returns 502 from Caddy with body "client session not ready"** — the WS dropped
-  mid-flight. Restart `tnl http`. (v0.1.0-beta will reconnect automatically.)
+- **404 with `X-Tnl-Component: registry`** — no tunnel registered for this host.
+  Start `tnl http` on a client; check terminal for errors.
+- **503 with `X-Tnl-Component: daemon` and `Retry-After: 1`** — tunnel exists
+  in the registry but the client session is missing or in the reattach grace
+  window. The CLI should reconnect automatically; retry the request.
+- **502 with `X-Tnl-Component: client` and `X-Tnl-Origin-Failure: connect-refused`**
+  — the local backend the CLI is forwarding to is not listening on the
+  resolved address. Body lists the resolved target. Start your dev server,
+  or pass an explicit `tnl http <IP>:<PORT>` if you want to bypass dual-stack
+  resolution.
+- **502 with `X-Tnl-Origin-Failure: local-eof | local-malformed | local-no-response`**
+  — the backend accepted the TCP connection but misbehaved on the response.
+  Check the local dev server output.
+- **502 with `X-Tnl-Component: transport`** — daemon-side yamux or socket
+  failure. Check `journalctl -u tnld -g 'server_failure'`.
 - **Returns 503** — `tnld` couldn't open a yamux substream. Likely a transport
   bug; capture `tnld` logs and report.
 - **Caddy reload fails with "no DNS provider"** — xcaddy build didn't include
