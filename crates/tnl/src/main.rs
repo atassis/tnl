@@ -25,6 +25,20 @@ enum Cmd {
         /// picks a random adjective-noun-N name like "happy-otter-12".
         subdomain: Option<String>,
     },
+    /// List active tunnels for the configured bearer.
+    Status {
+        /// Show all tunnels on the server (admin scope; v0.1.0-beta = any bearer).
+        #[arg(long)]
+        all: bool,
+        /// Emit JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Close a tunnel by subdomain.
+    Stop {
+        /// Subdomain to close, e.g. `foo` (not the full hostname).
+        subdomain: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -68,6 +82,14 @@ fn main() -> anyhow::Result<()> {
         Cmd::Http { port, subdomain } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(tnl::commands::http::run(port, subdomain.as_deref()))
+        }
+        Cmd::Status { all, json } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(tnl::commands::status::run(all, json))
+        }
+        Cmd::Stop { subdomain } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(tnl::commands::stop::run(&subdomain))
         }
     }
 }
