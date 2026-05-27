@@ -7,6 +7,7 @@ pub mod exit;
 pub mod forwarder;
 pub mod inspector;
 pub mod invite;
+pub mod peek;
 pub mod reconnect;
 pub mod synth;
 pub mod target;
