@@ -7,14 +7,21 @@ use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LogLine {
+    pub req_id: ulid::Ulid,
     pub timestamp: SystemTime,
     pub method: String,
     pub path: String,
+    /// As typed by the user — "localhost:5173" or "127.0.0.1:5173" or "[`::1`]:8080".
+    pub display_target: String,
+    /// `None` until connect attempted; `Some(addr)` after success or last attempt.
+    pub resolved_addr: Option<std::net::SocketAddr>,
     pub status: Option<u16>,
     pub duration_ms: u64,
     pub bytes_in: u64,
     pub bytes_out: u64,
-    pub remote_ip: Option<String>,
+    /// On failure, the kind catalog key from synth (`connect-refused`,
+    /// `local-eof`, etc.). `None` on success.
+    pub failure_kind: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -73,21 +80,28 @@ impl Inspector {
 
     fn print_text(&self, l: &LogLine) {
         let t = chrono_like_hms(l.timestamp);
-        let status_str = l.status.map_or_else(|| "?".into(), |s| s.to_string());
+        let status_str = l.status.map_or_else(|| "---".into(), |s| s.to_string());
         let status_col = if self.use_color {
             colorise_status(l.status)
         } else {
             status_str
         };
+        let target = l
+            .resolved_addr
+            .map_or_else(|| l.display_target.clone(), |a| a.to_string());
+        let kind_or_bytes = l
+            .failure_kind
+            .as_ref()
+            .map_or_else(|| fmt_bytes(l.bytes_out), std::clone::Clone::clone);
         println!(
-            "{}  {:<6} {:<24} {}  {:>6}ms  {:>8}  {:>8}",
+            "{}  {:<6} {:<26}\u{2192} {:<21} {}  {:>6}ms  {}",
             t,
             l.method,
-            truncate(&l.path, 24),
+            truncate(&l.path, 26),
+            target,
             status_col,
             l.duration_ms,
-            fmt_bytes(l.bytes_in),
-            fmt_bytes(l.bytes_out)
+            kind_or_bytes
         );
     }
 }
@@ -158,5 +172,24 @@ mod tests {
         let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_704_067_290);
         let s = chrono_like_hms(t);
         assert_eq!(s, "00:01:30.000");
+    }
+
+    #[test]
+    fn log_line_failure_has_kind() {
+        let l = LogLine {
+            req_id: ulid::Ulid::nil(),
+            timestamp: SystemTime::UNIX_EPOCH,
+            method: "GET".into(),
+            path: "/".into(),
+            display_target: "localhost:5173".into(),
+            resolved_addr: None,
+            status: None,
+            duration_ms: 3,
+            bytes_in: 0,
+            bytes_out: 0,
+            failure_kind: Some("connect-refused".into()),
+        };
+        let inspector = Inspector::new(mpsc::channel(1).1, Verbosity::Default, Format::Text);
+        inspector.print_text(&l);
     }
 }

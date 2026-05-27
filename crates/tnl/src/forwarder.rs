@@ -11,6 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::debug;
+use ulid::Ulid;
 
 use crate::inspector::LogLine;
 
@@ -131,14 +132,17 @@ pub async fn forward_with_inspection(
 
     let _ = log_tx
         .send(LogLine {
+            req_id: Ulid::new(),
             timestamp: std::time::SystemTime::now(),
             method,
             path,
+            display_target: format!("localhost:{port}"),
+            resolved_addr: None,
             status,
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             bytes_in: bytes_in.load(Ordering::Relaxed),
             bytes_out: bytes_out.load(Ordering::Relaxed),
-            remote_ip: None,
+            failure_kind: None,
         })
         .await;
 
