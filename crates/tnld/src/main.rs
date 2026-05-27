@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use tnld::commands::pair::PairCmd;
 use tnld::commands::token::TokenCmd;
 
 #[derive(Parser)]
@@ -27,6 +28,11 @@ enum Cmd {
         #[arg(short, long, default_value = "/etc/tnld/config.toml")]
         config: std::path::PathBuf,
     },
+    /// Pairing administration: mint and list invite codes.
+    Pair {
+        #[command(subcommand)]
+        cmd: PairCmd,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -37,6 +43,10 @@ fn main() -> anyhow::Result<()> {
         Cmd::Healthcheck { config } => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(tnld::commands::healthcheck::run(config))
+        }
+        Cmd::Pair { cmd } => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(tnld::commands::pair::run(cmd))
         }
         Cmd::Serve { config } => {
             let runtime = tokio::runtime::Runtime::new()?;
