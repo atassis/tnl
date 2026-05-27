@@ -1,4 +1,5 @@
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use tnld::commands::pair::PairCmd;
 use tnld::commands::token::TokenCmd;
 
@@ -32,6 +33,11 @@ enum Cmd {
     Pair {
         #[command(subcommand)]
         cmd: PairCmd,
+    },
+    /// Print shell-completion script for the given shell on stdout.
+    Completion {
+        /// Shell name (bash, zsh, fish, elvish, powershell).
+        shell: Shell,
     },
     /// First-run server wizard. Writes config.toml; optionally mints an initial token.
     Init {
@@ -103,6 +109,11 @@ fn real_main() -> anyhow::Result<()> {
             yes,
             json,
         }),
+        Cmd::Completion { shell } => {
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "tnld", &mut std::io::stdout());
+            Ok(())
+        }
         Cmd::Serve { config } => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async move {

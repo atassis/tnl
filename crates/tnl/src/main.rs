@@ -1,4 +1,5 @@
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 
 #[derive(Parser)]
 #[command(name = "tnl", version, about = "tnl tunneling client")]
@@ -53,6 +54,11 @@ enum Cmd {
     Stop {
         /// Subdomain to close, e.g. `foo` (not the full hostname).
         subdomain: String,
+    },
+    /// Print shell-completion script for the given shell on stdout.
+    Completion {
+        /// Shell name (bash, zsh, fish, elvish, powershell).
+        shell: Shell,
     },
     /// First-run wizard (interactive in a TTY; flag-driven otherwise).
     Init {
@@ -163,6 +169,11 @@ fn real_main() -> anyhow::Result<()> {
         Cmd::Stop { subdomain } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(tnl::commands::stop::run(&subdomain))
+        }
+        Cmd::Completion { shell } => {
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "tnl", &mut std::io::stdout());
+            Ok(())
         }
         Cmd::Init {
             invite,

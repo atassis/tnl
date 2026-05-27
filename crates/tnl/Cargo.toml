@@ -20,6 +20,7 @@ dialoguer.workspace = true
 http = "1"
 bytes.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 futures.workspace = true
 reqwest.workspace = true
 serde.workspace = true

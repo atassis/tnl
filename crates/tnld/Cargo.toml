@@ -24,6 +24,7 @@ async-trait.workspace = true
 axum.workspace = true
 bytes.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 dashmap.workspace = true
 dialoguer.workspace = true
 futures.workspace = true
