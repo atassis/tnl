@@ -63,7 +63,7 @@ pub fn parse_accept(accept_header: Option<&str>, user_agent_header: Option<&str>
     let accept = accept_header.unwrap_or("");
     let ua = user_agent_header.unwrap_or("");
 
-    let has_json = accept
+    let tokens: Vec<String> = accept
         .split(',')
         .map(|s| {
             s.split(';')
@@ -72,24 +72,16 @@ pub fn parse_accept(accept_header: Option<&str>, user_agent_header: Option<&str>
                 .trim()
                 .to_ascii_lowercase()
         })
-        .any(|s| {
-            s == "application/json" || (s.starts_with("application/") && s.ends_with("+json"))
-        });
-    if has_json {
+        .collect();
+
+    if tokens
+        .iter()
+        .any(|s| s == "application/json" || (s.starts_with("application/") && s.ends_with("+json")))
+    {
         return Accept::Json;
     }
 
-    let has_html = accept
-        .split(',')
-        .map(|s| {
-            s.split(';')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase()
-        })
-        .any(|s| s == "text/html");
-    if has_html {
+    if tokens.iter().any(|s| s == "text/html") {
         return Accept::Html;
     }
 
@@ -113,7 +105,7 @@ pub struct ErrorContext<'a> {
     pub reason: &'a str,
     pub hint: &'a str,
     pub req_id: Ulid,
-    pub version: &'static str,
+    pub version: &'a str,
 }
 
 /// Render the body bytes for the negotiated format.
@@ -130,6 +122,18 @@ pub fn render(ctx: &ErrorContext<'_>, accept: Accept) -> Vec<u8> {
     }
 }
 
+/// Escape special HTML characters to prevent injection.
+///
+/// Must replace `&` first so the entity sequences produced below are not
+/// double-escaped.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 fn render_html(c: &ErrorContext<'_>) -> String {
     let title = match c.component {
         Component::Registry => "tnl: no tunnel for host",
@@ -137,9 +141,11 @@ fn render_html(c: &ErrorContext<'_>) -> String {
         Component::Transport => "tnl: tunnel transport error",
         Component::Client => "tnl: local backend unreachable",
     };
-    let tunnel = c.tunnel.unwrap_or("(unknown)");
-    let target = c.target.unwrap_or("(none)");
-    let kind = c.kind.unwrap_or("(n/a)");
+    let tunnel = html_escape(c.tunnel.unwrap_or("(unknown)"));
+    let target = html_escape(c.target.unwrap_or("(none)"));
+    let kind = html_escape(c.kind.unwrap_or("(n/a)"));
+    let reason = html_escape(c.reason);
+    let hint = html_escape(c.hint);
     let mut s = String::with_capacity(1024);
     let _ = write!(
         s,
@@ -159,8 +165,8 @@ code{{background:#f4f4f4;padding:.1em .3em;border-radius:.2em}}\
         tunnel = tunnel,
         target = target,
         kind = kind,
-        reason = c.reason,
-        hint = c.hint,
+        reason = reason,
+        hint = hint,
         version = c.version,
         req_id = c.req_id,
         component = c.component.as_header(),

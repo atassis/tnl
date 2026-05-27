@@ -58,3 +58,82 @@ fn server_side_component_omits_local_only_fields_safely() {
     assert!(s.contains("demo"), "{s}");
     assert!(!s.contains("None"));
 }
+
+#[test]
+fn parse_accept_picks_json_first() {
+    use tnl_protocol::error_page::{parse_accept, Accept};
+    assert_eq!(parse_accept(Some("application/json"), None), Accept::Json);
+    assert_eq!(
+        parse_accept(Some("application/json, text/html;q=0.9"), None),
+        Accept::Json
+    );
+    assert_eq!(
+        parse_accept(Some("application/vnd.x+json"), None),
+        Accept::Json
+    );
+}
+
+#[test]
+fn parse_accept_picks_html_when_no_json() {
+    use tnl_protocol::error_page::{parse_accept, Accept};
+    assert_eq!(
+        parse_accept(Some("text/html, */*;q=0.8"), None),
+        Accept::Html
+    );
+}
+
+#[test]
+fn parse_accept_browser_wildcard_promotes_to_html() {
+    use tnl_protocol::error_page::{parse_accept, Accept};
+    assert_eq!(parse_accept(Some("*/*"), Some("Mozilla/5.0")), Accept::Html);
+    assert_eq!(parse_accept(Some("*/*"), Some("curl/8.0")), Accept::Text);
+    assert_eq!(parse_accept(Some("*/*"), None), Accept::Text);
+}
+
+#[test]
+fn parse_accept_defaults_text_when_missing() {
+    use tnl_protocol::error_page::{parse_accept, Accept};
+    assert_eq!(parse_accept(None, None), Accept::Text);
+    assert_eq!(parse_accept(Some(""), None), Accept::Text);
+}
+
+#[test]
+fn parse_accept_empty_with_mozilla_ua_is_html() {
+    // Edge case from review I1: empty Accept + Mozilla UA falls through the
+    // wildcard branch (intentional — browsers omitting Accept get HTML).
+    use tnl_protocol::error_page::{parse_accept, Accept};
+    assert_eq!(
+        parse_accept(Some(""), Some("Mozilla/5.0 (X11)")),
+        Accept::Html
+    );
+    assert_eq!(parse_accept(None, Some("Mozilla/5.0 (X11)")), Accept::Html);
+}
+
+#[test]
+fn daemon_component_json_omits_target_kind_as_null() {
+    use tnl_protocol::error_page::{render, Accept, Component, ErrorContext};
+    let ctx = ErrorContext {
+        component: Component::Daemon,
+        kind: None,
+        tunnel: Some("demo"),
+        target: None,
+        reason: "tunnel disconnected",
+        hint: "try again",
+        req_id: ulid::Ulid::nil(),
+        version: "0.1.0-test",
+    };
+    let body = render(&ctx, Accept::Json);
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert!(
+        v["kind"].is_null(),
+        "kind should be null, got {:?}",
+        v["kind"]
+    );
+    assert!(
+        v["target"].is_null(),
+        "target should be null, got {:?}",
+        v["target"]
+    );
+    assert_eq!(v["error"], "tunnel_disconnected");
+    assert_eq!(v["component"], "daemon");
+}
