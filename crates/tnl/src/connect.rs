@@ -97,7 +97,7 @@ pub async fn connect_local(
                 return Ok((stream, addr));
             }
             Ok(Err(e)) => {
-                last_err = Some(classify_io(&e));
+                last_err = Some(classify_io(&e, deadline));
             }
             Err(_elapsed) => {
                 last_err = Some(ConnectError::Timeout(deadline));
@@ -107,11 +107,11 @@ pub async fn connect_local(
     Err(last_err.unwrap_or(ConnectError::Refused))
 }
 
-fn classify_io(e: &io::Error) -> ConnectError {
+fn classify_io(e: &io::Error, active_deadline: Duration) -> ConnectError {
     use io::ErrorKind as K;
     match e.kind() {
         K::ConnectionRefused => ConnectError::Refused,
-        K::TimedOut => ConnectError::Timeout(LOCAL_CONNECT_TIMEOUT),
+        K::TimedOut => ConnectError::Timeout(active_deadline),
         K::NetworkUnreachable | K::HostUnreachable => ConnectError::Unreachable,
         _ => {
             // AF not supported (e.g. [::1] when v6 disabled) shows as InvalidInput on Linux.
