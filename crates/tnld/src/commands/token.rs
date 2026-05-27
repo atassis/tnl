@@ -147,7 +147,7 @@ fn revoke(name: &str, tokens_file: &PathBuf, yes: bool) -> Result<()> {
     Ok(())
 }
 
-fn random_token_suffix(len: usize) -> String {
+pub(crate) fn random_token_suffix(len: usize) -> String {
     use rand::distributions::Slice;
     use rand::Rng;
     // Exclude visually ambiguous chars: 0/O, 1/l/I.
@@ -157,7 +157,7 @@ fn random_token_suffix(len: usize) -> String {
     (0..len).map(|_| *rng.sample(dist) as char).collect()
 }
 
-fn write_tokens_file_atomic(path: &std::path::Path, tf: &TokensFile) -> Result<()> {
+pub(crate) fn write_tokens_file_atomic(path: &std::path::Path, tf: &TokensFile) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let parent = path
         .parent()

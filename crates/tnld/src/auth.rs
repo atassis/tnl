@@ -77,6 +77,33 @@ impl TokenStore {
             .unwrap_or(true)
     }
 
+    pub fn append(&self, entry: TokenEntry) -> anyhow::Result<()> {
+        // Read current file (or treat empty as empty list).
+        let raw = std::fs::read_to_string(&self.path).unwrap_or_default();
+        let mut tf: TokensFile = if raw.trim().is_empty() {
+            TokensFile::default()
+        } else {
+            toml::from_str(&raw).context("parse tokens.toml")?
+        };
+        tf.tokens.push(entry);
+
+        // Atomic rewrite using the helper from commands::token.
+        crate::commands::token::write_tokens_file_atomic(&self.path, &tf)?;
+
+        // Refresh in-memory state.
+        let mut by_hash = HashMap::new();
+        for tok in tf.tokens {
+            by_hash.insert(tok.hash.clone(), tok);
+        }
+        let mtime = std::fs::metadata(&self.path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        if let Ok(mut guard) = self.inner.write() {
+            *guard = TokenStoreInner { by_hash, mtime };
+        }
+        Ok(())
+    }
+
     fn reload_if_changed(&self) -> anyhow::Result<()> {
         let meta = std::fs::metadata(&self.path)
             .with_context(|| format!("stat {}", self.path.display()))?;

@@ -24,6 +24,8 @@ pub struct AppState {
     pub tokens: Arc<TokenStore>,
     pub registry: Arc<Registry>,
     pub session_handles: Arc<DashMap<String, SessionHandle>>,
+    pub pair_registry: Arc<crate::pair::PairRegistry>,
+    pub public_url: String,
 }
 
 impl std::fmt::Debug for AppState {
@@ -32,7 +34,8 @@ impl std::fmt::Debug for AppState {
             .field("tokens", &self.tokens)
             .field("registry", &self.registry)
             .field("session_handles_len", &self.session_handles.len())
-            .finish()
+            .field("public_url", &self.public_url)
+            .finish_non_exhaustive()
     }
 }
 
@@ -50,10 +53,25 @@ pub struct ServerHandle {
 pub async fn spawn_server(cfg: Config) -> anyhow::Result<ServerHandle> {
     let tokens = Arc::new(TokenStore::load(std::path::Path::new(&cfg.tokens_file))?);
     let registry = Arc::new(Registry::new(cfg.hostname_root.clone()));
+    let pair_registry = Arc::new(crate::pair::PairRegistry::new());
+
+    // Background cleanup of expired pair codes.
+    {
+        let pr = pair_registry.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                pr.cleanup();
+            }
+        });
+    }
+
     let state = AppState {
         tokens: tokens.clone(),
         registry: registry.clone(),
         session_handles: Arc::new(DashMap::new()),
+        pair_registry,
+        public_url: cfg.public_url.clone(),
     };
 
     let router = build_router(state);
@@ -61,7 +79,12 @@ pub async fn spawn_server(cfg: Config) -> anyhow::Result<ServerHandle> {
     let listener = TcpListener::bind(&cfg.listen).await?;
     let local_addr = listener.local_addr()?;
     let join = tokio::spawn(async move {
-        axum::serve(listener, router).await.ok();
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .ok();
     });
     Ok(ServerHandle { local_addr, join })
 }
@@ -75,6 +98,7 @@ fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .merge(authed)
+        .merge(crate::admin::router())
         .fallback(crate::data_plane::handler)
         .with_state(state)
 }
