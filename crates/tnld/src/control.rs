@@ -216,7 +216,18 @@ async fn axum_ws_to_tungstenite(
             }
         };
 
-        tokio::join!(axum_to_client, client_to_axum);
+        // Use `select!` rather than `join!`: when one half exits (e.g. real WS
+        // sees Close/FIN), the other future is dropped, which drops its captured
+        // half of `client_ws.split()` and `axum_ws.split()`. Both halves of
+        // `client_ws` going away closes the duplex `a` end, which makes the
+        // daemon-side `server_ws` read EOF — the only signal that propagates
+        // through the yamux driver into `control_loop` and triggers cleanup.
+        // With `join!` only one half drops on Close, the duplex stays open, and
+        // the daemon never releases the session (subdomain leaks until restart).
+        tokio::select! {
+            () = axum_to_client => {},
+            () = client_to_axum => {},
+        }
     });
 
     Ok(server_ws)
