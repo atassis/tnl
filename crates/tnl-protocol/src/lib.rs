@@ -2,6 +2,7 @@
 
 pub mod messages;
 pub mod transport;
+pub mod wordlists;
 
 pub use messages::{ControlMsg, CreateTunnelReq, ErrorCode, LogLine, TunnelCreatedResp};
 pub use transport::{
