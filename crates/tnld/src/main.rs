@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use tnld::commands::token::TokenCmd;
 
 #[derive(Parser)]
 #[command(name = "tnld", version, about = "tnl tunneling daemon")]
@@ -16,12 +17,18 @@ enum Cmd {
     },
     /// Print an argon2id hash for the given plaintext token.
     HashPassword { plaintext: String },
+    /// Token administration (list / add / revoke).
+    Token {
+        #[command(subcommand)]
+        cmd: TokenCmd,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::HashPassword { plaintext } => tnld::hash_password::run(&plaintext),
+        Cmd::Token { cmd } => tnld::commands::token::run(cmd),
         Cmd::Serve { config } => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async move {
