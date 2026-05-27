@@ -13,12 +13,17 @@ workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+async-tungstenite = { workspace = true }
 axum.workspace = true
+http = { workspace = true }
+rcgen = "0.13"
 reqwest = { workspace = true, features = ["rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 tempfile = "3"
 tnl-protocol = { path = "../tnl-protocol" }
 tnld = { path = "../tnld" }
 tnl = { path = "../tnl" }
 tokio = { workspace = true, features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
 toml.workspace = true
 tracing-subscriber.workspace = true
