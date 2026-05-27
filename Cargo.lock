@@ -2090,7 +2090,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tnl"
-version = "0.1.0-alpha.2"
+version = "0.1.0-beta.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2123,7 +2123,7 @@ dependencies = [
 
 [[package]]
 name = "tnl-e2e"
-version = "0.1.0-alpha.2"
+version = "0.1.0-beta.0"
 dependencies = [
  "anyhow",
  "async-tungstenite",
@@ -2144,7 +2144,7 @@ dependencies = [
 
 [[package]]
 name = "tnl-protocol"
-version = "0.1.0-alpha.2"
+version = "0.1.0-beta.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2164,7 +2164,7 @@ dependencies = [
 
 [[package]]
 name = "tnld"
-version = "0.1.0-alpha.2"
+version = "0.1.0-beta.0"
 dependencies = [
  "anyhow",
  "arc-swap",
