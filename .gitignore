@@ -7,3 +7,4 @@ Cargo.lock.bak
 *.swp
 *.swo
 .DS_Store
+.worktrees/
