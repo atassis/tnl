@@ -5,7 +5,7 @@ use axum::extract::{Request, State};
 use axum::http::header::{HeaderName, HeaderValue};
 use axum::http::{HeaderMap, Response, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::serve::AppState;
 
@@ -79,6 +79,15 @@ pub async fn handler(State(state): State<AppState>, req: Request) -> Response<Bo
             }
         }
     }
+
+    info!(
+        host = %host_no_port,
+        method = %parts.method,
+        path = %parts.uri.path(),
+        status = ?parsed_status_for_log(&resp_buf),
+        bytes_resp = resp_buf.len(),
+        "data-plane request"
+    );
 
     match build_response_from_raw(&resp_buf) {
         Ok(r) => r,
@@ -197,6 +206,15 @@ fn decode_chunked(input: &[u8]) -> Result<Vec<u8>, String> {
         i += 2;
     }
     Ok(out)
+}
+
+fn parsed_status_for_log(buf: &[u8]) -> Option<u16> {
+    let mut headers = [httparse::EMPTY_HEADER; 8];
+    let mut parsed = httparse::Response::new(&mut headers);
+    match parsed.parse(buf).ok()? {
+        httparse::Status::Complete(_) => parsed.code,
+        httparse::Status::Partial => None,
+    }
 }
 
 #[cfg(test)]
