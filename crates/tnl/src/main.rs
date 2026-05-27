@@ -55,6 +55,11 @@ enum Cmd {
         /// Subdomain to close, e.g. `foo` (not the full hostname).
         subdomain: String,
     },
+    /// Self-diagnostic: check config, daemon connectivity, token validity, clock skew.
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
     /// Print shell-completion script for the given shell on stdout.
     Completion {
         /// Shell name (bash, zsh, fish, elvish, powershell).
@@ -169,6 +174,10 @@ fn real_main() -> anyhow::Result<()> {
         Cmd::Stop { subdomain } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(tnl::commands::stop::run(&subdomain))
+        }
+        Cmd::Doctor { json } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(tnl::commands::doctor::run(json))
         }
         Cmd::Completion { shell } => {
             let mut cmd = Cli::command();
