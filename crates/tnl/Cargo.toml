@@ -36,6 +36,7 @@ yamux.workspace = true
 
 tnl-protocol = { path = "../tnl-protocol" }
 nu-ansi-term = "0.50"
+parking_lot = "0.12"
 url = "2"
 
 [dev-dependencies]

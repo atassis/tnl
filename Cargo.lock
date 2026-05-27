@@ -2034,6 +2034,7 @@ dependencies = [
  "futures",
  "http",
  "nu-ansi-term",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",
