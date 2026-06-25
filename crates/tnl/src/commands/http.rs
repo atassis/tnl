@@ -9,7 +9,7 @@ pub async fn run(
     format: crate::inspector::Format,
 ) -> anyhow::Result<()> {
     let cfg_path = resolve_config_path()?;
-    let cfg = Config::load_from(&cfg_path)?;
+    let cfg = Config::load_resolved(&cfg_path)?;
 
     let (log_tx, log_rx) = tokio::sync::mpsc::channel::<crate::inspector::LogLine>(1024);
     let inspector = crate::inspector::Inspector::new(log_rx, verbosity, format);
