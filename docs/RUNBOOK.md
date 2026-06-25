@@ -493,15 +493,14 @@ you don't want them lingering.
 
 ---
 
-## What to bring back to Claude
+## What to report back
 
 After you've tested:
 
-- **If §1 (local) failed** — share the full output of all three terminals
-  (`tnld serve`, `tnl http`, `curl`). The next Claude session can debug from
-  logs.
-- **If §1 worked but §2 failed** — share the specific step that broke and the
+- **If §1 (local) failed** — capture the full output of all three terminals
+  (`tnld serve`, `tnl http`, `curl`); the logs are enough to debug from.
+- **If §1 worked but §2 failed** — note the specific step that broke and the
   output. Probably a Caddy/DNS config issue, not a code issue.
-- **If §2 worked** — great. Tell Claude you're ready to plan v0.1.0-beta
+- **If §2 worked** — great. You're ready to plan v0.1.0-beta
   (inspector, reattach, admin CLI) or jump straight to v0.1.0 production
   (Dockerfile + CI + systemd unit + deploy automation).
