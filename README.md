@@ -14,11 +14,14 @@ it works from anywhere behind NAT, with no mesh required.
 
 ## Status
 
-**v0.1.0-beta.1.** Foundation plus the beta feature set ship and are tested:
-reverse-tunneling end-to-end (e2e test passes locally), a live request inspector in
-the CLI, argon2id token administration (`tnld token add/list/revoke`), client
-pairing, a first-run `tnld init` wizard, `healthcheck`, and shell completions.
-Production hardening (Docker image, CI, automated deploy) is the remaining roadmap.
+**v0.1.0-beta.1** — 170 tests green, `clippy` clean under `pedantic` + `nursery`,
+`unsafe_code = "forbid"`. The beta feature set ships and is tested: reverse-tunneling
+end-to-end, a live request inspector in the CLI, structured error attribution
+(`X-Tnl-Component` + content-negotiated HTML/JSON/plain error pages, IPv6 backends),
+argon2id token administration (`tnld token add/list/revoke`), client pairing, a
+first-run `tnld init` wizard, `healthcheck`, and shell completions. A multi-stage
+`Dockerfile` and a Compose reference ship in `deploy/`; CI and automated deploy are
+the remaining roadmap.
 
 - Design spec: [`docs/specs/2026-05-26-tnl-design.md`](docs/specs/2026-05-26-tnl-design.md)
 - Implementation history: [`docs/plans/`](docs/plans/)

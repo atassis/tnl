@@ -33,9 +33,12 @@ domain. For a no-domain local smoke test instead, see
    exact `tnl auth login …` line and a Caddy snippet to copy.
    (An annotated [`config.example.toml`](./config.example.toml) documents every field.)
 
-4. **Run the daemon.** [`tnld-compose.yaml.example`](./tnld-compose.yaml.example) is a
-   reference Compose service (host networking, mounts `/etc/tnld`, healthcheck):
+4. **Build the image and run the daemon.** Build `tnld` from the root
+   [`Dockerfile`](../Dockerfile), then start it with the reference Compose service
+   ([`tnld-compose.yaml.example`](./tnld-compose.yaml.example) — host networking,
+   mounts `/etc/tnld`, healthcheck):
    ```bash
+   docker build -t tnld:latest .
    docker compose -f deploy/tnld-compose.yaml.example up -d
    ```
 

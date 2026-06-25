@@ -6,6 +6,11 @@
 #
 # A more specific matcher (tnl-api.*) takes precedence over the wildcard.
 
+# Global options: contact email Let's Encrypt uses for expiry notices.
+{
+	email {$ACME_EMAIL}
+}
+
 # Tunnel data plane: TLS for *.<TNL_DOMAIN>, reverse-proxied to tnld on loopback.
 *.{$TNL_DOMAIN} {
 	tls {
