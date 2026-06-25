@@ -7,7 +7,7 @@
 
 services:
   tnld:
-    image: tnld:0.1.0-alpha.1
+    image: tnld:latest        # build + `docker load` your own, or use a registry
     container_name: tnld
     restart: always
     network_mode: host

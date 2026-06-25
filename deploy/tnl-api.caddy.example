@@ -1,9 +1,0 @@
-# tnl control + REST plane.
-# The bare /control endpoint upgrades to WebSocket; everything else
-# is plain HTTP REST. Caddy proxies all of it to tnld on loopback.
-tnl-api.t.example.com {
-    tls {
-        dns <provider> {env.YOUR_DNS_TOKEN}
-    }
-    reverse_proxy 127.0.0.1:7777
-}

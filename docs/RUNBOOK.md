@@ -1,6 +1,6 @@
 # tnl Runbook
 
-What **you** need to do (manually, outside Claude) to test the v0.1.0-alpha
+What **you** need to do (manually) to test the v0.1.0-alpha
 build. Two scenarios: §1 is a fully local smoke that bypasses Caddy entirely
 and proves the binaries work; §2 is the real production wiring on `your-gateway`
 with TLS and DNS.
@@ -192,10 +192,9 @@ from the repo root `Dockerfile` (multi-stage musl, ~21 MB) and shipped to the
 host via `docker save | ssh … docker load` (no registry required for
 v0.1.0-alpha).
 
-### 2.1. What you need to do manually (out of Claude scope)
+### 2.1. What you need to do manually
 
-These steps touch Cloudflare and the your-gateway host. Claude can guide but
-shouldn't do them autonomously.
+These steps touch your DNS provider and the gateway host; do them by hand.
 
 #### a. DNS record on Cloudflare
 

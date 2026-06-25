@@ -117,9 +117,8 @@ deploy/
   smoke.sh                     # end-to-end smoke after deploy
   README.md                    # deploy runbook
 docs/
-  superpowers/
-    specs/
-      2026-05-26-tnl-design.md  # ← this file
+  specs/
+    2026-05-26-tnl-design.md  # ← this file
 ```
 
 Workspace dependencies pinned at the root `Cargo.toml`. The shared `tnl-protocol` crate is the only path-dep across all three binaries.

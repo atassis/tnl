@@ -1,0 +1,19 @@
+# tnld server config. Generate this interactively with `tnld init`, or copy this
+# file to /etc/tnld/config.toml and edit. Env vars (TNLD_*) override these at
+# runtime; a value set in both the file and the env prints a warning.
+
+# Address tnld listens on (behind your reverse proxy).
+listen        = "127.0.0.1:7777"
+
+# Public URL of the control/API plane — what clients pass to `tnl auth login`.
+public_url    = "https://tnl-api.t.example.com"
+
+# Wildcard suffix tunnels live under: a tunnel "foo" becomes foo.<hostname_root>.
+hostname_root = "t.example.com"
+
+# Path to the argon2id-hashed client tokens (managed by `tnld init` / `tnld token`).
+tokens_file   = "/etc/tnld/tokens.toml"
+
+# Seconds a tunnel stays reserved after its control connection drops, before the
+# subdomain is freed (default 30; set 0 to free immediately).
+# session_grace_sec = 30

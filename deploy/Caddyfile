@@ -1,0 +1,26 @@
+# Generic tnl front. Parameterized by deploy/.env:
+#   {$TNL_DOMAIN} / {$TNL_DNS_PROVIDER}  — parse-time substitution (legal in the
+#                                          site address and the dns provider slot)
+#   {env.TNL_DNS_TOKEN}                   — runtime placeholder, so the secret never
+#                                          appears in `caddy adapt` JSON output
+#
+# A more specific matcher (tnl-api.*) takes precedence over the wildcard.
+
+# Tunnel data plane: TLS for *.<TNL_DOMAIN>, reverse-proxied to tnld on loopback.
+*.{$TNL_DOMAIN} {
+	tls {
+		dns {$TNL_DNS_PROVIDER} {env.TNL_DNS_TOKEN}
+	}
+	reverse_proxy 127.0.0.1:7777 {
+		flush_interval -1
+		header_up Connection close
+	}
+}
+
+# Control + REST plane: /control upgrades to WebSocket; the rest is plain REST.
+tnl-api.{$TNL_DOMAIN} {
+	tls {
+		dns {$TNL_DNS_PROVIDER} {env.TNL_DNS_TOKEN}
+	}
+	reverse_proxy 127.0.0.1:7777
+}
