@@ -53,6 +53,15 @@ pub struct ServerHandle {
 }
 
 pub async fn spawn_server(cfg: Config) -> anyhow::Result<ServerHandle> {
+    // Fail closed: a daemon with no client tokens can authenticate nobody and
+    // almost always means a misconfigured deploy. Refuse to start.
+    let store = TokenStore::load(std::path::Path::new(&cfg.tokens_file))?;
+    if store.is_empty() {
+        anyhow::bail!(
+            "no tokens in {}; run `tnld init` or `tnld token add <name>` before serving",
+            cfg.tokens_file
+        );
+    }
     let (handle, _state) = spawn_server_with_state(cfg).await?;
     Ok(handle)
 }
