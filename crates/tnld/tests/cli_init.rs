@@ -54,6 +54,48 @@ fn init_writes_config_and_token_files() {
 }
 
 #[test]
+fn init_supplied_admin_token_and_next_steps_footer() {
+    let dir = tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let tokens_path = dir.path().join("tokens.toml");
+
+    let out = Command::new(bin())
+        .args([
+            "init",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--public-url",
+            "https://tnl-api.example.com",
+            "--hostname-root",
+            "t.example.com",
+            "--tokens-file",
+            tokens_path.to_str().unwrap(),
+            "--admin-token",
+            "tnl_ci_known_token",
+            "-y",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Supplied token is used verbatim (not a fresh random one).
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("tnl_ci_known_token"), "stdout: {stdout}");
+
+    // Footer bridges server-init -> client-login and shows a Caddy snippet.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("tnl auth login --endpoint"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("*.t.example.com"), "stderr: {stderr}");
+}
+
+#[test]
 fn init_refuses_to_overwrite_without_yes() {
     let dir = tempdir().unwrap();
     let config_path = dir.path().join("config.toml");

@@ -55,6 +55,9 @@ enum Cmd {
         /// If set, generate an initial token of this name and print the plaintext.
         #[arg(long)]
         admin_token_name: Option<String>,
+        /// Supply a known token value instead of generating one (for CI/provisioning).
+        #[arg(long)]
+        admin_token: Option<String>,
         /// Override the default 30s grace window.
         #[arg(long)]
         session_grace_sec: Option<u32>,
@@ -95,6 +98,7 @@ fn real_main() -> anyhow::Result<()> {
             hostname_root,
             tokens_file,
             admin_token_name,
+            admin_token,
             session_grace_sec,
             yes,
             json,
@@ -105,6 +109,7 @@ fn real_main() -> anyhow::Result<()> {
             hostname_root,
             tokens_file,
             admin_token_name,
+            admin_token,
             session_grace_sec,
             yes,
             json,

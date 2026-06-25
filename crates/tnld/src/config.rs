@@ -40,7 +40,13 @@ impl Config {
             cfg.listen = v;
         }
         if let Some(v) = env("TNLD_PUBLIC_URL") {
-            note_overlap(&mut warnings, &table, "public_url", "TNLD_PUBLIC_URL", &where_);
+            note_overlap(
+                &mut warnings,
+                &table,
+                "public_url",
+                "TNLD_PUBLIC_URL",
+                &where_,
+            );
             cfg.public_url = v;
         }
         if let Some(v) = env("TNLD_HOSTNAME_ROOT") {

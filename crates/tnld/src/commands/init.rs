@@ -21,6 +21,8 @@ pub struct InitArgs {
     pub hostname_root: Option<String>,
     pub tokens_file: Option<PathBuf>,
     pub admin_token_name: Option<String>,
+    /// Supply a known plaintext token instead of generating one (for CI).
+    pub admin_token: Option<String>,
     pub session_grace_sec: Option<u32>,
     pub yes: bool,
     pub json: bool,
@@ -95,6 +97,10 @@ fn resolve_token_name(args: &InitArgs, interactive: bool) -> Result<Option<Strin
     if let Some(name) = args.admin_token_name.as_deref() {
         return Ok(Some(name.to_string()));
     }
+    // A supplied token with no explicit name still gets minted, named "admin".
+    if args.admin_token.is_some() {
+        return Ok(Some("admin".to_string()));
+    }
     if !interactive {
         return Ok(None);
     }
@@ -115,9 +121,14 @@ fn resolve_token_name(args: &InitArgs, interactive: bool) -> Result<Option<Strin
     Ok(Some(name))
 }
 
-/// Mint a token, append it to the tokens file, and print the plaintext.
-fn mint_token(name: &str, tokens_file: &PathBuf) -> Result<()> {
-    let plaintext = format!("tnl_{}", random_token_suffix(26));
+/// Mint or store a token, append it to the tokens file, print the plaintext to
+/// stdout, and return it. If `supplied` is given it is used verbatim (CI path);
+/// otherwise a fresh random token is generated.
+fn mint_token(name: &str, supplied: Option<&str>, tokens_file: &PathBuf) -> Result<String> {
+    let plaintext = supplied.map_or_else(
+        || format!("tnl_{}", random_token_suffix(26)),
+        ToString::to_string,
+    );
     let hash = hash_plaintext(&plaintext).context("argon2 hash")?;
     let entry = TokenEntry {
         name: name.to_string(),
@@ -140,7 +151,7 @@ fn mint_token(name: &str, tokens_file: &PathBuf) -> Result<()> {
 
     eprintln!("✓ token {name:?} written to {}", tokens_file.display());
     println!("{plaintext}");
-    Ok(())
+    Ok(plaintext)
 }
 
 pub fn run(mut args: InitArgs) -> Result<()> {
@@ -181,9 +192,15 @@ session_grace_sec = {session_grace_sec}
     eprintln!("✓ wrote config to {}", args.config.display());
 
     // Optionally mint a first token.
-    if let Some(name) = resolve_token_name(&args, interactive)? {
-        mint_token(&name, &r.tokens_file)?;
-    }
+    let minted = if let Some(name) = resolve_token_name(&args, interactive)? {
+        Some(mint_token(
+            &name,
+            args.admin_token.as_deref(),
+            &r.tokens_file,
+        )?)
+    } else {
+        None
+    };
 
     if args.json {
         let summary = serde_json::json!({
@@ -206,6 +223,20 @@ session_grace_sec = {session_grace_sec}
             "  4. start tnld: tnld serve --config {}",
             args.config.display()
         );
+        if let Some(token) = &minted {
+            eprintln!();
+            eprintln!("connect a client:");
+            eprintln!(
+                "  tnl auth login --endpoint {} --token {token}",
+                r.public_url
+            );
+            eprintln!();
+            eprintln!("example Caddy site block (TLS via your DNS provider):");
+            eprintln!("  *.{} {{", r.hostname_root);
+            eprintln!("      tls {{ dns <provider> {{env.YOUR_DNS_TOKEN}} }}");
+            eprintln!("      reverse_proxy {}", r.listen);
+            eprintln!("  }}");
+        }
     }
     Ok(())
 }
