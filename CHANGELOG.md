@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.0-beta.2] - 2026-07-19
+
 ### Changed
 - Daemon data plane now relays tunnel responses through hyper's HTTP/1 client
   (`hyper::client::conn::http1`) instead of a hand-rolled parser. This removes
