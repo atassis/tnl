@@ -271,8 +271,12 @@ pub async fn handler(State(state): State<AppState>, req: Request) -> Response<Bo
                 component = component.as_header(),
                 %kind,
                 tunnel = %tunnel.subdomain,
+                host = %host_no_port,
+                method = %method,
+                path = %path,
                 req_id = %req_id,
                 error = %e,
+                error_debug = ?e,
                 "served 502 from daemon: send_request"
             );
             let hint = if is_io {

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.0-beta.3] - 2026-07-19
+
+### Fixed
+- `tnld serve` never installed a `tracing` subscriber, so **every** daemon log
+  event (request logs, `server_failure` warnings) was silently dropped and
+  production ran blind — the only output was the startup banner. It now installs
+  an stderr `fmt` subscriber honouring `RUST_LOG` (default `info,tnld=debug`).
+
+### Changed
+- The `server_failure` warning for an unrelayable tunnel response now includes
+  `host`, `method`, `path`, and the debug form of the underlying `hyper` error,
+  to make `upstream`/`transport` 502s diagnosable from logs.
+
 ## [0.1.0-beta.2] - 2026-07-19
 
 ### Changed

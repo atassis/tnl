@@ -120,6 +120,20 @@ fn real_main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Serve { config } => {
+            // Install the tracing subscriber for the daemon. Without this every
+            // `tracing` event (request logs, `server_failure` warnings) is
+            // silently dropped, leaving production unobservable. Logs go to
+            // stderr so they never collide with a stdout protocol; `RUST_LOG`
+            // controls verbosity (default: info, tnld=debug).
+            use tracing_subscriber::EnvFilter;
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| EnvFilter::new("info,tnld=debug")),
+                )
+                .with_writer(std::io::stderr)
+                .init();
+
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async move {
                 let cfg = tnld::config::Config::load(std::path::Path::new(&config))?;
