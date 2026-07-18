@@ -104,11 +104,7 @@ async fn local_backend_down_returns_502_with_attribution() {
     let _accept = tokio::spawn(tnl::client::run_accept_loop(
         session.session,
         tnl::target::Target::LocalhostPort(dead_port),
-        tnl::forwarder::ForwardCtx {
-            tunnel: "smoke-down".into(),
-            log_tx: None,
-            version: env!("CARGO_PKG_VERSION"),
-        },
+        tnl::forwarder::ForwardCtx::new("smoke-down".into(), None, env!("CARGO_PKG_VERSION")),
     ));
     tokio::time::sleep(Duration::from_millis(100)).await;
 

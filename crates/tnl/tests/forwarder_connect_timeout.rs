@@ -20,11 +20,7 @@ async fn synth_502_on_unreachable_or_timeout() {
     let driver = tokio::spawn(forward(
         Box::pin(b) as Pin<Box<dyn Stream>>,
         target,
-        ForwardCtx {
-            tunnel: "demo".into(),
-            log_tx: None,
-            version: env!("CARGO_PKG_VERSION"),
-        },
+        ForwardCtx::new("demo".into(), None, env!("CARGO_PKG_VERSION")),
     ));
 
     let (mut ar, mut aw) = tokio::io::split(a);

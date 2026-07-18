@@ -46,6 +46,7 @@ async fn client_reattaches_within_grace_window() {
             "tnl_U",
             Some("foo"),
             tnl::target::Target::LocalhostPort(backend_port),
+            tnl::host_header::HostHeader::Auto,
             tnl::reconnect::Hooks {
                 cancel_first_session: Some(cancel_rx),
                 log_tx: None,

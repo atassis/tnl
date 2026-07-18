@@ -46,11 +46,16 @@ pub async fn run(
     token: &str,
     subdomain: Option<&str>,
     target: crate::target::Target,
+    host_header: crate::host_header::HostHeader,
     mut hooks: Hooks,
 ) -> anyhow::Result<()> {
     let mut backoff_ms: u64 = 1_000;
     let mut last_tunnel: Option<(ulid::Ulid, String)> = None;
     let mut printed_banner = false;
+    // Per-tunnel host-rewrite state, persisted across reconnects so a learned
+    // dev-server block survives a reattach.
+    let rewrite_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let warned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     loop {
         let result = if let Some((tid, sub)) = &last_tunnel {
@@ -125,6 +130,10 @@ pub async fn run(
             tunnel: session.subdomain.clone(),
             log_tx: hooks.log_tx.clone(),
             version: env!("CARGO_PKG_VERSION"),
+            host_header: host_header.clone(),
+            host_public: session.hostname.clone(),
+            rewrite_active: rewrite_active.clone(),
+            warned: warned.clone(),
         };
         let accept = tokio::spawn(crate::client::run_accept_loop(
             session.session,

@@ -21,11 +21,7 @@ async fn synth_502_on_local_malformed() {
     let driver = tokio::spawn(forward(
         Box::pin(b) as Pin<Box<dyn Stream>>,
         Target::LocalhostPort(port),
-        ForwardCtx {
-            tunnel: "demo".into(),
-            log_tx: None,
-            version: env!("CARGO_PKG_VERSION"),
-        },
+        ForwardCtx::new("demo".into(), None, env!("CARGO_PKG_VERSION")),
     ));
     let (mut ar, mut aw) = tokio::io::split(a);
     aw.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")

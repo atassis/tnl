@@ -57,6 +57,13 @@ enum Cmd {
         target: tnl::target::Target,
         /// Subdomain to claim. If omitted, the daemon assigns a random one.
         subdomain: Option<String>,
+        /// `Host` sent to your backend. Default (auto): forward the real host,
+        /// but if the dev server rejects it (Vite/webpack/Django/Rails host
+        /// allowlists) rewrite it to the connected address for later requests.
+        /// `preserve` disables that; `rewrite` always rewrites; any other value
+        /// is used verbatim.
+        #[arg(long, value_name = "MODE")]
+        host_header: Option<String>,
         #[arg(long, conflicts_with_all = ["verbose", "very_verbose"])]
         quiet: bool,
         #[arg(short = 'v', long, conflicts_with = "very_verbose")]
@@ -187,6 +194,7 @@ fn real_main() -> anyhow::Result<()> {
         Cmd::Http {
             target,
             subdomain,
+            host_header,
             quiet,
             verbose,
             very_verbose,
@@ -210,6 +218,7 @@ fn real_main() -> anyhow::Result<()> {
             rt.block_on(tnl::commands::http::run(
                 target,
                 subdomain.as_deref(),
+                tnl::host_header::HostHeader::parse(host_header.as_deref()),
                 verbosity,
                 format,
             ))

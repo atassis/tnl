@@ -32,11 +32,7 @@ async fn ipv6_only_backend_forwarded_via_localhost_port() {
     let driver = tokio::spawn(forward(
         substream,
         Target::LocalhostPort(port),
-        ForwardCtx {
-            tunnel: "demo".into(),
-            log_tx: None,
-            version: env!("CARGO_PKG_VERSION"),
-        },
+        ForwardCtx::new("demo".into(), None, env!("CARGO_PKG_VERSION")),
     ));
 
     let (mut ar, mut aw) = tokio::io::split(a);

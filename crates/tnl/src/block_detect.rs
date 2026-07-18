@@ -31,7 +31,10 @@ mod tests {
 
     #[test]
     fn detects_django_and_webpack_and_rails() {
-        assert_eq!(detect(Some(400), b"...DisallowedHost at /..."), Some("Django"));
+        assert_eq!(
+            detect(Some(400), b"...DisallowedHost at /..."),
+            Some("Django")
+        );
         assert_eq!(
             detect(Some(403), b"...Invalid Host header..."),
             Some("webpack-dev-server")
@@ -41,7 +44,10 @@ mod tests {
 
     #[test]
     fn ignores_normal_403_and_missing_status() {
-        assert_eq!(detect(Some(403), b"HTTP/1.1 403 Forbidden\r\n\r\nnope"), None);
+        assert_eq!(
+            detect(Some(403), b"HTTP/1.1 403 Forbidden\r\n\r\nnope"),
+            None
+        );
         assert_eq!(detect(None, b"Blocked request"), None);
     }
 }

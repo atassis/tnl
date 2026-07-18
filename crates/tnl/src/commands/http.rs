@@ -5,6 +5,7 @@ use crate::target::Target;
 pub async fn run(
     target: Target,
     subdomain: Option<&str>,
+    host_header: crate::host_header::HostHeader,
     verbosity: crate::inspector::Verbosity,
     format: crate::inspector::Format,
 ) -> anyhow::Result<()> {
@@ -21,6 +22,7 @@ pub async fn run(
             &cfg.token,
             subdomain,
             target,
+            host_header,
             crate::reconnect::Hooks {
                 cancel_first_session: None,
                 log_tx: Some(log_tx),

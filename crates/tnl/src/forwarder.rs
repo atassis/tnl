@@ -66,6 +66,36 @@ pub struct ForwardCtx {
     pub log_tx: Option<mpsc::Sender<LogLine>>,
     /// Crate version string used in error bodies (`env!("CARGO_PKG_VERSION")`).
     pub version: &'static str,
+    /// What `Host` to present to the backend (dev-server allowlist smoothing).
+    pub host_header: crate::host_header::HostHeader,
+    /// Full public host (`<sub>.t.example.com`) shown in the block notice.
+    pub host_public: String,
+    /// Set once a host block is detected; makes `Auto` mode rewrite subsequent
+    /// requests. Shared across every substream of a tunnel.
+    pub rewrite_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Ensures the block notice prints at most once per tunnel.
+    pub warned: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ForwardCtx {
+    /// Construct a context with default host-header handling (`Auto`) and fresh
+    /// per-tunnel state. Prefer this in tests and simple call sites.
+    #[must_use]
+    pub fn new(
+        tunnel: String,
+        log_tx: Option<mpsc::Sender<LogLine>>,
+        version: &'static str,
+    ) -> Self {
+        Self {
+            tunnel,
+            log_tx,
+            version,
+            host_header: crate::host_header::HostHeader::Auto,
+            host_public: String::new(),
+            rewrite_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            warned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
 }
 
 impl std::fmt::Debug for ForwardCtx {
@@ -74,6 +104,14 @@ impl std::fmt::Debug for ForwardCtx {
             .field("tunnel", &self.tunnel)
             .field("log_tx", &self.log_tx.as_ref().map(|_| "<sender>"))
             .field("version", &self.version)
+            .field("host_header", &self.host_header)
+            .field("host_public", &self.host_public)
+            .field(
+                "rewrite_active",
+                &self
+                    .rewrite_active
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -198,6 +236,21 @@ pub async fn forward(
         }
     };
 
+    // Decide what `Host` the backend sees (dev-server allowlist smoothing).
+    let rewrite_to: Option<String> = match &ctx.host_header {
+        crate::host_header::HostHeader::Preserve => None,
+        crate::host_header::HostHeader::Fixed(v) => Some(v.clone()),
+        crate::host_header::HostHeader::Rewrite => Some(resolved_addr.to_string()),
+        crate::host_header::HostHeader::Auto => ctx
+            .rewrite_active
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(|| resolved_addr.to_string()),
+    };
+    let head_bytes = match &rewrite_to {
+        Some(host) => crate::host_header::rewrite_host(&head_bytes, host),
+        None => head_bytes,
+    };
+
     // Phase 2: write head + leftover body to backend.
     if let Err(e) = tcp.write_all(&head_bytes).await {
         return synth_phase2(
@@ -308,7 +361,7 @@ pub async fn forward(
     let (mut tr, mut tw) = tokio::io::split(tcp);
 
     let resp_peek = Arc::new(Mutex::new({
-        let mut b = BytesMut::with_capacity(512);
+        let mut b = BytesMut::with_capacity(1024);
         b.extend_from_slice(&prefix_bytes);
         b
     }));
@@ -348,8 +401,8 @@ pub async fn forward(
             }
             {
                 let mut p = resp_peek_a.lock();
-                if p.len() < 512 {
-                    let take = (512 - p.len()).min(n);
+                if p.len() < 1024 {
+                    let take = (1024 - p.len()).min(n);
                     p.extend_from_slice(&buf[..take]);
                 }
             }
@@ -364,6 +417,25 @@ pub async fn forward(
 
     let resp_buf = resp_peek.lock().to_vec();
     let status = self::peek::parse_response_status(&resp_buf);
+
+    // Evidence-driven dev-server host smoothing: on a recognized host block in
+    // `Auto` mode, flip on Host rewrite for subsequent requests and notify once.
+    if matches!(ctx.host_header, crate::host_header::HostHeader::Auto)
+        && !ctx.rewrite_active.load(Ordering::Relaxed)
+    {
+        if let Some(fw) = crate::block_detect::detect(status, &resp_buf) {
+            ctx.rewrite_active.store(true, Ordering::Relaxed);
+            if !ctx.warned.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "! dev server blocked host '{}' (looks like {fw}).\n  \
+                     auto-rewriting Host -> {} for this tunnel.\n  \
+                     override: --host-header=preserve  (or =<host>)",
+                    ctx.host_public, resolved_addr,
+                );
+            }
+        }
+    }
+
     emit_log(
         &ctx,
         LogLine {

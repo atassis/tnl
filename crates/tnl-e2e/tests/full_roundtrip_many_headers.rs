@@ -82,11 +82,7 @@ async fn backend_with_more_than_64_headers_is_relayed_verbatim() {
     let _accept = tokio::spawn(tnl::client::run_accept_loop(
         session_box,
         tnl::target::Target::LocalhostPort(backend_port),
-        tnl::forwarder::ForwardCtx {
-            tunnel: "fat".into(),
-            log_tx: None,
-            version: env!("CARGO_PKG_VERSION"),
-        },
+        tnl::forwarder::ForwardCtx::new("fat".into(), None, env!("CARGO_PKG_VERSION")),
     ));
     tokio::time::sleep(Duration::from_millis(100)).await;
 

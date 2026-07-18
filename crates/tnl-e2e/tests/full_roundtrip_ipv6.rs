@@ -79,11 +79,7 @@ async fn end_to_end_http_request_reaches_ipv6_local_backend() {
     let _accept = tokio::spawn(tnl::client::run_accept_loop(
         session_box,
         tnl::target::Target::LocalhostPort(backend_port),
-        tnl::forwarder::ForwardCtx {
-            tunnel: "smoke-v6".into(),
-            log_tx: None,
-            version: env!("CARGO_PKG_VERSION"),
-        },
+        tnl::forwarder::ForwardCtx::new("smoke-v6".into(), None, env!("CARGO_PKG_VERSION")),
     ));
 
     // give the daemon a moment to register

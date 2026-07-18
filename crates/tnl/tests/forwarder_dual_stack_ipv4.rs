@@ -26,11 +26,7 @@ async fn ipv4_only_backend_forwarded_via_localhost_port() {
     let (a, b) = tokio::io::duplex(64 * 1024);
     let substream: Pin<Box<dyn Stream>> = Box::pin(b);
     let target = Target::LocalhostPort(port);
-    let ctx = ForwardCtx {
-        tunnel: "demo".into(),
-        log_tx: None,
-        version: env!("CARGO_PKG_VERSION"),
-    };
+    let ctx = ForwardCtx::new("demo".into(), None, env!("CARGO_PKG_VERSION"));
 
     let driver = tokio::spawn(forward(substream, target, ctx));
 
