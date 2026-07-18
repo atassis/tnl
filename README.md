@@ -57,6 +57,11 @@ tnl http 3000 foo                          # → https://foo.t.example.com
 
 Front the daemon with Caddy doing TLS for `*.<your-domain>` — see [`deploy/`](deploy/).
 
+**Dev servers with a host allowlist** (Vite/Astro, webpack, Django, Rails) reject
+the tunnel hostname by default. `tnl` detects this and auto-rewrites the
+forwarded `Host` to the address it connected to, so they just work — no config
+edits. Control it with `tnl http … --host-header <preserve|rewrite|VALUE>`.
+
 ## Configuration
 
 Server config is a TOML file (`tnld init` generates it; an annotated

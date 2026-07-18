@@ -112,6 +112,10 @@ impl std::fmt::Debug for ForwardCtx {
                     .rewrite_active
                     .load(std::sync::atomic::Ordering::Relaxed),
             )
+            .field(
+                "warned",
+                &self.warned.load(std::sync::atomic::Ordering::Relaxed),
+            )
             .finish()
     }
 }

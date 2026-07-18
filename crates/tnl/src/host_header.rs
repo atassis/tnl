@@ -27,9 +27,10 @@ impl HostHeader {
     }
 }
 
-/// Replace the `Host:` header value in a raw HTTP/1.x request head, preserving
-/// line order and CRLF framing. Case-insensitive on the header name. If no
-/// `Host` line exists, one is inserted immediately after the request line.
+/// Replace the `Host:` header value in a raw HTTP/1.x request head.
+///
+/// Preserves line order and CRLF framing; case-insensitive on the header name.
+/// If no `Host` line exists, one is inserted immediately after the request line.
 /// Non-UTF-8 input is returned unchanged.
 #[must_use]
 pub fn rewrite_host(head: &[u8], new_host: &str) -> Vec<u8> {

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- `tnl http --host-header <preserve|rewrite|VALUE>`. Default (auto) forwards the
+  real host, but when a local dev server rejects the tunnel host with its
+  allowlist guard (Vite/Astro `Blocked request`, webpack `Invalid Host header`,
+  Django `DisallowedHost`, Rails `Blocked host`), tnl rewrites the forwarded
+  `Host` to the address it connected to (`127.0.0.1:<port>`, …) for subsequent
+  requests and prints a one-time notice — so dev servers work through the tunnel
+  without editing their config. `X-Forwarded-Host` is unaffected. `preserve`
+  disables the auto behavior; `rewrite` always rewrites; any other value is used
+  verbatim (for a custom allowlist). Client-only; no daemon change. Security
+  boundary: only host-allowlist friction is smoothed, and only on evidence — the
+  app's own protections (CORS, CSP, cookies, auth) are never touched.
+
 ## [0.1.0-beta.3] - 2026-07-19
 
 ### Fixed
