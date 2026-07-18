@@ -1,3 +1,4 @@
+pub mod block_detect;
 pub mod client;
 pub mod commands;
 pub mod completion;
@@ -5,6 +6,7 @@ pub mod config;
 pub mod connect;
 pub mod exit;
 pub mod forwarder;
+pub mod host_header;
 pub mod inspector;
 pub mod invite;
 pub mod peek;
