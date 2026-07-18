@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- Daemon data plane now relays tunnel responses through hyper's HTTP/1 client
+  (`hyper::client::conn::http1`) instead of a hand-rolled parser. This removes
+  the fixed 64-header limit, decodes chunked/`gzip, chunked` correctly, skips
+  leading `1xx` informational responses, honours HTTP/1.0 close-delimited
+  bodies, and streams responses instead of buffering the whole body in RAM.
+
+### Fixed
+- A valid backend response with **more than 64 headers**, a leading **`1xx`**
+  response, or **`Transfer-Encoding: gzip, chunked`** was previously rejected
+  or corrupted by the daemon's hand-rolled parser and served as a misleading
+  `502` blaming the client (`X-Tnl-Component: client`,
+  `client-malformed-response`, hint "Update to tnl >= 0.1.0-beta.1"). The
+  daemon only relays bytes the client forwarded verbatim, so it could never
+  legitimately attribute a response-parse failure to the client. These
+  responses now pass through unchanged.
+
+### Added
+- New `X-Tnl-Component: upstream` attribution for the rare case where a
+  response received over the tunnel genuinely cannot be relayed as HTTP/1.1
+  (non-HTTP backend, or the backend closed mid-response). Kinds:
+  `unparseable-response`, `incomplete-response`. This replaces the previous
+  `client` mis-attribution and its version-shaming hint; the message now
+  points at the local backend, not the client binary.
+
 ## [0.1.0-beta.1] - 2026-05-27
 
 ### Added

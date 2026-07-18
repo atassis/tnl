@@ -16,6 +16,11 @@ pub enum Component {
     Daemon,
     /// Daemon-side substream / write / read failure (yamux or transport).
     Transport,
+    /// A response arrived through the tunnel that tnld could not relay as
+    /// HTTP/1.1 (unparseable, incomplete, or non-HTTP). Origin is the local
+    /// backend, relayed verbatim by the client — the daemon cannot pin blame
+    /// on the client binary, so this is a neutral "upstream" attribution.
+    Upstream,
     /// Client-side failure (synth) — local backend down, EOF, malformed.
     Client,
 }
@@ -27,6 +32,7 @@ impl Component {
             Self::Registry => "registry",
             Self::Daemon => "daemon",
             Self::Transport => "transport",
+            Self::Upstream => "upstream",
             Self::Client => "client",
         }
     }
@@ -139,6 +145,7 @@ fn render_html(c: &ErrorContext<'_>) -> String {
         Component::Registry => "tnl: no tunnel for host",
         Component::Daemon => "tnl: tunnel disconnected",
         Component::Transport => "tnl: tunnel transport error",
+        Component::Upstream => "tnl: invalid response from local backend",
         Component::Client => "tnl: local backend unreachable",
     };
     let tunnel = html_escape(c.tunnel.unwrap_or("(unknown)"));
@@ -181,6 +188,7 @@ fn render_json(c: &ErrorContext<'_>) -> String {
             Component::Registry => "no_such_tunnel",
             Component::Daemon => "tunnel_disconnected",
             Component::Transport => "transport_error",
+            Component::Upstream => "invalid_upstream_response",
         },
         "kind": c.kind,
         "tunnel": c.tunnel,
