@@ -30,7 +30,10 @@ async fn spawn_host_checking_backend() -> u16 {
                 let req = String::from_utf8_lossy(&buf[..n]);
                 let host = req
                     .lines()
-                    .find_map(|l| l.strip_prefix("Host: ").or_else(|| l.strip_prefix("host: ")))
+                    .find_map(|l| {
+                        l.strip_prefix("Host: ")
+                            .or_else(|| l.strip_prefix("host: "))
+                    })
                     .unwrap_or("")
                     .trim();
                 let allowed = host.starts_with("127.")
@@ -39,7 +42,10 @@ async fn spawn_host_checking_backend() -> u16 {
                 let (status, body) = if allowed {
                     ("200 OK", "ok\n")
                 } else {
-                    ("403 Forbidden", "Blocked request. This host is not allowed.\n")
+                    (
+                        "403 Forbidden",
+                        "Blocked request. This host is not allowed.\n",
+                    )
                 };
                 let resp = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -101,9 +107,10 @@ async fn auto_rewrite_after_block() {
     let backend = spawn_host_checking_backend().await;
     let tnld_addr = spawn_tnld().await;
 
-    let session = tnl::client::connect_and_create(&format!("http://{tnld_addr}"), "tnl_HOSTRW", "auto")
-        .await
-        .unwrap();
+    let session =
+        tnl::client::connect_and_create(&format!("http://{tnld_addr}"), "tnl_HOSTRW", "auto")
+            .await
+            .unwrap();
     let _ctrl = session.control;
     let ctx = ForwardCtx::new("auto".into(), None, env!("CARGO_PKG_VERSION"));
     let _accept = tokio::spawn(tnl::client::run_accept_loop(
@@ -132,9 +139,10 @@ async fn preserve_never_rewrites() {
     let backend = spawn_host_checking_backend().await;
     let tnld_addr = spawn_tnld().await;
 
-    let session = tnl::client::connect_and_create(&format!("http://{tnld_addr}"), "tnl_HOSTRW", "keep")
-        .await
-        .unwrap();
+    let session =
+        tnl::client::connect_and_create(&format!("http://{tnld_addr}"), "tnl_HOSTRW", "keep")
+            .await
+            .unwrap();
     let _ctrl = session.control;
     let ctx = ForwardCtx {
         tunnel: "keep".into(),
