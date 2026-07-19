@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.0-beta.4] - 2026-07-19
+
 ### Added
 - `tnl http --host-header <preserve|rewrite|VALUE>`. Default (auto) forwards the
   real host, but when a local dev server rejects the tunnel host with its
