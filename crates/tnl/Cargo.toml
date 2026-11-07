@@ -37,7 +37,7 @@ thiserror.workspace = true
 async-tungstenite.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

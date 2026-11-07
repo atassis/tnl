@@ -129,6 +129,7 @@ async fn control_loop(
         })?;
         debug!("control message decoded");
 
+        let closing = matches!(msg, ControlMsg::Close);
         let response = match msg {
             ControlMsg::CreateTunnel(req) => {
                 let resolved = req.subdomain.map_or_else(
@@ -292,7 +293,13 @@ async fn control_loop(
                 }
             }
             ControlMsg::Heartbeat => ControlMsg::HeartbeatAck,
-            ControlMsg::Close => return Ok(()),
+            ControlMsg::Close => {
+                // Session-scoped removal cannot delete a newer reattached binding.
+                registry.close_session(session_id)?;
+                ControlMsg::Closing {
+                    reason: "client_shutdown".into(),
+                }
+            }
             _ => ControlMsg::Error {
                 code: ErrorCode::Internal,
                 message: "unexpected control message".into(),
@@ -306,6 +313,9 @@ async fn control_loop(
         stream.write_all(&len).await?;
         stream.write_all(&out).await?;
         stream.flush().await?;
+        if closing {
+            return Ok(());
+        }
     }
 }
 

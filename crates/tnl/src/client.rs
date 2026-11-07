@@ -140,6 +140,16 @@ async fn read_msg(ctrl: &mut Pin<Box<dyn tnl_protocol::Stream>>) -> anyhow::Resu
     })
 }
 
+pub(crate) async fn close_control(
+    control: &mut Pin<Box<dyn tnl_protocol::Stream>>,
+) -> anyhow::Result<()> {
+    write_msg(control, &ControlMsg::Close).await?;
+    match read_msg(control).await? {
+        ControlMsg::Closing { reason } if reason == "client_shutdown" => Ok(()),
+        _ => bail!("daemon did not acknowledge intentional shutdown"),
+    }
+}
+
 /// Run-owned immutable policy. Prepared once before the async runtime and
 /// reused for protected reattach/recreation; no password or file is retained.
 #[derive(Debug, Clone, Default)]
@@ -417,19 +427,75 @@ pub async fn connect_and_reattach(
     })
 }
 
+/// Shared across reconnect generations so an ended accept loop cannot truncate old forwards.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ForwardTasks {
+    tracker: tokio_util::task::TaskTracker,
+    stop_forwarding: tokio_util::sync::CancellationToken,
+    stop_accepting: tokio_util::sync::CancellationToken,
+}
+
+impl ForwardTasks {
+    pub(crate) fn accept(
+        &self,
+        session: Box<dyn tnl_protocol::Session>,
+        target: crate::target::Target,
+        ctx: crate::forwarder::ForwardCtx,
+    ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        self.tracker
+            .spawn(run_accept_loop_owned(session, target, ctx, self.clone()))
+    }
+
+    pub(crate) fn stop_forwarding(&self) {
+        self.stop_forwarding.cancel();
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.stop_forwarding.cancel();
+        self.stop_accepting.cancel();
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.cancel();
+        self.tracker.close();
+        self.tracker.wait().await;
+    }
+}
+
 pub async fn run_accept_loop(
-    mut session: Box<dyn tnl_protocol::Session>,
+    session: Box<dyn tnl_protocol::Session>,
     target: crate::target::Target,
     ctx: crate::forwarder::ForwardCtx,
 ) -> anyhow::Result<()> {
+    run_accept_loop_owned(session, target, ctx, ForwardTasks::default()).await
+}
+
+async fn run_accept_loop_owned(
+    mut session: Box<dyn tnl_protocol::Session>,
+    target: crate::target::Target,
+    ctx: crate::forwarder::ForwardCtx,
+    tasks: ForwardTasks,
+) -> anyhow::Result<()> {
     loop {
-        match session.accept_stream().await {
+        let stream = tokio::select! {
+            biased;
+            () = tasks.stop_accepting.cancelled() => return Ok(()),
+            stream = session.accept_stream() => stream,
+        };
+        match stream {
             Ok(Some(stream)) => {
                 let t = target.clone();
                 let ctx2 = ctx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = Box::pin(crate::forwarder::forward(stream, t, ctx2)).await {
-                        warn!(?e, "forward failed");
+                let cancel = tasks.stop_forwarding.clone();
+                tasks.tracker.spawn(async move {
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => {},
+                        result = Box::pin(crate::forwarder::forward(stream, t, ctx2)) => {
+                            if let Err(e) = result {
+                                warn!(?e, "forward failed");
+                            }
+                        }
                     }
                 });
             }

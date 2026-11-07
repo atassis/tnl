@@ -19,7 +19,7 @@ use tracing::{info, warn};
 #[derive(Default)]
 pub struct Hooks {
     pub inspection: Option<crate::inspection::Inspection>,
-    /// When this oneshot fires, the current accept loop is cancelled so the
+    /// When this oneshot fires, the current control session ends so the
     /// outer loop can attempt a reattach.
     pub cancel_first_session: Option<tokio::sync::oneshot::Receiver<()>>,
     /// If set, each forwarded substream tees its head into this channel
@@ -40,8 +40,8 @@ impl std::fmt::Debug for Hooks {
     }
 }
 
-/// Run the reconnect loop until a non-recoverable error occurs or `Ctrl-C`
-/// cancels the outer `tokio::select!`.
+/// Run until a non-recoverable error occurs or the caller cancels this future.
+/// The CLI uses `run_until_shutdown` for acknowledged signal shutdown.
 ///
 /// Prints a one-time banner on the first successful connect.
 #[allow(clippy::too_many_lines)]
@@ -75,8 +75,63 @@ pub async fn run_with_options(
     target: crate::target::Target,
     host_header: crate::host_header::HostHeader,
     options: &crate::client::TunnelOptions,
-    mut hooks: Hooks,
+    hooks: Hooks,
 ) -> anyhow::Result<()> {
+    run_until_shutdown(
+        endpoint,
+        token,
+        subdomain,
+        target,
+        host_header,
+        options,
+        hooks,
+        std::future::pending(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_until_shutdown(
+    endpoint: &str,
+    token: &str,
+    subdomain: Option<&str>,
+    target: crate::target::Target,
+    host_header: crate::host_header::HostHeader,
+    options: &crate::client::TunnelOptions,
+    hooks: Hooks,
+    shutdown: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    let tasks = crate::client::ForwardTasks::default();
+    let _cleanup = StopTasksOnDrop(tasks.clone());
+    let result = run_loop(
+        endpoint,
+        token,
+        subdomain,
+        target,
+        host_header,
+        options,
+        hooks,
+        shutdown,
+        &tasks,
+    )
+    .await;
+    tasks.shutdown().await;
+    result
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_loop(
+    endpoint: &str,
+    token: &str,
+    subdomain: Option<&str>,
+    target: crate::target::Target,
+    host_header: crate::host_header::HostHeader,
+    options: &crate::client::TunnelOptions,
+    mut hooks: Hooks,
+    shutdown: impl std::future::Future<Output = anyhow::Result<()>>,
+    tasks: &crate::client::ForwardTasks,
+) -> anyhow::Result<()> {
+    tokio::pin!(shutdown);
     let _availability = AvailabilityGuard(hooks.inspection.clone());
     let mut backoff_ms: u64 = 1_000;
     let mut last_tunnel: Option<(ulid::Ulid, String)> = None;
@@ -90,46 +145,80 @@ pub async fn run_with_options(
     let warned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     loop {
-        let result = if let Some((tid, sub)) = &last_tunnel {
-            // Clone the subdomain before the borrow on `last_tunnel` ends so
-            // we can use it after potentially setting `last_tunnel = None`.
-            let tid = *tid;
-            let sub = sub.clone();
-            // Try to reattach within the grace window.
-            match crate::client::connect_and_reattach_with_options(
-                endpoint, token, tid, &sub, options,
-            )
-            .await
-            {
-                Ok(s) => Ok(s),
-                Err(e) => {
-                    // On TunnelLost the grace window has elapsed; fall back to
-                    // a fresh create in the SAME selected mode so the URL
-                    // stays stable.
-                    if is_tunnel_lost(&e, options.access.is_some()) {
-                        eprintln!("info: grace window elapsed; recreating tunnel");
-                        last_tunnel = None;
-                        retain_protected_recreation_name(
-                            &mut create_subdomain,
-                            &sub,
-                            options.access.is_some(),
-                        );
-                        crate::client::connect_and_create_with_options(
-                            endpoint,
-                            token,
-                            Some(&sub),
-                            options,
-                        )
-                        .await
-                    } else {
-                        Err(e)
+        let previous = last_tunnel.clone();
+        let result = {
+            let started = std::sync::atomic::AtomicBool::new(false);
+            let mut connect = Box::pin(async {
+                started.store(true, std::sync::atomic::Ordering::Relaxed);
+                if let Some((tid, sub)) = &last_tunnel {
+                    // Clone the subdomain before the borrow on `last_tunnel` ends so
+                    // we can use it after potentially setting `last_tunnel = None`.
+                    let tid = *tid;
+                    let sub = sub.clone();
+                    // Try to reattach within the grace window.
+                    match crate::client::connect_and_reattach_with_options(
+                        endpoint, token, tid, &sub, options,
+                    )
+                    .await
+                    {
+                        Ok(s) => Ok(s),
+                        Err(e) => {
+                            // On TunnelLost the grace window has elapsed; fall back to
+                            // a fresh create in the SAME selected mode so the URL
+                            // stays stable.
+                            if is_tunnel_lost(&e, options.access.is_some()) {
+                                eprintln!("info: grace window elapsed; recreating tunnel");
+                                last_tunnel = None;
+                                retain_protected_recreation_name(
+                                    &mut create_subdomain,
+                                    &sub,
+                                    options.access.is_some(),
+                                );
+                                crate::client::connect_and_create_with_options(
+                                    endpoint,
+                                    token,
+                                    Some(&sub),
+                                    options,
+                                )
+                                .await
+                            } else {
+                                Err(e)
+                            }
+                        }
                     }
+                } else if let Some(s) = create_subdomain.as_deref() {
+                    crate::client::connect_and_create_with_options(
+                        endpoint,
+                        token,
+                        Some(s),
+                        options,
+                    )
+                    .await
+                } else {
+                    crate::client::connect_and_create_with_options(endpoint, token, None, options)
+                        .await
                 }
+            });
+            tokio::select! {
+                biased;
+                signal = &mut shutdown => {
+                    signal?;
+                    begin_shutdown(hooks.inspection.as_ref(), tasks);
+                    let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
+                    if started.load(std::sync::atomic::Ordering::Relaxed) {
+                        // Retain the in-flight registration long enough to close a late ACK.
+                        let released = tokio::time::timeout_at(deadline, async {
+                            let mut connected = connect.await?;
+                            crate::client::close_control(&mut connected.control).await
+                        }).await;
+                        report_shutdown(matches!(released, Ok(Ok(()))));
+                    } else {
+                        release_disconnected(endpoint, token, previous.as_ref(), options).await;
+                    }
+                    return Ok(());
+                }
+                result = &mut connect => result,
             }
-        } else if let Some(s) = create_subdomain.as_deref() {
-            crate::client::connect_and_create_with_options(endpoint, token, Some(s), options).await
-        } else {
-            crate::client::connect_and_create_with_options(endpoint, token, None, options).await
         };
 
         let session = match result {
@@ -150,7 +239,16 @@ pub async fn run_with_options(
                     "warning: connection lost ({e:#}); reconnecting in {}s",
                     backoff_ms / 1_000
                 );
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                tokio::select! {
+                    biased;
+                    signal = &mut shutdown => {
+                        signal?;
+                        begin_shutdown(hooks.inspection.as_ref(), tasks);
+                        release_disconnected(endpoint, token, last_tunnel.as_ref(), options).await;
+                        return Ok(());
+                    }
+                    () = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {},
+                }
                 backoff_ms = (backoff_ms * 2).min(30_000);
                 continue;
             }
@@ -187,7 +285,7 @@ pub async fn run_with_options(
         }
         let cancel = hooks.cancel_first_session.take();
         // Keep the control stream alive for the duration of the session.
-        let _ctrl_keep = session.control;
+        let mut control = session.control;
         let ctx = crate::forwarder::ForwardCtx {
             #[cfg(test)]
             inspection_ownership_check: None,
@@ -206,14 +304,18 @@ pub async fn run_with_options(
             rewrite_active: rewrite_active.clone(),
             warned: warned.clone(),
         };
-        let accept = tokio::spawn(crate::client::run_accept_loop(
-            session.session,
-            target.clone(),
-            ctx,
-        ));
+        let mut accept = tasks.accept(session.session, target.clone(), ctx);
 
         tokio::select! {
-            r = accept => {
+            biased;
+            signal = &mut shutdown => {
+                signal?;
+                begin_shutdown(hooks.inspection.as_ref(), tasks);
+                let released = tokio::time::timeout(SHUTDOWN_TIMEOUT, crate::client::close_control(&mut control)).await;
+                report_shutdown(matches!(released, Ok(Ok(()))));
+                return Ok(());
+            }
+            r = &mut accept => {
                 match r {
                     Ok(Ok(())) => info!("accept loop ended cleanly; reconnecting"),
                     Ok(Err(e)) => warn!(%e, "accept loop ended with error; reconnecting"),
@@ -236,6 +338,53 @@ pub async fn run_with_options(
         // Availability is not a claim that detached forwarding tasks ended.
         // Loop restarts; next iteration tries ReattachTunnel.
     }
+}
+
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+struct StopTasksOnDrop(crate::client::ForwardTasks);
+impl Drop for StopTasksOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+fn begin_shutdown(
+    inspection: Option<&crate::inspection::Inspection>,
+    tasks: &crate::client::ForwardTasks,
+) {
+    if let Some(inspection) = inspection {
+        // Revoke replay authority before any bounded network cleanup awaits.
+        inspection.disconnected();
+    }
+    tasks.stop_forwarding();
+}
+
+fn report_shutdown(confirmed: bool) {
+    if confirmed {
+        println!("✓ tunnel stopped; session released");
+    } else {
+        eprintln!("warning: shutdown was not acknowledged; the name may remain reserved until the server's reconnect grace expires");
+    }
+}
+
+async fn release_disconnected(
+    endpoint: &str,
+    token: &str,
+    previous: Option<&(ulid::Ulid, String)>,
+    options: &crate::client::TunnelOptions,
+) {
+    let released = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+        let (id, subdomain) = previous.ok_or_else(|| anyhow::anyhow!("no confirmed session"))?;
+        // Reattach only: cleanup must never create or delete by a reusable name.
+        let mut connected = crate::client::connect_and_reattach_with_options(
+            endpoint, token, *id, subdomain, options,
+        )
+        .await?;
+        crate::client::close_control(&mut connected.control).await
+    })
+    .await;
+    report_shutdown(matches!(released, Ok(Ok(()))));
 }
 
 struct AvailabilityGuard(Option<crate::inspection::Inspection>);

@@ -100,9 +100,22 @@ impl Registry {
     /// When `grace_sec == 0`, tunnels are removed immediately (backward-compatible).
     /// Otherwise GC will clean them up after the grace window expires.
     pub fn drop_session(&self, session_id: &str, grace_sec: u32) {
-        let Ok(_lifecycle) = self.lifecycle.lock() else {
-            return;
-        };
+        let _ = self.drop_session_with_grace(session_id, grace_sec);
+    }
+
+    pub fn close_session(&self, session_id: &str) -> Result<(), RegistryError> {
+        self.drop_session_with_grace(session_id, 0)
+    }
+
+    fn drop_session_with_grace(
+        &self,
+        session_id: &str,
+        grace_sec: u32,
+    ) -> Result<(), RegistryError> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| RegistryError::Unavailable)?;
         self.sessions.remove(session_id);
 
         if grace_sec == 0 {
@@ -136,6 +149,7 @@ impl Registry {
                 }
             }
         }
+        Ok(())
     }
 
     /// Remove all tunnels whose grace window has expired.
@@ -400,6 +414,23 @@ mod tests {
         assert!(!valid_subdomain("Foo")); // uppercase
         assert!(!valid_subdomain("foo.bar")); // dot
         assert!(!valid_subdomain(&"x".repeat(32)));
+    }
+
+    #[test]
+    fn intentional_close_reports_registry_failure_instead_of_claiming_release() {
+        let reg = Registry::new("t.example.com");
+        let session = reg.register_session("owner");
+        let tunnel = reg.create_tunnel("demo", &session.id, "owner").unwrap();
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = reg.lifecycle.lock().unwrap();
+            panic!("inject lifecycle failure");
+        }));
+        assert!(failed.is_err());
+        assert!(matches!(
+            reg.close_session(&session.id),
+            Err(RegistryError::Unavailable)
+        ));
+        assert_eq!(reg.find_by_subdomain("demo").unwrap().id, tunnel.id);
     }
 
     #[test]

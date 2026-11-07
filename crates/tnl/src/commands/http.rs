@@ -77,28 +77,43 @@ pub async fn run_configured(
     let inspector = crate::inspector::Inspector::new(log_rx, verbosity, format);
     let inspector_task = tokio::spawn(inspector.run());
 
-    let result = tokio::select! {
-        r = crate::reconnect::run_with_options(
-            &cfg.endpoint,
-            &cfg.token,
-            subdomain,
-            target,
-            host_header,
-            options,
-            crate::reconnect::Hooks {
-                inspection,
-                cancel_first_session: None,
-                log_tx: Some(log_tx),
-            },
-        ) => r,
-        _ = tokio::signal::ctrl_c() => {
-            println!("\n✓ stopping tunnel");
-            Ok(())
-        }
-    };
+    let result = crate::reconnect::run_until_shutdown(
+        &cfg.endpoint,
+        &cfg.token,
+        subdomain,
+        target,
+        host_header,
+        options,
+        crate::reconnect::Hooks {
+            inspection,
+            cancel_first_session: None,
+            log_tx: Some(log_tx),
+        },
+        shutdown_signal(),
+    )
+    .await;
     if let Some(service) = service {
         service.shutdown().await;
     }
     inspector_task.abort();
+    let _ = inspector_task.await;
     result
+}
+
+async fn shutdown_signal() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            signal = terminate.recv() => {
+                signal.ok_or_else(|| anyhow::anyhow!("termination signal stream closed"))?;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await?;
+    println!("\nStopping tunnel…");
+    Ok(())
 }

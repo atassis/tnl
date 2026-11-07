@@ -148,7 +148,11 @@ async fn authority_auth_browser_context_and_query_validation_are_fail_closed() {
     assert!(!root.contains(token));
     assert!(!root.contains("Access-Control-Allow"));
     let script = request(&service, "", "/inspector.js").await;
-    assert!(script.contains("history.replaceState"));
+    assert!(script.contains("location.hash"));
+    assert!(
+        !script.contains("history.replaceState"),
+        "private fragment must survive refresh"
+    );
     assert!(script.contains("textContent"));
     for forbidden in [
         "innerHTML",

@@ -14,7 +14,7 @@ it works from anywhere behind NAT, with no mesh required.
 
 ## Status
 
-**v0.1.0-beta.5** adds classic HTTP/1.1 application WebSockets, shared request
+**v0.1.0-beta.6 (candidate)** includes classic HTTP/1.1 application WebSockets, shared request
 IDs, trusted-proxy visitor attribution, opt-in authenticated browser history and
 confirmed replay, and optional per-tunnel visitor access controls. Inspection
 and raw replay retention are off by default; normal tunnels remain public.
@@ -67,11 +67,28 @@ the tunnel hostname by default. `tnl` detects this and auto-rewrites the
 forwarded `Host` to the address it connected to, so they just work — no config
 edits. Control it with `tnl http … --host-header <preserve|rewrite|VALUE>`.
 
+## Stopping and reconnecting
+
+Ctrl+C and SIGTERM close active HTTP/WebSocket connections immediately and
+attempt a bounded, acknowledged release of the current session's tunnel. Once
+the server confirms release, the same name can be used by a new CLI invocation
+without waiting for reconnect grace. Older or unreachable daemons may not
+confirm release; the CLI warns that the name may remain reserved.
+
+Unexpected network loss still uses grace, reattach and same-policy recreation;
+intentional shutdown does not reconnect. This does not change `tnl stop` or the
+retry classification of a separately occupied name.
+
 ## Local browser inspection (opt-in)
 
 Run `tnl http 3000 foo --inspect` to retain sanitized recent history in memory
 (200 records, 15 minutes) and serve a private IPv4-loopback browser inspector.
-Open the private URL printed to stderr; do not share/save that link or its token.
+Open the private URL printed to stderr; do not share that link or its token.
+The bearer token stays in the URL fragment so refresh retains access, without
+cookies or browser storage. Fragments are not sent in HTTP requests or Referer,
+but the link can appear in browser history/session restore or copied URLs.
+It authorizes only this CLI run; restarting the CLI generates a new token.
+Refreshing never preserves replay confirmation or automatically resends a request.
 Body previews are off by default. `--inspect-bodies json` enables only complete,
 small sanitized JSON previews; it does **not** retain raw replay requests.
 `--inspect-port PORT` optionally selects the loopback port (default: ephemeral).

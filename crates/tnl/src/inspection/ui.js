@@ -1,7 +1,6 @@
 "use strict";
 (() => {
   let token = new URLSearchParams(location.hash.slice(1)).get("token");
-  history.replaceState(null, "", location.pathname);
   let before = null;
   let selectedCapture = null;
   let selectedReplay = null;

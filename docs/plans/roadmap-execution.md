@@ -227,3 +227,17 @@ script remain at `/opt/tnld/releases/beta5-45e0b7a-20261107T194526Z`. Rollback w
 not needed and no live rollback rehearsal is claimed. Full frozen manifest,
 logs, artifact hashes, public fixtures/results and old client backup are under
 release-validation/target/release-candidate/45e0b7a (private ignored artifacts).
+
+
+## Unreleased beta.6 follow-up
+
+The intentional-stop/refresh follow-up is described in
+`2026-11-07-intentional-stop-and-refresh.md`. Ctrl+C/SIGTERM now request
+session-scoped acknowledged release without network grace; active HTTP/WS stop
+immediately. Replay authority is revoked before cleanup awaits. The private
+inspector fragment remains for F5 without cookies/storage or replay recovery.
+Configured beta.6 debug source tests report 447 passed, zero failed/ignored,
+including real CLI signals, stale-session protection, delayed/missing ACK,
+protected named/random WS shutdown, actual Caddy and Brave F5/replay safety.
+No frozen beta.6 artifacts, deployment or global client replacement is implied;
+the deployed daemon and installed CLI remain the qualified beta.5 versions.

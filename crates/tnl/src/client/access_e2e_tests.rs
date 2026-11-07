@@ -530,3 +530,129 @@ mod access_reconnect_tests;
 
 #[path = "access_observation_tests.rs"]
 mod access_observation_tests;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn intentional_shutdown_closes_protected_websockets_and_releases_named_or_random_tunnels() {
+    for requested in [Some("guarded"), None] {
+        let fixture = fixture().await;
+        let endpoint = fixture.endpoint.clone();
+        let backend = fixture.backend;
+        let options = options(true);
+        let run_options = options.clone();
+        let connector = fixture.connector.clone();
+        let (stop, stopping) = tokio::sync::oneshot::channel();
+        let run = tokio::spawn(TEST_TLS_CONNECTOR.scope(connector, async move {
+            crate::reconnect::run_until_shutdown(
+                &endpoint,
+                "tnl_TEST",
+                requested,
+                crate::target::Target::Explicit(backend),
+                crate::host_header::HostHeader::Preserve,
+                &run_options,
+                crate::reconnect::Hooks::default(),
+                async { stopping.await.map_err(anyhow::Error::from) },
+            )
+            .await
+        }));
+        let tunnel = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if let Some(info) = fixture
+                    .state
+                    .registry
+                    .snapshot_infos()
+                    .into_iter()
+                    .find(|t| t.active)
+                {
+                    break fixture
+                        .state
+                        .registry
+                        .find_by_subdomain(&info.subdomain)
+                        .unwrap();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let request = http::Request::builder()
+            .uri(format!("ws://{}/socket", fixture.server.local_addr))
+            .header("Host", format!("{}.t.x", tunnel.subdomain))
+            .header("Connection", "upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Key", generate_key())
+            .header("Sec-WebSocket-Version", "13")
+            .header("Authorization", "Basic dXNlcjpWSVNJVE9SX1NFTlRJTkVM")
+            .body(())
+            .unwrap();
+        let (mut ws, _) = async_tungstenite::tokio::connect_async(request)
+            .await
+            .unwrap();
+        ws.send(async_tungstenite::tungstenite::Message::Text("live".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            ws.next().await.unwrap().unwrap().into_text().unwrap(),
+            "live"
+        );
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), run)
+            .await
+            .expect("shutdown must join without draining WS")
+            .unwrap()
+            .unwrap();
+        assert!(fixture
+            .state
+            .registry
+            .find_by_subdomain(&tunnel.subdomain)
+            .is_none());
+        assert_shutdown_frame(&mut ws).await;
+        let mut next = connect_and_create_with_connector(
+            &fixture.endpoint,
+            "tnl_TEST",
+            Some(&tunnel.subdomain),
+            &options,
+            Some(fixture.connector.clone()),
+        )
+        .await
+        .expect("released protected name immediately reusable");
+        assert_ne!(next.tunnel_id.to_string(), tunnel.id);
+        tokio::time::timeout(Duration::from_secs(2), close_control(&mut next.control))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(fixture);
+    }
+}
+
+async fn assert_shutdown_frame(
+    stream: &mut (impl futures::Stream<
+        Item = Result<
+            async_tungstenite::tungstenite::Message,
+            async_tungstenite::tungstenite::Error,
+        >,
+    > + Unpin),
+) {
+    use async_tungstenite::tungstenite::{error::ProtocolError, Error, Message};
+    match tokio::time::timeout(Duration::from_secs(1), stream.next())
+        .await
+        .expect("WS must close")
+    {
+        None
+        | Some(
+            Ok(Message::Close(_))
+            | Err(
+                Error::Protocol(ProtocolError::ResetWithoutClosingHandshake)
+                | Error::ConnectionClosed
+                | Error::AlreadyClosed,
+            ),
+        ) => {}
+        Some(Err(Error::Io(error)))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+            ) => {}
+        other => panic!("unexpected shutdown WS result: {other:?}"),
+    }
+}

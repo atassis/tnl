@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- Ctrl+C and SIGTERM stop active HTTP/WebSocket connections immediately and
+  request acknowledged session-scoped tunnel release, allowing immediate
+  same-name restart without disabling unexpected-disconnect grace.
+- Bound shutdown during registration/reconnect and warn if an older or
+  unreachable daemon cannot confirm release. Revoke replay authority before
+  waiting for network cleanup.
+- Keep the private inspector capability in the URL fragment so browser refresh
+  retains access, without cookies/storage or restored replay confirmation.
+
 ## [0.1.0-beta.5] - 2026-11-07
 
 ### Added
