@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tnld::auth::{hash_plaintext, TokenEntry, TokensFile};
 use tnld::config::Config as TnldConfig;
-use tnld::serve::spawn_server;
+use tnld::serve::{spawn_server_with_state, AppState};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn client_reattaches_within_grace_window() {
@@ -33,14 +33,16 @@ async fn client_reattaches_within_grace_window() {
         tokens_file: tmp.path().to_string_lossy().into_owned(),
         session_grace_sec: 30,
     };
-    let h = spawn_server(cfg).await.unwrap();
+    let (h, state) = spawn_server_with_state(cfg).await.unwrap();
     let daemon_addr = h.local_addr.to_string();
 
     // 3. Start the reconnect loop with a fixed subdomain "foo".
     //    Pass a cancel oneshot so we can force the first session to drop.
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
     let endpoint = format!("http://{daemon_addr}");
-    let task = tokio::spawn(async move {
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut task = tokio::spawn(async move {
+        start_rx.await?;
         tnl::reconnect::run(
             &endpoint,
             "tnl_U",
@@ -55,12 +57,25 @@ async fn client_reattaches_within_grace_window() {
         .await
     });
 
-    // Give the client time to connect and the daemon to register the tunnel.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Deterministically hold startup beyond the old 400ms sleep: readiness must
+    // remain pending until a tunnel actually exists, regardless of elapsed time.
+    let (tunnel_id, first_session_id) = {
+        let ready = wait_for_tunnel_session(&state, None, &mut task);
+        tokio::pin!(ready);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut ready)
+                .await
+                .is_err(),
+            "readiness completed before the client was allowed to connect"
+        );
+        start_tx.send(()).unwrap();
+        ready.await
+    };
 
     // 4. First request: must succeed via the active tunnel.
     let c = reqwest::Client::builder()
         .pool_max_idle_per_host(0)
+        .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
     let r = c
@@ -71,13 +86,20 @@ async fn client_reattaches_within_grace_window() {
         .await
         .unwrap();
     assert_eq!(r.status().as_u16(), 200, "first request failed");
+    assert_eq!(r.text().await.unwrap(), "ok");
 
     // 5. Force a disconnect; the reconnect loop should attempt ReattachTunnel.
     cancel_tx.send(()).unwrap();
 
-    // 6. Give the reconnect loop time to: detect the disconnect, wait for the
-    //    1-second backoff, reattach, and start accepting again.
-    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    // 6. Observe a new session bound to the original tunnel, not merely a
+    //    still-active first session or a recreated tunnel with the same hostname.
+    let (reattached_tunnel_id, _) =
+        wait_for_tunnel_session(&state, Some(&first_session_id), &mut task).await;
+    assert_eq!(reattached_tunnel_id, tunnel_id, "tunnel was recreated");
+    assert!(
+        !state.session_handles.contains_key(&first_session_id),
+        "first session was not cleaned up"
+    );
 
     // 7. Second request after reattach: same hostname, still works.
     let r = c
@@ -93,5 +115,49 @@ async fn client_reattaches_within_grace_window() {
         "second request failed after reattach"
     );
 
+    assert_eq!(r.text().await.unwrap(), "ok");
+
     task.abort();
+}
+
+/// Observe daemon-side routing readiness without issuing/retrying HTTP requests.
+/// A changed binding proves reattach; waiting for an intermediate Disconnected
+/// snapshot could miss that transient state entirely.
+async fn wait_for_tunnel_session(
+    state: &AppState,
+    previous_session: Option<&str>,
+    task: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> (String, String) {
+    let phase = if previous_session.is_some() {
+        "reattachment to a new session"
+    } else {
+        "initial tunnel registration"
+    };
+    tokio::select! {
+        result = &mut *task => panic!("reconnect task ended during {phase}: {result:?}"),
+        result = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(tunnel) = state.registry.find_by_subdomain("foo") {
+                    if let Some(session_id) = state.registry.current_session_id(&tunnel.id) {
+                        if Some(session_id.as_str()) != previous_session
+                            && state.session_handles.contains_key(&session_id)
+                        {
+                            return (tunnel.id.clone(), session_id);
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }) => result.unwrap_or_else(|_| {
+            task.abort();
+            panic!(
+                "timed out waiting for {phase}; previous_session={previous_session:?}, \
+                 current_session={:?}, tunnels={:?}, session_handles={:?}",
+                state.registry.find_by_subdomain("foo")
+                    .and_then(|t| state.registry.current_session_id(&t.id)),
+                state.registry.snapshot_infos(),
+                state.session_handles.iter().map(|entry| entry.key().clone()).collect::<Vec<_>>(),
+            )
+        }),
+    }
 }
