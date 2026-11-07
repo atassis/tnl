@@ -71,8 +71,16 @@ Body previews are off by default. `--inspect-bodies json` enables only complete,
 small sanitized JSON previews; it does **not** retain raw replay requests.
 `--inspect-port PORT` optionally selects the loopback port (default: ephemeral).
 Headers and query values are redacted, but arbitrary paths and allowed header
-values can still be sensitive. No durable history, raw export or replay controls
-are provided by this checkpoint. The existing CLI request rows remain available.
+values can still be sensitive. The existing CLI request rows remain available.
+
+Replay requires separate explicit `--replay-retain-secrets` consent (also requiring
+`--inspect`). **This retains original query, credentials, cookies and body secrets
+in memory:** at most20 requests/10minutes/16MiB total/1MiB body per request. JSON
+previews do not enable it. Eligible complete original requests can be reviewed
+and explicitly confirmed in the inspector for one fixed-original-loopback-backend
+attempt; every method can cause side effects. No request editing, raw export,
+redirect following or automatic retry is provided. Missing outcomes mean unknown
+delivery, not that nothing was sent. Never expose/share this private inspector.
 
 ## Optional per-run visitor controls
 

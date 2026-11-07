@@ -82,6 +82,9 @@ enum Cmd {
         /// Sanitized body preview policy; off by default. Never raw replay consent.
         #[arg(long, value_enum, requires = "inspect")]
         inspect_bodies: Option<tnl::inspection::PreviewMode>,
+        /// Retain original request secrets in bounded memory for explicit replay.
+        #[arg(long, requires = "inspect")]
+        replay_retain_secrets: bool,
     },
     /// List active tunnels for the configured bearer.
     Status {
@@ -213,15 +216,13 @@ fn real_main() -> anyhow::Result<()> {
             inspect,
             inspect_port,
             inspect_bodies,
+            replay_retain_secrets,
         } => {
-            let verbosity = if quiet {
-                tnl::inspector::Verbosity::Quiet
-            } else if very_verbose {
-                tnl::inspector::Verbosity::VeryVerbose
-            } else if verbose {
-                tnl::inspector::Verbosity::Verbose
-            } else {
-                tnl::inspector::Verbosity::Default
+            let verbosity = match (quiet, very_verbose, verbose) {
+                (true, _, _) => tnl::inspector::Verbosity::Quiet,
+                (_, true, _) => tnl::inspector::Verbosity::VeryVerbose,
+                (_, _, true) => tnl::inspector::Verbosity::Verbose,
+                _ => tnl::inspector::Verbosity::Default,
             };
             let format = if json {
                 tnl::inspector::Format::Json
@@ -245,6 +246,7 @@ fn real_main() -> anyhow::Result<()> {
                 &options,
                 inspect.then_some(tnl::commands::http::InspectionOptions {
                     port: inspect_port.unwrap_or(0),
+                    replay_retain_secrets,
                     bodies: inspect_bodies.unwrap_or(tnl::inspection::PreviewMode::Off),
                 }),
             ))

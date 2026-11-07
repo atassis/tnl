@@ -1,7 +1,8 @@
 //! Explicitly opted-in memory-only retention and one-attempt replay.
 //!
 //! This module owns no listener or UI. The authenticated inspector must check
-//! sanitized-row existence before prepare/confirm, call `forget` on eviction,
+//! sanitized-row existence before prepare/new execution, recover consumed-ticket
+//! metadata before that existence gate, call `forget` on eviction,
 //! `activate` on each trusted attach, `deactivate` on disconnect and `shutdown`
 //! on service failure. Its periodic timer must call `sweep` even with no traffic.
 //! Raw eligibility is independently enforced here; display bytes are never input.
@@ -259,6 +260,27 @@ impl ReplayController {
             ],
         })
     }
+    /// Metadata-only duplicate recovery. This never accesses raw entries,
+    /// admits retention, or starts an execution; new tickets return None.
+    pub(crate) fn consumed_confirmation(
+        &self,
+        capture: CaptureId,
+        replay: ulid::Ulid,
+        token: &str,
+        confirm_side_effects: bool,
+    ) -> Result<Option<ReplayOutcome>, ReplayError> {
+        if !confirm_side_effects {
+            return Err(ReplayError::ConfirmationRequired);
+        }
+        let token = decode_token(token).ok_or(ReplayError::InvalidConfirmation)?;
+        Ok(consumed_outcome(
+            &self.inner.state.lock(),
+            capture,
+            replay,
+            &token,
+            Instant::now(),
+        ))
+    }
     /// Atomic lease acceptance: authority, ticket, snapshot pin, raw/transient
     /// quota and the one-execution permit share this single state lock. Budget
     /// drops use atomics only (never acquire the state lock); cancellation only
@@ -276,13 +298,10 @@ impl ReplayController {
         }
         let token = decode_token(token).ok_or(ReplayError::InvalidConfirmation)?;
         let mut state = self.inner.state.lock();
-        Self::sweep_locked(&mut state, Instant::now());
-        if let Some(saved) = state.outcomes.iter().find(|o| {
-            o.token == token
-                && o.outcome.replay_id == replay
-                && o.outcome.parent_capture_id == capture
-        }) {
-            return Ok(saved.outcome.clone());
+        let now = Instant::now();
+        Self::sweep_locked(&mut state, now);
+        if let Some(outcome) = consumed_outcome(&state, capture, replay, &token, now) {
+            return Ok(outcome);
         }
         let index = state
             .tickets
@@ -370,6 +389,25 @@ impl ReplayController {
             .find(|o| o.outcome.replay_id == replay)
             .map(|o| o.outcome.clone())
     }
+}
+fn consumed_outcome(
+    state: &State,
+    capture: CaptureId,
+    replay: ulid::Ulid,
+    token: &[u8; 32],
+    now: Instant,
+) -> Option<ReplayOutcome> {
+    state
+        .outcomes
+        .iter()
+        .find(|saved| {
+            &saved.token == token
+                && saved.outcome.replay_id == replay
+                && saved.outcome.parent_capture_id == capture
+                && (saved.outcome.state == AttemptState::Running
+                    || now.saturating_duration_since(saved.created) < OUTCOME_TTL)
+        })
+        .map(|saved| saved.outcome.clone())
 }
 fn reserve_with_eviction(inner: &Inner, state: &mut State, bytes: usize) -> Option<Charge> {
     loop {

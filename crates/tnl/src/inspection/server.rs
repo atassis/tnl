@@ -1,7 +1,7 @@
-//! One bounded HTTP/1 loopback listener. No mutation or raw-content endpoints.
+//! One bounded authenticated HTTP/1 loopback listener. No raw-content endpoints.
 use super::{CaptureId, Inspection, InspectionRecord};
 use anyhow::Context;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +13,7 @@ use tokio::task::{JoinHandle, JoinSet};
 
 const HEAD_LIMIT: usize = 32768;
 const RESPONSE_LIMIT: usize = 65536;
+const JSON_LIMIT: usize = 1024;
 const HEX: &[u8; 16] = b"0123456789abcdef";
 const DEADLINE: Duration = Duration::from_secs(3);
 const UI: &str = include_str!("ui.html");
@@ -164,31 +165,43 @@ async fn connection(mut socket: TcpStream, state: &ServerState) -> std::io::Resu
     let Ok(_permit) = state.handlers.try_acquire() else {
         return Ok(());
     };
-    let mut head = Vec::with_capacity(HEAD_LIMIT);
+    let mut input = Vec::with_capacity(HEAD_LIMIT + JSON_LIMIT);
     let read = tokio::time::timeout(DEADLINE, async {
         let mut chunk = [0u8; 1024];
-        loop {
-            if head.len() == HEAD_LIMIT {
-                return false;
+        let end = loop {
+            if input.len() == HEAD_LIMIT {
+                return Err(0);
             }
-            let available = (HEAD_LIMIT - head.len()).min(chunk.len());
-            let Ok(n) = socket.read(&mut chunk[..available]).await else {
-                return false;
-            };
+            let available = (HEAD_LIMIT - input.len()).min(chunk.len());
+            let n = socket.read(&mut chunk[..available]).await.map_err(|_| 0)?;
             if n == 0 {
-                return false;
+                return Err(0);
             }
-            head.extend_from_slice(&chunk[..n]);
-            if let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") {
-                return end + 4 == head.len();
+            input.extend_from_slice(&chunk[..n]);
+            if let Some(end) = input.windows(4).position(|w| w == b"\r\n\r\n") {
+                break end + 4;
             }
+        };
+        let length = post_body_length(&input[..end]).map_err(|()| 400)?;
+        if input.len() > end + length {
+            return Err(400);
         }
+        while input.len() < end + length {
+            let available = (end + length - input.len()).min(chunk.len());
+            let n = socket.read(&mut chunk[..available]).await.map_err(|_| 0)?;
+            if n == 0 {
+                return Err(0);
+            }
+            input.extend_from_slice(&chunk[..n]);
+        }
+        Ok(end)
     })
     .await;
-    if !matches!(read, Ok(true)) {
-        return Ok(());
-    }
-    let reply = route(&head, state);
+    let reply = match read {
+        Ok(Ok(end)) => route(&input[..end], &input[end..], state),
+        Ok(Err(400)) => error(400),
+        _ => return Ok(()),
+    };
     let body = reply.body;
     let headers=format!("HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nPragma: no-cache\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'none'; script-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n\r\n",reply.status,reason(reply.status),reply.mime,body.len());
     let _ = tokio::time::timeout(DEADLINE, async {
@@ -198,6 +211,36 @@ async fn connection(mut socket: TcpStream, state: &ServerState) -> std::io::Resu
     })
     .await;
     Ok(())
+}
+// Fixed admission and read deadline also cover JSON; transfer coding is never
+// accepted. All other methods retain the no-body policy checked by route().
+fn post_body_length(head: &[u8]) -> Result<usize, ()> {
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut req = httparse::Request::new(&mut headers);
+    if !matches!(req.parse(head), Ok(httparse::Status::Complete(_))) {
+        return Err(());
+    }
+    if req.method != Some("POST") {
+        return Ok(0);
+    }
+    if one(req.headers, "transfer-encoding") != Ok(None) || one(req.headers, "upgrade") != Ok(None)
+    {
+        return Err(());
+    }
+    let Some(value) = one(req.headers, "content-length")? else {
+        return Ok(0);
+    };
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return Err(());
+    }
+    let length: usize = std::str::from_utf8(value)
+        .map_err(|_| ())?
+        .parse()
+        .map_err(|_| ())?;
+    if length > JSON_LIMIT {
+        return Err(());
+    }
+    Ok(length)
 }
 struct Reply {
     status: u16,
@@ -219,6 +262,7 @@ const fn reason(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         _ => "Service Unavailable",
     }
 }
@@ -268,7 +312,7 @@ fn one<'a>(headers: &'a [httparse::Header<'a>], name: &str) -> Result<Option<&'a
     Ok(value)
 }
 #[allow(clippy::too_many_lines)] // Ordered transport/auth checks precede route disclosure.
-fn route(head: &[u8], state: &ServerState) -> Reply {
+fn route(head: &[u8], body: &[u8], state: &ServerState) -> Reply {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut req = httparse::Request::new(&mut headers);
     if !matches!(req.parse(head), Ok(httparse::Status::Complete(_))) || req.version != Some(1) {
@@ -295,11 +339,12 @@ fn route(head: &[u8], state: &ServerState) -> Reply {
                 && one(req.headers, "sec-fetch-user") == Ok(Some(b"?1")) => {}
         _ => return error(403),
     }
-    // No request bodies, transfer coding, upgrades or pipelining. No POST or
-    // simple-form mutation exists until replay's real API is integrated.
+    // Only bounded, length-framed JSON POSTs can reach replay mutation routes.
+    // Transfer coding, upgrades and non-POST bodies remain forbidden.
     if one(req.headers, "transfer-encoding") != Ok(None)
         || one(req.headers, "upgrade") != Ok(None)
-        || !matches!(one(req.headers, "content-length"), Ok(None | Some(b"0")))
+        || (req.method != Some("POST")
+            && !matches!(one(req.headers, "content-length"), Ok(None | Some(b"0"))))
     {
         return error(400);
     }
@@ -332,6 +377,19 @@ fn route(head: &[u8], state: &ServerState) -> Reply {
                 ))
         {
             return error(403);
+        }
+        if req.method == Some("POST") {
+            if replay_capture(path, "/replay/prepare").is_none()
+                && replay_capture(path, "/replay/confirm").is_none()
+            {
+                return error(405);
+            }
+            if one(req.headers, "content-encoding") != Ok(None)
+                || one(req.headers, "content-type") != Ok(Some(b"application/json"))
+            {
+                return error(400);
+            }
+            return replay_mutation(path, body, state);
         }
         return error(405);
     }
@@ -370,6 +428,37 @@ fn route(head: &[u8], state: &ServerState) -> Reply {
                 Err(()) => error(503),
             }
         }
+        _ if path.ends_with("/replay/prepare") || path.ends_with("/replay/confirm") => error(405),
+        _ if path.starts_with("/api/v1/replays/") => {
+            let Some(id) = path
+                .strip_prefix("/api/v1/replays/")
+                .and_then(|id| id.parse().ok())
+            else {
+                return error(404);
+            };
+            match state.history.replay_outcome(id) {
+                Ok(outcome) => json(&OutcomeReply {
+                    schema_version: 1,
+                    outcome,
+                }),
+                Err(reason) => replay_error(reason),
+            }
+        }
+        _ if path.ends_with("/replay") => {
+            let Some(id) = replay_capture(path, "/replay") else {
+                return error(404);
+            };
+            match state
+                .history
+                .with_replay_row(id, |replay, _| Ok(replay.availability(id)))
+            {
+                Ok(availability) => json(&AvailabilityReply {
+                    schema_version: 1,
+                    availability,
+                }),
+                Err(reason) => replay_error(reason),
+            }
+        }
         _ if path.starts_with("/api/v1/requests/") => {
             let Some(id) = path
                 .strip_prefix("/api/v1/requests/")
@@ -384,6 +473,107 @@ fn route(head: &[u8], state: &ServerState) -> Reply {
             }
         }
         _ => error(404),
+    }
+}
+#[derive(Serialize)]
+struct AvailabilityReply {
+    schema_version: u8,
+    availability: crate::replay::ReplayAvailability,
+}
+#[derive(Serialize)]
+struct PreviewReply {
+    schema_version: u8,
+    method: String,
+    request_target: String,
+    preview: crate::replay::ReplayPreview,
+}
+#[derive(Serialize)]
+struct OutcomeReply {
+    schema_version: u8,
+    outcome: Option<crate::replay::ReplayOutcome>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrepareRequest {
+    schema_version: u8,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfirmRequest {
+    schema_version: u8,
+    replay_id: ulid::Ulid,
+    confirmation_token: String,
+    confirm_side_effects: bool,
+}
+fn replay_capture(path: &str, suffix: &str) -> Option<CaptureId> {
+    path.strip_prefix("/api/v1/requests/")?
+        .strip_suffix(suffix)?
+        .parse()
+        .ok()
+        .map(CaptureId)
+}
+fn replay_error(reason: crate::replay::ReplayError) -> Reply {
+    use crate::replay::ReplayError;
+    #[derive(Serialize)]
+    struct Failure {
+        schema_version: u8,
+        error: crate::replay::ReplayError,
+    }
+    let mut reply = json(&Failure {
+        schema_version: 1,
+        error: reason,
+    });
+    reply.status = match reason {
+        ReplayError::NotRetained => 404,
+        ReplayError::InvalidRequest
+        | ReplayError::InvalidConfirmation
+        | ReplayError::ConfirmationRequired => 400,
+        ReplayError::Busy | ReplayError::Overloaded | ReplayError::RuntimeUnavailable => 503,
+        _ => 409,
+    };
+    reply
+}
+fn replay_mutation(path: &str, body: &[u8], state: &ServerState) -> Reply {
+    use crate::replay::ReplayError;
+    if let Some(id) = replay_capture(path, "/replay/prepare") {
+        let Ok(request) = serde_json::from_slice::<PrepareRequest>(body) else {
+            return replay_error(ReplayError::InvalidRequest);
+        };
+        if request.schema_version != 1 {
+            return replay_error(ReplayError::InvalidRequest);
+        }
+        match state.history.with_replay_row(id, |replay, row| {
+            Ok(PreviewReply {
+                schema_version: 1,
+                method: row.method.clone(),
+                request_target: row.request_target.clone(),
+                preview: replay.prepare(id)?,
+            })
+        }) {
+            Ok(preview) => json(&preview),
+            Err(reason) => replay_error(reason),
+        }
+    } else if let Some(id) = replay_capture(path, "/replay/confirm") {
+        let Ok(request) = serde_json::from_slice::<ConfirmRequest>(body) else {
+            return replay_error(ReplayError::InvalidRequest);
+        };
+        if request.schema_version != 1 {
+            return replay_error(ReplayError::InvalidRequest);
+        }
+        match state.history.confirm_replay(
+            id,
+            request.replay_id,
+            &request.confirmation_token,
+            request.confirm_side_effects,
+        ) {
+            Ok(outcome) => json(&OutcomeReply {
+                schema_version: 1,
+                outcome: Some(outcome),
+            }),
+            Err(reason) => replay_error(reason),
+        }
+    } else {
+        error(405)
     }
 }
 pub(super) struct Filter {

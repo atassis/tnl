@@ -969,3 +969,59 @@ async fn canonical_fragmented_response_prefixes_allow_binary_entity() {
         }
     }
 }
+
+#[test]
+fn consumed_confirmation_is_metadata_only_and_preserves_outcome_expiry() {
+    let controller = ReplayController::new(false, 49151).unwrap();
+    let capture = CaptureId(ulid::Ulid::new());
+    let replay = ulid::Ulid::new();
+    let token = [7; 32];
+    let encoded = encode_token(&token);
+    controller
+        .inner
+        .state
+        .lock()
+        .outcomes
+        .push_back(SavedOutcome {
+            token,
+            created: Instant::now(),
+            outcome: ReplayOutcome {
+                replay_id: replay,
+                parent_capture_id: capture,
+                tunnel_generation: TunnelGeneration::new(),
+                state: AttemptState::Complete,
+                delivery: Delivery::ResponseReceived,
+                status: Some(204),
+                duration_ms: 1,
+                request_body_bytes: 0,
+                response_body_bytes: 0,
+                response_complete: true,
+                error_code: None,
+            },
+        });
+    // No runtime, retention consent, active generation, raw entry or ticket is
+    // needed to read exact already-consumed metadata. No new authority is added.
+    assert!(controller
+        .consumed_confirmation(capture, replay, &encoded, true)
+        .unwrap()
+        .is_some());
+    assert!(controller.confirm(capture, replay, &encoded, true).is_ok());
+    assert_eq!(
+        controller
+            .consumed_confirmation(capture, replay, &encoded, false)
+            .unwrap_err(),
+        ReplayError::ConfirmationRequired
+    );
+    let mut state = controller.inner.state.lock();
+    assert!(state.entries.is_empty());
+    assert!(state.tickets.is_empty());
+    assert!(state.execution.is_none());
+    assert_eq!(controller.raw_bytes(), 0);
+    state.outcomes[0].created = Instant::now().checked_sub(OUTCOME_TTL).unwrap();
+    drop(state);
+    assert!(controller
+        .consumed_confirmation(capture, replay, &encoded, true)
+        .unwrap()
+        .is_none());
+    assert!(controller.confirm(capture, replay, &encoded, true).is_err());
+}
