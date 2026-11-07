@@ -37,6 +37,7 @@ clap_complete = { version = "4", features = ["unstable-dynamic"] }
 dashmap = "6"
 dialoguer = { version = "0.11", default-features = false, features = ["history", "password"] }
 futures = "0.3"
+getrandom = "0.3"
 http = "1"
 httparse = "1"
 hyper = { version = "1", features = ["full"] }
@@ -45,6 +46,7 @@ ipnet = "2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+subtle = "2.6"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat"] }

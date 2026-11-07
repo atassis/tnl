@@ -675,3 +675,41 @@ fn invalid_encoded_or_ambiguous_json_is_omitted_without_raw_fallback() {
         }
     }
 }
+
+#[test]
+fn display_record_distinguishes_untracked_tunnel_availability() {
+    let history = Inspection::new(PreviewMode::Off);
+    let capture = history.admit(TunnelGeneration::new(), None).unwrap();
+    let value = serde_json::to_value(history.get(capture.id()).unwrap()).unwrap();
+    assert_eq!(value["connection"], "untracked");
+}
+
+#[test]
+fn cancellation_after_both_message_ends_still_revokes_both_directions() {
+    use tnl::inspection::Direction;
+    for graceful in [true, false] {
+        let (history, seen) = recorded_inspection();
+        let id = {
+            let mut capture = history.admit(TunnelGeneration::new(), None).unwrap();
+            capture.request(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            capture.response(b"HTTP/1.1 204 No Content\r\n\r\n");
+            if graceful {
+                capture.finish();
+            }
+            capture.id()
+        };
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.ends.len(), 2);
+        assert_eq!(
+            seen.stops.contains(&(Direction::Request, "cancelled")),
+            !graceful
+        );
+        assert_eq!(
+            seen.stops.contains(&(Direction::Response, "cancelled")),
+            !graceful
+        );
+        assert_eq!(seen.finished, 1);
+        drop(seen);
+        assert_eq!(history.get(id).unwrap().observation_incomplete, !graceful);
+    }
+}

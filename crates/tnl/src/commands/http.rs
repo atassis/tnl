@@ -2,6 +2,12 @@ use crate::commands::config::resolve_config_path;
 use crate::config::Config;
 use crate::target::Target;
 
+#[derive(Clone, Copy, Debug)]
+pub struct InspectionOptions {
+    pub port: u16,
+    pub bodies: crate::inspection::PreviewMode,
+}
+
 pub async fn run(
     target: Target,
     subdomain: Option<&str>,
@@ -9,14 +15,37 @@ pub async fn run(
     verbosity: crate::inspector::Verbosity,
     format: crate::inspector::Format,
 ) -> anyhow::Result<()> {
+    run_with_inspection(target, subdomain, host_header, verbosity, format, None).await
+}
+
+pub async fn run_with_inspection(
+    target: Target,
+    subdomain: Option<&str>,
+    host_header: crate::host_header::HostHeader,
+    verbosity: crate::inspector::Verbosity,
+    format: crate::inspector::Format,
+    options: Option<InspectionOptions>,
+) -> anyhow::Result<()> {
     let cfg_path = resolve_config_path()?;
     let cfg = Config::load_resolved(&cfg_path)?;
+    let (inspection, service) = if let Some(options) = options {
+        let inspection = crate::inspection::Inspection::new(options.bodies);
+        let service =
+            crate::inspection::InspectorService::start(inspection.clone(), options.port).await?;
+        eprintln!(
+            "Inspector (private; do not share): {}",
+            service.bootstrap_url()
+        );
+        (Some(inspection), Some(service))
+    } else {
+        (None, None)
+    };
 
     let (log_tx, log_rx) = tokio::sync::mpsc::channel::<crate::inspector::LogLine>(1024);
     let inspector = crate::inspector::Inspector::new(log_rx, verbosity, format);
-    let _inspector_task = tokio::spawn(inspector.run());
+    let inspector_task = tokio::spawn(inspector.run());
 
-    tokio::select! {
+    let result = tokio::select! {
         r = crate::reconnect::run(
             &cfg.endpoint,
             &cfg.token,
@@ -24,7 +53,7 @@ pub async fn run(
             target,
             host_header,
             crate::reconnect::Hooks {
-                inspection: None,
+                inspection,
                 cancel_first_session: None,
                 log_tx: Some(log_tx),
             },
@@ -33,5 +62,10 @@ pub async fn run(
             println!("\n✓ stopping tunnel");
             Ok(())
         }
+    };
+    if let Some(service) = service {
+        service.shutdown().await;
     }
+    inspector_task.abort();
+    result
 }

@@ -189,5 +189,8 @@ async fn assert_inspection_reattach(history: &tnl::inspection::Inspection) {
         "reattach changed generation"
     );
     assert_ne!(records[0].capture_id, records[1].capture_id);
+    assert!(records
+        .iter()
+        .all(|r| r.connection == tnl::inspection::GenerationState::Connected));
     assert!(records.iter().all(|r| r.request_id.is_some()));
 }

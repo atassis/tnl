@@ -62,6 +62,18 @@ the tunnel hostname by default. `tnl` detects this and auto-rewrites the
 forwarded `Host` to the address it connected to, so they just work — no config
 edits. Control it with `tnl http … --host-header <preserve|rewrite|VALUE>`.
 
+## Local browser inspection (opt-in)
+
+Run `tnl http 3000 foo --inspect` to retain sanitized recent history in memory
+(200 records, 15 minutes) and serve a private IPv4-loopback browser inspector.
+Open the private URL printed to stderr; do not share/save that link or its token.
+Body previews are off by default. `--inspect-bodies json` enables only complete,
+small sanitized JSON previews; it does **not** retain raw replay requests.
+`--inspect-port PORT` optionally selects the loopback port (default: ephemeral).
+Headers and query values are redacted, but arbitrary paths and allowed header
+values can still be sensitive. No durable history, raw export or replay controls
+are provided by this checkpoint. The existing CLI request rows remain available.
+
 ## Configuration
 
 Server config is a TOML file (`tnld init` generates it; an annotated

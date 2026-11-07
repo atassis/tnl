@@ -16,12 +16,13 @@ impl Default for TunnelGeneration {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, clap::ValueEnum)]
 pub enum PreviewMode {
     Off,
     Json,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum State {
     Active,
     Complete,
@@ -73,7 +74,45 @@ pub struct InspectionRecord {
     pub request_target: String,
     pub status: Option<u16>,
     pub state: State,
+    pub connection: GenerationState,
     pub request: Message,
     pub response: Message,
     pub observation_incomplete: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationState {
+    Untracked,
+    Connected,
+    Disconnected,
+    Superseded,
+}
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct TunnelStatus {
+    pub generation: Option<TunnelGeneration>,
+    pub connected: bool,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct Summary {
+    pub capture_id: CaptureId,
+    pub generation: TunnelGeneration,
+    pub request_id: Option<ulid::Ulid>,
+    pub sequence: u64,
+    pub method: String,
+    pub request_target: String,
+    pub status: Option<u16>,
+    pub state: State,
+    pub connection: GenerationState,
+}
+
+impl State {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Complete => "complete",
+            Self::Incomplete => "incomplete",
+            Self::Upgraded => "upgraded",
+        }
+    }
 }

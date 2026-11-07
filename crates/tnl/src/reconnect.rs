@@ -52,6 +52,7 @@ pub async fn run(
     host_header: crate::host_header::HostHeader,
     mut hooks: Hooks,
 ) -> anyhow::Result<()> {
+    let _availability = AvailabilityGuard(hooks.inspection.clone());
     let mut backoff_ms: u64 = 1_000;
     let mut last_tunnel: Option<(ulid::Ulid, String)> = None;
     let mut generation = crate::inspection::TunnelGeneration::new();
@@ -122,6 +123,9 @@ pub async fn run(
             generation,
         );
         last_tunnel = Some((session.tunnel_id, session.subdomain.clone()));
+        if let Some(inspection) = &hooks.inspection {
+            inspection.activate(generation);
+        }
 
         if !printed_banner {
             printed_banner = true;
@@ -181,7 +185,20 @@ pub async fn run(
                 eprintln!("[test hook] forced disconnect");
             }
         }
+        if let Some(inspection) = &hooks.inspection {
+            inspection.disconnected();
+        }
+        // Availability is not a claim that detached forwarding tasks ended.
         // Loop restarts; next iteration tries ReattachTunnel.
+    }
+}
+
+struct AvailabilityGuard(Option<crate::inspection::Inspection>);
+impl Drop for AvailabilityGuard {
+    fn drop(&mut self) {
+        if let Some(inspection) = &self.0 {
+            inspection.disconnected();
+        }
     }
 }
 
