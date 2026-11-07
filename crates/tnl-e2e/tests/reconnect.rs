@@ -42,6 +42,8 @@ async fn client_reattaches_within_grace_window() {
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
     let endpoint = format!("http://{daemon_addr}");
     let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+    let history = tnl::inspection::Inspection::new(tnl::inspection::PreviewMode::Off);
+    let capture_history = history.clone();
     let mut task = tokio::spawn(async move {
         start_rx.await?;
         tnl::reconnect::run(
@@ -51,6 +53,7 @@ async fn client_reattaches_within_grace_window() {
             tnl::target::Target::LocalhostPort(backend_port),
             tnl::host_header::HostHeader::Auto,
             tnl::reconnect::Hooks {
+                inspection: Some(capture_history),
                 cancel_first_session: Some(cancel_rx),
                 log_tx: None,
             },
@@ -118,6 +121,8 @@ async fn client_reattaches_within_grace_window() {
 
     assert_eq!(r.text().await.unwrap(), "ok");
 
+    assert_inspection_reattach(&history).await;
+
     task.abort();
 }
 
@@ -161,4 +166,28 @@ async fn wait_for_tunnel_session(
             )
         }),
     }
+}
+
+async fn assert_inspection_reattach(history: &tnl::inspection::Inspection) {
+    let records = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let records = history.search("");
+            if records.len() == 2
+                && records
+                    .iter()
+                    .all(|r| r.state != tnl::inspection::State::Active)
+            {
+                break records;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        records[0].generation, records[1].generation,
+        "reattach changed generation"
+    );
+    assert_ne!(records[0].capture_id, records[1].capture_id);
+    assert!(records.iter().all(|r| r.request_id.is_some()));
 }

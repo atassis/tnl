@@ -114,6 +114,7 @@ async fn auto_rewrite_after_block() {
             .unwrap();
     let _ctrl = session.control;
     let ctx = ForwardCtx {
+        inspection: None,
         data_stream_protocol: session.data_stream_protocol,
         ..ForwardCtx::new("auto".into(), None, env!("CARGO_PKG_VERSION"))
     };
@@ -149,6 +150,7 @@ async fn preserve_never_rewrites() {
             .unwrap();
     let _ctrl = session.control;
     let ctx = ForwardCtx {
+        inspection: None,
         data_stream_protocol: session.data_stream_protocol,
         tunnel: "keep".into(),
         log_tx: None,

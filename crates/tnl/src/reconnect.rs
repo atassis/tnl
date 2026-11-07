@@ -17,6 +17,7 @@ use tracing::{info, warn};
 /// network connections.
 #[derive(Default)]
 pub struct Hooks {
+    pub inspection: Option<crate::inspection::Inspection>,
     /// When this oneshot fires, the current accept loop is cancelled so the
     /// outer loop can attempt a reattach.
     pub cancel_first_session: Option<tokio::sync::oneshot::Receiver<()>>,
@@ -28,6 +29,7 @@ pub struct Hooks {
 impl std::fmt::Debug for Hooks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Hooks")
+            .field("inspection", &self.inspection)
             .field(
                 "cancel_first_session",
                 &self.cancel_first_session.as_ref().map(|_| "<receiver>"),
@@ -52,6 +54,7 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let mut backoff_ms: u64 = 1_000;
     let mut last_tunnel: Option<(ulid::Ulid, String)> = None;
+    let mut generation = crate::inspection::TunnelGeneration::new();
     let mut printed_banner = false;
     let mut warned_raw_metadata = false;
     // Per-tunnel host-rewrite state, persisted across reconnects so a learned
@@ -113,6 +116,11 @@ pub async fn run(
 
         // Successful connect: reset backoff, remember tunnel for the next reattach.
         backoff_ms = 1_000;
+        generation = generation_for_session(
+            last_tunnel.as_ref().map(|(id, _)| *id),
+            session.tunnel_id,
+            generation,
+        );
         last_tunnel = Some((session.tunnel_id, session.subdomain.clone()));
 
         if !printed_banner {
@@ -136,6 +144,10 @@ pub async fn run(
         // Keep the control stream alive for the duration of the session.
         let _ctrl_keep = session.control;
         let ctx = crate::forwarder::ForwardCtx {
+            inspection: hooks
+                .inspection
+                .clone()
+                .map(|inspection| (inspection, generation)),
             data_stream_protocol: session.data_stream_protocol,
             tunnel: session.subdomain.clone(),
             log_tx: hooks.log_tx.clone(),
@@ -177,4 +189,33 @@ pub async fn run(
 fn is_recoverable(e: &anyhow::Error) -> bool {
     let s = format!("{e:#}").to_lowercase();
     !(s.contains("unauthor") || s.contains("token rejected"))
+}
+
+fn generation_for_session(
+    previous: Option<ulid::Ulid>,
+    current: ulid::Ulid,
+    generation: crate::inspection::TunnelGeneration,
+) -> crate::inspection::TunnelGeneration {
+    if previous == Some(current) {
+        generation
+    } else {
+        crate::inspection::TunnelGeneration::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generation_for_session;
+    #[test]
+    fn generation_survives_reattach_but_not_recreation() {
+        let tunnel = ulid::Ulid::new();
+        let initial = crate::inspection::TunnelGeneration::new();
+        let reattached = generation_for_session(Some(tunnel), tunnel, initial);
+        assert_eq!(reattached, initial);
+        assert_ne!(generation_for_session(None, tunnel, initial), initial);
+        assert_ne!(
+            generation_for_session(Some(tunnel), ulid::Ulid::new(), initial),
+            initial
+        );
+    }
 }

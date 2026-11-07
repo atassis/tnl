@@ -2113,6 +2113,7 @@ dependencies = [
  "dialoguer",
  "futures",
  "http",
+ "httparse",
  "nu-ansi-term",
  "parking_lot",
  "reqwest",

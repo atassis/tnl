@@ -7,6 +7,7 @@ pub mod connect;
 pub mod exit;
 pub mod forwarder;
 pub mod host_header;
+pub mod inspection;
 pub mod inspector;
 pub mod invite;
 pub mod peek;

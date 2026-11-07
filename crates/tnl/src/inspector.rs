@@ -129,10 +129,13 @@ fn chrono_like_hms(ts: SystemTime) -> String {
 }
 
 fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
+    if n == 0 {
+        String::new()
+    } else if s.len() <= n {
         s.to_string()
     } else {
-        format!("{}…", &s[..n - 1])
+        let end = s.floor_char_boundary(n - 1);
+        format!("{}…", &s[..end])
     }
 }
 
@@ -168,6 +171,12 @@ mod tests {
         assert_eq!(fmt_bytes(500), "500B");
         assert_eq!(fmt_bytes(2048), "2.0KB");
         assert_eq!(fmt_bytes(5 * 1024 * 1024), "5.0MB");
+    }
+
+    #[test]
+    fn truncate_respects_utf8_and_zero_width() {
+        assert_eq!(truncate("ééé", 4), "é…");
+        assert_eq!(truncate("abc", 0), "");
     }
 
     #[test]
