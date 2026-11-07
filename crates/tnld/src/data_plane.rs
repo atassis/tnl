@@ -54,6 +54,48 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
 }
 
+// Reframe an end-to-end trailer declaration after removing hop headers. Hyper
+// will otherwise discard trailer frames even though the leased body retains them.
+fn response_trailer_declaration(headers: &HeaderMap) -> Option<HeaderValue> {
+    let connection_fields = headers
+        .get_all("connection")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let mut names = headers
+        .get_all("trailer")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|name| HeaderName::from_bytes(name.trim().as_bytes()).ok())
+        .filter(|name| {
+            !HOP_BY_HOP.contains(&name.as_str())
+                && !connection_fields.iter().any(|field| field == name.as_str())
+                && ![
+                    "authorization",
+                    "set-cookie",
+                    "host",
+                    "cache-control",
+                    "content-encoding",
+                    "content-range",
+                    "content-type",
+                    "max-forwards",
+                ]
+                .contains(&name.as_str())
+        })
+        .map(|name| name.to_string())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names.dedup();
+    if names.is_empty() {
+        None
+    } else {
+        HeaderValue::from_str(&names.join(", ")).ok()
+    }
+}
+
 const WEBSOCKET_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const WEBSOCKET_RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -246,13 +288,15 @@ impl Drop for TunnelConnectionDriver {
     }
 }
 
-/// This future owns both upgraded IOs for their entire lifetime. A later
-/// concurrency lease belongs in this ownership scope, not the returned 101 body.
+/// This future owns both upgraded IOs and its concurrency lease through
+/// rendezvous and the entire relay, independently of the empty 101 body.
 async fn relay_websocket(
     downstream: hyper::upgrade::OnUpgrade,
     upstream: hyper::upgrade::Upgraded,
     req_id: ulid::Ulid,
+    lease: crate::access::AdmissionLease,
 ) {
+    let _lease = lease;
     let Ok(Ok(downstream)) = tokio::time::timeout(WEBSOCKET_RENDEZVOUS_TIMEOUT, downstream).await
     else {
         warn!(%req_id, "WebSocket visitor upgrade rendezvous failed");
@@ -282,7 +326,8 @@ pub async fn handler(
         .await
 }
 
-#[allow(clippy::too_many_lines)]
+// The admission lease deliberately spans driver/body/relay ownership transfers.
+#[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
 async fn handle_request(
     state: AppState,
     mut req: Request,
@@ -349,6 +394,69 @@ async fn handle_request(
             accept,
             None,
         );
+    };
+
+    let lease = if let Some(access) = &tunnel.access {
+        match access
+            .admit(
+                crate::access::visitor_ip_for_admission(&visitor),
+                req.headers_mut(),
+            )
+            .await
+        {
+            Ok(lease) => lease,
+            Err(denial) => {
+                use crate::access::AccessDenial;
+                let (status, kind, retry) = match denial {
+                    AccessDenial::Basic => (StatusCode::UNAUTHORIZED, "basic-auth-required", None),
+                    AccessDenial::Ip => (StatusCode::FORBIDDEN, "ip-not-allowed", None),
+                    AccessDenial::Rate { retry_after } => (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "rate-limited",
+                        Some(retry_after.to_string()),
+                    ),
+                    AccessDenial::Concurrency => (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "concurrency-limited",
+                        Some("1".into()),
+                    ),
+                    AccessDenial::Unavailable => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "access-unavailable",
+                        Some("1".into()),
+                    ),
+                };
+                info!(%req_id, tunnel = %tunnel.subdomain, method = %req.method(), path = %req.uri().path(), %status, %kind, "visitor access denied");
+                let mut response = error_response(
+                    status,
+                    Component::Access,
+                    &ErrorContext {
+                        component: Component::Access,
+                        kind: Some(kind),
+                        tunnel: Some(&tunnel.subdomain),
+                        target: None,
+                        reason: "Visitor access denied.",
+                        hint: "Check the tunnel's visitor access requirements.",
+                        req_id,
+                        version,
+                    },
+                    accept,
+                    retry.as_deref(),
+                );
+                if matches!(denial, AccessDenial::Basic) {
+                    response.headers_mut().insert(
+                        "www-authenticate",
+                        HeaderValue::from_static("Basic realm=\"tnl\", charset=\"UTF-8\""),
+                    );
+                }
+                if req.method() == axum::http::Method::HEAD {
+                    *response.body_mut() = Body::empty();
+                }
+                return response;
+            }
+        }
+    } else {
+        crate::access::AdmissionLease::default()
     };
 
     let Some(session_id) = state.registry.current_session_id(&tunnel.id) else {
@@ -530,8 +638,10 @@ async fn handle_request(
     // The connection future drives IO; it completes once the response body has
     // been consumed and the substream closes. It must run concurrently with the
     // response read below, so spawn it.
+    let driver_lease = lease.clone();
     let driver = TunnelConnectionDriver(Some(tokio::spawn(
         async move {
+            let _lease = driver_lease;
             if let Err(e) = conn.with_upgrades().await {
                 debug!(error = %e, "tunnel client connection ended");
             }
@@ -677,7 +787,7 @@ async fn handle_request(
                 "The visitor connection cannot be upgraded.",
             );
         };
-        tokio::spawn(relay_websocket(downstream, upstream, req_id).in_current_span());
+        tokio::spawn(relay_websocket(downstream, upstream, req_id, lease).in_current_span());
         let (mut parts, _) = resp.into_parts();
         strip_hop_by_hop(&mut parts.headers);
         set_request_id(&mut parts.headers, req_id);
@@ -692,8 +802,12 @@ async fn handle_request(
     driver.detach();
     let (mut resp_parts, incoming) = resp.into_parts();
     let status = resp_parts.status;
+    let trailer = response_trailer_declaration(&resp_parts.headers);
     strip_hop_by_hop(&mut resp_parts.headers);
     set_request_id(&mut resp_parts.headers, req_id);
+    if let Some(trailer) = trailer {
+        resp_parts.headers.insert("trailer", trailer);
+    }
 
     info!(
         host = %host_no_port,
@@ -704,7 +818,10 @@ async fn handle_request(
         "data-plane request"
     );
 
-    Response::from_parts(resp_parts, Body::new(incoming))
+    Response::from_parts(
+        resp_parts,
+        Body::new(crate::access::LeasedBody::new(incoming, lease)),
+    )
 }
 
 /// Install authority only after hop filtering: Connection nominations and all

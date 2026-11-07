@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tnl_protocol::request_metadata::DataStreamProtocol;
 
 use dashmap::DashMap;
 use thiserror::Error;
@@ -28,6 +29,8 @@ pub struct Tunnel {
     /// UNIX timestamp (seconds since epoch) when this tunnel was created.
     pub created_at_unix: u64,
     pub stats: TunnelStats,
+    pub data_stream_protocol: DataStreamProtocol,
+    pub access: Option<Arc<crate::access::CompiledAccess>>,
 }
 
 /// Connection state of a tunnel (stored separately from the immutable Tunnel).
@@ -53,6 +56,7 @@ pub struct SessionState {
 
 #[derive(Debug, Default)]
 pub struct Registry {
+    lifecycle: Mutex<()>,
     by_subdomain: DashMap<String, Arc<Tunnel>>,
     by_id: DashMap<TunnelId, Arc<Tunnel>>,
     /// Mutable per-tunnel binding (`session_id` + lifecycle state).
@@ -69,6 +73,8 @@ pub enum RegistryError {
     InvalidSubdomain(String),
     #[error("session not found")]
     SessionMissing,
+    #[error("registry unavailable")]
+    Unavailable,
 }
 
 impl Registry {
@@ -94,6 +100,9 @@ impl Registry {
     /// When `grace_sec == 0`, tunnels are removed immediately (backward-compatible).
     /// Otherwise GC will clean them up after the grace window expires.
     pub fn drop_session(&self, session_id: &str, grace_sec: u32) {
+        let Ok(_lifecycle) = self.lifecycle.lock() else {
+            return;
+        };
         self.sessions.remove(session_id);
 
         if grace_sec == 0 {
@@ -131,6 +140,9 @@ impl Registry {
 
     /// Remove all tunnels whose grace window has expired.
     pub fn gc_disconnected(&self, grace: std::time::Duration) {
+        let Ok(_lifecycle) = self.lifecycle.lock() else {
+            return;
+        };
         let now = Instant::now();
         let mut to_remove = Vec::new();
         for kv in &self.tunnel_state {
@@ -154,10 +166,38 @@ impl Registry {
         session_id: &str,
         token_name: &str,
     ) -> Result<Arc<Tunnel>, RegistryError> {
+        self.create_tunnel_bound(
+            subdomain,
+            session_id,
+            token_name,
+            DataStreamProtocol::RawHttp1,
+            None,
+        )
+    }
+
+    pub fn create_tunnel_bound(
+        &self,
+        subdomain: &str,
+        session_id: &str,
+        token_name: &str,
+        data_stream_protocol: DataStreamProtocol,
+        access: Option<Arc<crate::access::CompiledAccess>>,
+    ) -> Result<Arc<Tunnel>, RegistryError> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| RegistryError::Unavailable)?;
+        if access.is_some() && data_stream_protocol != DataStreamProtocol::Http1MetadataV1 {
+            return Err(RegistryError::Unavailable);
+        }
         if !valid_subdomain(subdomain) {
             return Err(RegistryError::InvalidSubdomain(subdomain.into()));
         }
-        if !self.sessions.contains_key(session_id) {
+        if self
+            .sessions
+            .get(session_id)
+            .is_none_or(|session| session.token_name != token_name)
+        {
             return Err(RegistryError::SessionMissing);
         }
         if self.by_subdomain.contains_key(subdomain) {
@@ -174,10 +214,9 @@ impl Registry {
             created_by: token_name.into(),
             created_at_unix,
             stats: TunnelStats::default(),
+            data_stream_protocol,
+            access,
         });
-        self.by_id.insert(tunnel.id.clone(), tunnel.clone());
-        self.by_subdomain
-            .insert(tunnel.subdomain.clone(), tunnel.clone());
         self.tunnel_state.insert(
             tunnel.id.clone(),
             TunnelBinding {
@@ -185,6 +224,10 @@ impl Registry {
                 state: TunnelState::Active,
             },
         );
+        self.by_id.insert(tunnel.id.clone(), tunnel.clone());
+        // Publish the routing name last, with admission and binding complete.
+        self.by_subdomain
+            .insert(tunnel.subdomain.clone(), tunnel.clone());
         Ok(tunnel)
     }
 
@@ -212,6 +255,26 @@ impl Registry {
         owner_token: &str,
         new_session_id: &str,
     ) -> Result<Arc<Tunnel>, &'static str> {
+        self.try_reattach_bound(
+            tunnel_id,
+            subdomain,
+            owner_token,
+            new_session_id,
+            None,
+            None,
+        )
+    }
+
+    pub fn try_reattach_bound(
+        &self,
+        tunnel_id: &str,
+        subdomain: &str,
+        owner_token: &str,
+        new_session_id: &str,
+        protocol: Option<DataStreamProtocol>,
+        fingerprint: Option<&str>,
+    ) -> Result<Arc<Tunnel>, &'static str> {
+        let _lifecycle = self.lifecycle.lock().map_err(|_| "unavailable")?;
         // Clone Arc immediately so we don't hold the DashMap guard.
         let tunnel = self.by_id.get(tunnel_id).ok_or("not_found")?.clone();
 
@@ -221,8 +284,18 @@ impl Registry {
         if tunnel.created_by != owner_token {
             return Err("not_owner");
         }
-        if !self.sessions.contains_key(new_session_id) {
+        if self
+            .sessions
+            .get(new_session_id)
+            .is_none_or(|session| session.token_name != owner_token)
+        {
             return Err("session_missing");
+        }
+        if tunnel.access.as_ref().map(|access| access.fingerprint()) != fingerprint {
+            return Err("policy_mismatch");
+        }
+        if protocol.is_some_and(|mode| mode != tunnel.data_stream_protocol) {
+            return Err("mode_mismatch");
         }
 
         // Now mutate the binding.
@@ -278,6 +351,7 @@ impl Registry {
     /// if the caller's token doesn't match. Sessions linger; clients discover
     /// the closure naturally on their next request.
     pub fn close_by_subdomain(&self, subdomain: &str, owner: &str) -> Result<(), &'static str> {
+        let _lifecycle = self.lifecycle.lock().map_err(|_| "unavailable")?;
         // Clone Arc so we don't hold the DashMap guard while mutating.
         let tunnel = self.by_subdomain.get(subdomain).ok_or("not_found")?.clone();
         if tunnel.created_by != owner {
@@ -404,5 +478,122 @@ mod tests {
             .try_reattach(&tunnel.id, "baz", "user", &sess2.id)
             .unwrap_err();
         assert_eq!(err, "already_active");
+    }
+    #[tokio::test]
+    async fn protected_reattach_retains_quota_arc_and_all_mismatches_leave_binding_unchanged() {
+        let registry = Registry::new("t.x");
+        let first = registry.register_session("owner");
+        let second = registry.register_session("owner");
+        let outsider = registry.register_session("other");
+        let policy = Arc::new(
+            tnl_protocol::access::VisitorAccessPolicyV1::new(None, &[], None, Some(1)).unwrap(),
+        );
+        let access = Arc::new(crate::access::CompiledAccess::new(policy).unwrap());
+        let held = access
+            .admit(None, &mut axum::http::HeaderMap::new())
+            .await
+            .unwrap();
+        let tunnel = registry
+            .create_tunnel_bound(
+                "protected",
+                &first.id,
+                "owner",
+                DataStreamProtocol::Http1MetadataV1,
+                Some(access.clone()),
+            )
+            .unwrap();
+        registry.drop_session(&first.id, 30);
+        for (sub, owner, session, mode, fingerprint) in [
+            (
+                "wrong",
+                "owner",
+                &second.id,
+                DataStreamProtocol::Http1MetadataV1,
+                Some(access.fingerprint()),
+            ),
+            (
+                "protected",
+                "other",
+                &outsider.id,
+                DataStreamProtocol::Http1MetadataV1,
+                Some(access.fingerprint()),
+            ),
+            (
+                "protected",
+                "owner",
+                &second.id,
+                DataStreamProtocol::RawHttp1,
+                Some(access.fingerprint()),
+            ),
+            (
+                "protected",
+                "owner",
+                &second.id,
+                DataStreamProtocol::Http1MetadataV1,
+                None,
+            ),
+            (
+                "protected",
+                "owner",
+                &second.id,
+                DataStreamProtocol::Http1MetadataV1,
+                Some("wrong"),
+            ),
+        ] {
+            assert!(registry
+                .try_reattach_bound(&tunnel.id, sub, owner, session, Some(mode), fingerprint)
+                .is_err());
+            assert_eq!(registry.current_session_id(&tunnel.id).unwrap(), first.id);
+        }
+        let reattached = registry
+            .try_reattach_bound(
+                &tunnel.id,
+                "protected",
+                "owner",
+                &second.id,
+                Some(DataStreamProtocol::Http1MetadataV1),
+                Some(access.fingerprint()),
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(reattached.access.as_ref().unwrap(), &access));
+        assert!(matches!(
+            reattached
+                .access
+                .as_ref()
+                .unwrap()
+                .admit(None, &mut axum::http::HeaderMap::new())
+                .await,
+            Err(crate::access::AccessDenial::Concurrency)
+        ));
+        drop(held);
+        access
+            .admit(None, &mut axum::http::HeaderMap::new())
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::needless_collect)] // Spawn every barrier participant before joining any.
+    fn concurrent_name_publication_never_overwrites_an_existing_policy() {
+        let registry = Arc::new(Registry::new("t.x"));
+        let session = registry.register_session("owner");
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let workers = (0..8)
+            .map(|_| {
+                let registry = registry.clone();
+                let session = session.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    registry.create_tunnel("same", &session.id, "owner").is_ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        let successes = workers
+            .into_iter()
+            .map(|worker| usize::from(worker.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(successes, 1);
+        assert_eq!(registry.snapshot_infos().len(), 1);
     }
 }

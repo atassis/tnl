@@ -57,6 +57,8 @@ enum Cmd {
         target: tnl::target::Target,
         /// Subdomain to claim. If omitted, the daemon assigns a random one.
         subdomain: Option<String>,
+        #[command(flatten)]
+        access: tnl::access::AccessArgs,
         /// `Host` sent to your backend. Default (auto): forward the real host,
         /// but if the dev server rejects it (Vite/webpack/Django/Rails host
         /// allowlists) rewrite it to the connected address for later requests.
@@ -202,6 +204,7 @@ fn real_main() -> anyhow::Result<()> {
         Cmd::Http {
             target,
             subdomain,
+            access,
             host_header,
             quiet,
             verbose,
@@ -225,13 +228,21 @@ fn real_main() -> anyhow::Result<()> {
             } else {
                 tnl::inspector::Format::Text
             };
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(tnl::commands::http::run_with_inspection(
+            let cfg =
+                tnl::config::Config::load_resolved(&tnl::commands::config::resolve_config_path()?)?;
+            // Read/hash once before starting the runtime. Reconnect retains only
+            // this immutable policy, never plaintext, a prompt or file handle.
+            let options = tnl::client::TunnelOptions {
+                access: access.prepare(&cfg.endpoint)?,
+            };
+            tokio::runtime::Runtime::new()?.block_on(tnl::commands::http::run_configured(
+                &cfg,
                 target,
                 subdomain.as_deref(),
                 tnl::host_header::HostHeader::parse(host_header.as_deref()),
                 verbosity,
                 format,
+                &options,
                 inspect.then_some(tnl::commands::http::InspectionOptions {
                     port: inspect_port.unwrap_or(0),
                     bodies: inspect_bodies.unwrap_or(tnl::inspection::PreviewMode::Off),

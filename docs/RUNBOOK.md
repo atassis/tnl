@@ -141,3 +141,24 @@ pre-existing client observer limitation exposed by application WS tests
 (binary frame/body bytes can erase an otherwise valid status). Do not infer
 that a working 101 relay proves correct inspector status reporting. The observer
 follow-up must qualify both WS 101 and ordinary binary HTTP final status.
+
+
+## Per-run visitor access qualification
+
+See README's optional visitor controls. No daemon profiles or visitor-password
+persistence are required. Password files must be trusted regular files; Unix mode
+checks do not validate ownership, directories, ACLs or backups. Restrictive ACLs
+are the user's responsibility on other systems. Secret-buffer zeroization is best
+effort, not protection against process compromise, allocator copies or core dumps.
+
+Protected control requires verified HTTPS/WSS and the existing authenticated WS
+metadata capability. Test Basic denial before backend/stream contact, consumed
+Authorization on success, and application Authorization passthrough without Basic.
+Exercise full streaming-upload/response and WebSocket concurrency lifetime, not
+just headers/101. Reattach must retain policy and quota state; expired-instance
+recreation must preserve the original policy and requested hostname or fail on
+conflict. Policies do not permanently reserve hostnames. No gate protects a backend
+that is separately exposed, and local replay/inspector owners must never restore a
+consumed gate credential. Combined release qualification still owns public Caddy,
+packaged binaries and browser behavior; local trusted-CA tests are not deployment
+acceptance.

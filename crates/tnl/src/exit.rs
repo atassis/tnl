@@ -19,6 +19,23 @@ pub const EX_PAIRING_FAILURE: i32 = 75;
 /// inspecting the rendered error string. Coarse but predictable for v0.1.0-beta;
 /// structured error variants land in 1.0.
 pub fn classify(e: &anyhow::Error) -> i32 {
+    if e.downcast_ref::<crate::access::AccessInputError>()
+        .is_some()
+    {
+        return EX_USAGE;
+    }
+    if let Some(error) = e.downcast_ref::<crate::client::ProtectedControlError>() {
+        return match error {
+            crate::client::ProtectedControlError::Endpoint => EX_USAGE,
+            crate::client::ProtectedControlError::Server(tnl_protocol::ErrorCode::Unauthorized) => {
+                EX_TOKEN_REJECTED
+            }
+            crate::client::ProtectedControlError::Server(
+                tnl_protocol::ErrorCode::SubdomainTaken,
+            ) => EX_SUBDOMAIN_CONFLICT,
+            _ => EX_SERVER_ERROR,
+        };
+    }
     let s = format!("{e:#}").to_lowercase();
     if s.contains("config not found") || s.contains("not authenticated") {
         return EX_NOT_AUTH;
@@ -42,4 +59,24 @@ pub fn classify(e: &anyhow::Error) -> i32 {
         return EX_PAIRING_FAILURE;
     }
     EX_GENERIC
+}
+
+#[cfg(test)]
+mod access_tests {
+    use super::*;
+    #[test]
+    fn protected_control_failure_uses_server_error_exit_code() {
+        assert_eq!(
+            classify(&anyhow::Error::new(
+                crate::client::ProtectedControlError::Acknowledgment
+            )),
+            EX_SERVER_ERROR
+        );
+        assert_eq!(
+            classify(&anyhow::Error::new(
+                crate::access::AccessInputError::Endpoint
+            )),
+            EX_USAGE
+        );
+    }
 }

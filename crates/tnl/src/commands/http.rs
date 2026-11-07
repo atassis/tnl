@@ -28,7 +28,31 @@ pub async fn run_with_inspection(
 ) -> anyhow::Result<()> {
     let cfg_path = resolve_config_path()?;
     let cfg = Config::load_resolved(&cfg_path)?;
-    let (inspection, service) = if let Some(options) = options {
+    run_configured(
+        &cfg,
+        target,
+        subdomain,
+        host_header,
+        verbosity,
+        format,
+        &crate::client::TunnelOptions::default(),
+        options,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_configured(
+    cfg: &Config,
+    target: Target,
+    subdomain: Option<&str>,
+    host_header: crate::host_header::HostHeader,
+    verbosity: crate::inspector::Verbosity,
+    format: crate::inspector::Format,
+    options: &crate::client::TunnelOptions,
+    inspection_options: Option<InspectionOptions>,
+) -> anyhow::Result<()> {
+    let (inspection, service) = if let Some(options) = inspection_options {
         let inspection = crate::inspection::Inspection::new(options.bodies);
         let service =
             crate::inspection::InspectorService::start(inspection.clone(), options.port).await?;
@@ -46,12 +70,13 @@ pub async fn run_with_inspection(
     let inspector_task = tokio::spawn(inspector.run());
 
     let result = tokio::select! {
-        r = crate::reconnect::run(
+        r = crate::reconnect::run_with_options(
             &cfg.endpoint,
             &cfg.token,
             subdomain,
             target,
             host_header,
+            options,
             crate::reconnect::Hooks {
                 inspection,
                 cancel_first_session: None,

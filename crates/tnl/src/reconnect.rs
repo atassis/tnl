@@ -348,6 +348,8 @@ mod protected_tests {
         for failure in [
             ProtectedControlError::Capability,
             ProtectedControlError::Acknowledgment,
+            ProtectedControlError::Framing,
+            ProtectedControlError::Schema,
             ProtectedControlError::Server(ErrorCode::AccessUnavailable),
             ProtectedControlError::Server(ErrorCode::AccessPolicyMismatch),
         ] {
@@ -357,6 +359,15 @@ mod protected_tests {
             &anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
             true
         ));
+        assert!(
+            is_recoverable(
+                &anyhow::Error::new(async_tungstenite::tungstenite::Error::Io(
+                    std::io::Error::from(std::io::ErrorKind::InvalidData)
+                )),
+                true
+            ),
+            "TLS transport IO must retain its same-mode retry classification"
+        );
         assert!(!is_recoverable(
             &anyhow::anyhow!("malformed peer response"),
             true

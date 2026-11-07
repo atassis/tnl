@@ -1,9 +1,9 @@
 # Per-run visitor access controls — replacement reconciliation specification
 
-**Status:** Phase1 committed in `4a451fc`; phase2 is an incomplete, fail-closed wire/client/admission-primitives checkpoint over the reviewed WS merge. Executable protection is not implemented. See §13 for the exact current boundary.
+**Status:** Phase2b registry/control/HTTP/WS enforcement and executable options are implemented over `d174904`, pending independent review and combined release qualification. Historical checkpoints below are not the current runtime boundary; see §14.
 **Supersedes:** The daemon-profile proposal in `plans/access-controls.md` and its repository copy. Those files are historical, not implementation direction.
 **Inspected worktree / branch / baseline:** `/home/atassis/.config/superpowers/worktrees/tnl/access-controls` / `feat/roadmap-access-controls` / `43f2bc0ed29e00821e1ede624b8fe190eb0d5c57`.
-**Current checkpoint:** Phase2 adds protected control message shapes, exact-ACK client helpers, shared-loop protected retry decisions and bounded daemon admission primitives. The daemon rejects protected creation/reattachment with `AccessUnavailable`; no protected descriptor can be published yet. No worker staging, commits, children or deployment changes.
+**Current checkpoint:** Phase2b enforces protected create/reattach with immutable registry policy/mode binding, exact-ACK client helpers, shared-loop protected retry decisions and HTTP/WS admission/lease ownership. Protected descriptors publish only after admission compilation; `AccessUnavailable` remains an error for unavailable admission, not a blanket protected-operation rejection. The superseded phase2a no-publication checkpoint is recorded historically in §13. Independent review and whole-feature/release qualification remain required (§14). No worker staging, commits, children or deployment changes.
 
 ## 1. Settled direction and changes from the previous design
 
@@ -109,11 +109,11 @@ Require a PHC string at most 256 ASCII bytes, Argon2id v19 with **exactly** m=19
 
 The server's accepted fingerprint identifies the whole policy including verifier and numbers. It is not a bearer capability and need not be logged/exposed in admin/inspector UI. ACK carries fingerprint rather than PHC. Validation may canonicalize CIDR representation but must not weaken/drop controls. A matching fingerprint must be acknowledged before success/forwarding starts.
 
-## 6. Proposed protected wire lifecycle using existing WS metadata negotiation
+## 6. Protected wire lifecycle using existing WS metadata negotiation
 
-**Lifecycle contract:** Protected message shapes and client helpers now exist, but daemon publication/enforcement are not integrated; protected create/reattach return `AccessUnavailable` at this checkpoint. Metadata already negotiates on the client-Bearer-authenticated WebSocket upgrade: the client offers `x-tnl-data-stream-protocol: http1-metadata-v1`, and the daemon echoes that exact capability. Reuse `DataStreamProtocol::from_echo` and the existing `Http1MetadataV1` data-substream envelope. There is no JSON `data_protocol` selector, additional metadata handshake, new stream prefix, or numeric control-protocol negotiation here.
+**Lifecycle contract (enforced phase2b; qualification pending):** Protected create validates and compiles admission before atomic publication; protected reattach validates binding/mode/fingerprint without replacing quota state. Both acknowledge the exact stored policy fingerprint. The phase2a blanket `AccessUnavailable` behavior is historical (§13), not the current runtime boundary. Metadata already negotiates on the client-Bearer-authenticated WebSocket upgrade: the client offers `x-tnl-data-stream-protocol: http1-metadata-v1`, and the daemon echoes that exact capability. Reuse `DataStreamProtocol::from_echo` and the existing `Http1MetadataV1` data-substream envelope. There is no JSON `data_protocol` selector, additional metadata handshake, new stream prefix, or numeric control-protocol negotiation here.
 
-Proposed concrete new internally tagged `ControlMsg` variants and named payloads:
+Implemented internally tagged `ControlMsg` variants and named payloads:
 
 ```text
 CreateProtectedTunnel(CreateProtectedTunnelReq {
@@ -283,7 +283,7 @@ Key risks: PHC leaking through Debug/serde errors; client file/input or verifier
 **Evidence from this reconciliation:** branch/HEAD verified; relevant source and prior artifact read; only this replacement external artifact written. Existing untracked repository plan was present before work and left unchanged. Product tests/builds/deployment: **none run**. Read-only artifact and git/staging checks are reported in the final handoff; no implementation correctness is claimed from document inspection.
 
 
-## 13. Phase2 fail-closed implementation checkpoint
+## 13. Historical phase2a fail-closed implementation checkpoint
 
 This checkpoint is intentionally **not the complete access-controls feature**. It builds on phase1 `4a451fc` and the parent-started reviewed WS/S0 merge. The Cargo.toml working-tree conflict resolution retains the access dependencies, exact yamux 0.13.10 patch and vendor workspace exclusion; the inherited staged merge/index resolution remains parent-owned.
 
@@ -312,3 +312,65 @@ Required next slice before enabling protection:
 5. Extend the trusted-WSS fixture through the real daemon/enforcement path and exercise actual reconnect/recreation with retained verifier/options. Add deterministic refill/concurrent-burst and complete worker-saturation isolation tests.
 
 Until these gates pass, do not replace the `AccessUnavailable` branch, advertise a protected tunnel, or treat this checkpoint as release-ready security enforcement.
+
+
+## 14. Phase2b enforced integration checkpoint
+
+Protected create now compiles admission before atomic routing publication, stores
+immutable mode/policy state and acknowledges its stored fingerprint. Registry
+lifecycle mutation is serialized; all reattach identity/owner/mode/fingerprint
+checks precede binding mutation and preserve the original quota Arc. Public helper
+signatures and no-flag behavior remain unchanged. Protected requests require the
+existing authenticated WS metadata echo; no metadata V2 lifecycle was introduced.
+
+Admission runs before every stream open/101. Basic consumes Authorization only
+when configured and successful; other policies preserve application credentials.
+Denials are generic attributed 401/403/429/503 with challenge/Retry-After/no-store
+and HEAD handling. Driver/body owners share one HTTP permit; WS rendezvous/relay
+owns its permit before the empty 101 response is returned. Safe trailer declaration
+reconstruction is required because Hyper discards trailer frames without a declared
+field, even with a trailer-preserving body wrapper.
+
+**Approved implementation correction:** deterministic testing found governor 0.7
+permits burst+1 after long idle (`gcra.rs`: tau=B*t and next=max(tat,now)+t). Parent
+approved replacing only this feature's limiter with a constant-state fixed-point
+mutex token bucket; pairing's governor dependency/code remain unchanged. Credits
+clamp to B, time is captured under lock/nonregressing, arithmetic is saturating,
+poison fails closed, and Retry-After rounds upward. Tests cover initial/refilled B,
+499/500ms, 16 concurrent attempts, long idle and validated upper bounds.
+
+Executable options prepare the policy once before the runtime. The shared reconnect
+loop retains that Arc, uses typed protected TunnelLost, and never selects a public
+request. Actual generated-CA TLS termination forwards to the real daemon's WSS
+control handler and real local backend in tests: Basic consumption, HTTP body and
+unfinished-upload lifetime, cancellation, trailers, full WS lifetime, retained
+reattach quota Arc and non-Basic Authorization passthrough are exercised. These are
+not merely mock ACK tests. Admission-bypass and missing-WS-lease negative mutations
+fail the corresponding scenario assertions.
+
+The shared-loop gate now runs the actual `reconnect::run_with_options` through a
+transparent verified-TLS/WS test edge, the real daemon and a real backend. Its wire
+summaries assert protected random creation, network loss, same-ID/descriptor/quota
+Arc reattach, a second network loss, existing-registry expiry, a real typed
+`TunnelLost`, one post-upgrade failed recreation and assigned-name retry with the
+same fingerprint/verifier. Recreation gets a new tunnel ID/descriptor/admission
+Arc. No public lifecycle message is accepted. Proxy oneshots and bounded
+session/registry predicates establish readiness, rather than sleep-based timing;
+the production retry backoff still runs. Roots are scoped with a test-only task
+local; certificate verification is never bypassed. Only sanitized lifecycle
+summaries are retained, not policy/verifier/header diagnostics. A mutation deleting
+assigned-name retention fails on the retry's random request. This tests tunnel
+instance identity, not an inspection-generation observer absent from this branch.
+
+The review P2 correction maps protected framing/schema/invalid-echo negotiation
+failures to safe typed server/protocol errors and exit 70, without wrapping genuine
+IO/TLS transport errors or changing their same-mode retry classification. Three
+trusted-WSS cases each fail with exit 1 when the conversion is removed and pass
+with exit 70 when restored. Malformed payload/echo sentinels never reach diagnostics.
+The opening checkpoint and §6 now explicitly distinguish enforced phase2b from
+the historical phase2a blanket `AccessUnavailable` boundary.
+
+Remaining qualification: independent review of these corrections/tests, combined
+T2 authoritative request-ID and inspection/raw-retention/replay credential-boundary
+tests, and actual public Caddy/packaged-binary/browser acceptance. No deployment,
+inspection-generation integration or production security acceptance is claimed.

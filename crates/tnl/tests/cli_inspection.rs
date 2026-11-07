@@ -139,3 +139,34 @@ fn actual_cli_private_service_stops_on_ctrl_c_without_a_tunnel() {
     assert!(!stdout.contains(token));
     assert!(!stdout.contains("Tunnel:"));
 }
+
+#[test]
+fn access_and_inspection_options_share_the_configured_lifecycle() {
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let config = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        config.path(),
+        "endpoint = \"https://localhost:1\"\ntoken = \"fixture\"\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tnl"))
+        .args([
+            "http",
+            "3000",
+            "--inspect",
+            "--inspect-bodies",
+            "json",
+            "--max-concurrent",
+            "1",
+            "--inspect-port",
+            &occupied.local_addr().unwrap().port().to_string(),
+        ])
+        .env("TNL_CONFIG", config.path())
+        .env_remove("TNL_ENDPOINT")
+        .env_remove("TNL_TOKEN")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("bind loopback inspector"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Tunnel:"));
+}
