@@ -407,9 +407,145 @@ mod tests {
 
 #[cfg(test)]
 mod yamux_tests {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use futures::task::AtomicWaker;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadBuf};
+    use tokio::sync::Notify;
 
     use super::*;
+
+    #[derive(Default)]
+    struct IoProbe {
+        block_writes: AtomicBool,
+        blocked_polls: AtomicUsize,
+        write_blocked: Notify,
+        write_waker: AtomicWaker,
+        read_error: AtomicBool,
+        read_waker: AtomicWaker,
+    }
+
+    impl IoProbe {
+        fn unblock_writes(&self) {
+            self.block_writes.store(false, Ordering::SeqCst);
+            self.write_waker.wake();
+        }
+
+        fn fail_reads(&self) {
+            self.read_error.store(true, Ordering::SeqCst);
+            self.read_waker.wake();
+        }
+    }
+
+    struct ObservedIo {
+        inner: DuplexStream,
+        probe: Arc<IoProbe>,
+        released: Option<oneshot::Sender<()>>,
+    }
+
+    impl Drop for ObservedIo {
+        fn drop(&mut self) {
+            let _ = self.released.take().unwrap().send(());
+        }
+    }
+
+    impl AsyncRead for ObservedIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.probe.read_waker.register(cx.waker());
+            if self.probe.read_error.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()));
+            }
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for ObservedIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.probe.write_waker.register(cx.waker());
+            if self.probe.block_writes.load(Ordering::SeqCst) {
+                self.probe.blocked_polls.fetch_add(1, Ordering::SeqCst);
+                self.probe.write_blocked.notify_one();
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    struct ObservedPair {
+        local: YamuxSession,
+        peer: YamuxSession,
+        probe: Arc<IoProbe>,
+        released: oneshot::Receiver<()>,
+    }
+
+    impl ObservedPair {
+        fn new(mode: Mode) -> Self {
+            let (a, b) = tokio::io::duplex(64 * 1024);
+            let probe = Arc::new(IoProbe::default());
+            let (released_tx, released) = oneshot::channel();
+            let local = YamuxSession::start(
+                ObservedIo {
+                    inner: a,
+                    probe: probe.clone(),
+                    released: Some(released_tx),
+                },
+                mode,
+            );
+            let peer = YamuxSession::start(
+                b,
+                match mode {
+                    Mode::Client => Mode::Server,
+                    Mode::Server => Mode::Client,
+                },
+            );
+            Self {
+                local,
+                peer,
+                probe,
+                released,
+            }
+        }
+
+        async fn streams(
+            &mut self,
+            local_opens: bool,
+        ) -> (Pin<Box<dyn Stream>>, Pin<Box<dyn Stream>>) {
+            let (opener, accepter) = if local_opens {
+                (&mut self.local, &mut self.peer)
+            } else {
+                (&mut self.peer, &mut self.local)
+            };
+            let mut outgoing = opener.open_stream().await.unwrap();
+            outgoing.write_all(b"x").await.unwrap();
+            let mut incoming = accepter.accept_stream().await.unwrap().unwrap();
+            incoming.read_exact(&mut [0; 1]).await.unwrap();
+            if local_opens {
+                (outgoing, incoming)
+            } else {
+                (incoming, outgoing)
+            }
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn yamux_substream_roundtrip_1mb() {
@@ -494,6 +630,318 @@ mod yamux_tests {
         let _ = done_tx.send(());
 
         server_task.await.expect("server task panicked");
+    }
+
+    async fn local_shutdown_wakes_pending_reader(
+        mode: Mode,
+        explicit_close: bool,
+        local_opens: bool,
+    ) {
+        let mut pair = ObservedPair::new(mode);
+        let (mut local_stream, _peer_stream) = pair.streams(local_opens).await;
+        let ObservedPair {
+            mut local,
+            peer: _peer,
+            released,
+            ..
+        } = pair;
+
+        let (pending_tx, pending_rx) = oneshot::channel();
+        let reader = tokio::spawn(async move {
+            let mut byte = [0; 1];
+            let mut read = Box::pin(local_stream.read(&mut byte));
+            assert!(futures::poll!(&mut read).is_pending());
+            pending_tx.send(()).unwrap();
+            read.await
+        });
+        pending_rx.await.unwrap();
+        if explicit_close {
+            local.close().await.unwrap();
+        } else {
+            drop(local);
+        }
+        // Time out the task handle, not the read: a timeout's final re-poll of
+        // the read itself can hide a missing wakeup by producing WriteZero.
+        let result = tokio::time::timeout(Duration::from_secs(2), reader)
+            .await
+            .expect("local stream reader hung after session shutdown")
+            .unwrap();
+        assert!(matches!(result, Ok(0) | Err(_)));
+        tokio::time::timeout(Duration::from_secs(2), released)
+            .await
+            .expect("driver retained IO after shutdown")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_close_wakes_pending_local_reader() {
+        local_shutdown_wakes_pending_reader(Mode::Client, true, true).await;
+    }
+
+    #[tokio::test]
+    async fn server_close_wakes_pending_local_reader() {
+        local_shutdown_wakes_pending_reader(Mode::Server, true, true).await;
+    }
+
+    #[tokio::test]
+    async fn client_drop_wakes_pending_local_reader() {
+        local_shutdown_wakes_pending_reader(Mode::Client, false, true).await;
+    }
+
+    #[tokio::test]
+    async fn server_drop_wakes_pending_local_reader() {
+        local_shutdown_wakes_pending_reader(Mode::Server, false, true).await;
+    }
+
+    #[tokio::test]
+    async fn local_shutdown_wakes_pending_accepted_reader() {
+        for mode in [Mode::Client, Mode::Server] {
+            for explicit_close in [true, false] {
+                local_shutdown_wakes_pending_reader(mode, explicit_close, false).await;
+            }
+        }
+    }
+
+    async fn buffered_reads_after_shutdown(mode: Mode, explicit_close: bool) {
+        for local_opens in [true, false] {
+            let mut pair = ObservedPair::new(mode);
+            let (mut local_stream, mut peer_stream) = pair.streams(local_opens).await;
+            peer_stream.write_all(b"buffered").await.unwrap();
+            // A single yamux data frame has arrived; leave its remaining bytes buffered.
+            let mut first = [0; 1];
+            local_stream.read_exact(&mut first).await.unwrap();
+            assert_eq!(&first, b"b");
+            if explicit_close {
+                pair.local.close().await.unwrap();
+            } else {
+                drop(pair.local);
+            }
+            tokio::time::timeout(Duration::from_secs(2), pair.released)
+                .await
+                .expect("driver did not release IO")
+                .unwrap();
+            let mut rest = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), local_stream.read_to_end(&mut rest))
+                .await
+                .expect("buffered stream reader hung after session shutdown")
+                .unwrap();
+            assert_eq!(rest, b"uffered");
+        }
+    }
+
+    #[tokio::test]
+    async fn local_close_preserves_buffered_reads() {
+        buffered_reads_after_shutdown(Mode::Client, true).await;
+    }
+
+    #[tokio::test]
+    async fn server_close_preserves_buffered_reads() {
+        buffered_reads_after_shutdown(Mode::Server, true).await;
+    }
+
+    #[tokio::test]
+    async fn client_drop_preserves_buffered_reads() {
+        buffered_reads_after_shutdown(Mode::Client, false).await;
+    }
+
+    #[tokio::test]
+    async fn server_drop_preserves_buffered_reads() {
+        buffered_reads_after_shutdown(Mode::Server, false).await;
+    }
+
+    #[tokio::test]
+    async fn local_shutdown_wakes_flow_control_blocked_writer() {
+        for mode in [Mode::Client, Mode::Server] {
+            for explicit_close in [true, false] {
+                let mut pair = ObservedPair::new(mode);
+                let (mut local_stream, _peer_stream) = pair.streams(true).await;
+                // One byte of initial credit was consumed establishing the stream.
+                local_stream
+                    .write_all(&vec![0x42; yamux::DEFAULT_CREDIT as usize - 1])
+                    .await
+                    .unwrap();
+                let (pending_tx, pending_rx) = oneshot::channel();
+                let writer = tokio::spawn(async move {
+                    let mut write = Box::pin(local_stream.write(b"x"));
+                    assert!(futures::poll!(&mut write).is_pending());
+                    pending_tx.send(()).unwrap();
+                    write.await
+                });
+                pending_rx.await.unwrap();
+                if explicit_close {
+                    pair.local.close().await.unwrap();
+                } else {
+                    drop(pair.local);
+                }
+                let result = tokio::time::timeout(Duration::from_secs(2), writer)
+                    .await
+                    .expect("flow-control-blocked writer was not woken")
+                    .unwrap();
+                assert!(result.is_err());
+                tokio::time::timeout(Duration::from_secs(2), pair.released)
+                    .await
+                    .expect("driver retained IO after writer shutdown")
+                    .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_shutdown_flushes_queued_writes_without_spinning_or_cancellation() {
+        for mode in [Mode::Client, Mode::Server] {
+            // Explicit close, drop, and dropping the session during an in-flight close.
+            for shutdown in 0..3 {
+                let mut pair = ObservedPair::new(mode);
+                let (mut local_stream, mut peer_stream) = pair.streams(true).await;
+                pair.probe.block_writes.store(true, Ordering::SeqCst);
+                let payload = vec![0x42; 8192];
+                local_stream.write_all(&payload).await.unwrap();
+                local_stream.shutdown().await.unwrap();
+                if shutdown != 1 {
+                    pair.local.close().await.unwrap();
+                }
+                if shutdown != 0 {
+                    drop(pair.local);
+                }
+                tokio::time::timeout(Duration::from_secs(2), pair.probe.write_blocked.notified())
+                    .await
+                    .expect("close did not encounter the write gate");
+                assert!(matches!(
+                    pair.released.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ));
+                // A genuinely blocked close must wait for IO, not return false-ready
+                // and repeatedly poll the socket. Allow initial close-transition wakes.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let polls = pair.probe.blocked_polls.load(Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                assert_eq!(pair.probe.blocked_polls.load(Ordering::SeqCst), polls);
+                pair.probe.unblock_writes();
+                let mut received = Vec::new();
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    peer_stream.read_to_end(&mut received),
+                )
+                .await
+                .expect("peer did not receive queued writes and EOF")
+                .unwrap();
+                assert_eq!(received, payload);
+                tokio::time::timeout(Duration::from_secs(2), pair.released)
+                    .await
+                    .expect("driver did not release IO after flushing")
+                    .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_stream_read_does_not_prevent_shutdown() {
+        for mode in [Mode::Client, Mode::Server] {
+            for explicit_close in [true, false] {
+                let mut pair = ObservedPair::new(mode);
+                let (mut local_stream, _peer_stream) = pair.streams(true).await;
+                let (pending_tx, pending_rx) = oneshot::channel();
+                let (cancel_tx, cancel_rx) = oneshot::channel();
+                let reader = tokio::spawn(async move {
+                    {
+                        let mut byte = [0; 1];
+                        let mut read = Box::pin(local_stream.read(&mut byte));
+                        assert!(futures::poll!(&mut read).is_pending());
+                        pending_tx.send(()).unwrap();
+                        tokio::select! {
+                            _ = read => panic!("read ended before cancellation"),
+                            _ = cancel_rx => {}
+                        }
+                    }
+                    local_stream
+                });
+                pending_rx.await.unwrap();
+                cancel_tx.send(()).unwrap();
+                let mut stream = reader.await.unwrap();
+                if explicit_close {
+                    pair.local.close().await.unwrap();
+                } else {
+                    drop(pair.local);
+                }
+                tokio::time::timeout(Duration::from_secs(2), pair.released)
+                    .await
+                    .expect("cancelled read retained driver IO")
+                    .unwrap();
+                assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_shutdown_wakes_pending_reader_and_preserves_buffered_reads() {
+        for mode in [Mode::Client, Mode::Server] {
+            for explicit_close in [true, false] {
+                let mut pair = ObservedPair::new(mode);
+                let (mut pending_stream, _peer_pending_stream) = pair.streams(true).await;
+                let (mut buffered_stream, mut peer_buffered_stream) = pair.streams(false).await;
+                peer_buffered_stream.write_all(b"buffered").await.unwrap();
+                buffered_stream.read_exact(&mut [0; 1]).await.unwrap();
+                let (pending_tx, pending_rx) = oneshot::channel();
+                let reader = tokio::spawn(async move {
+                    let mut byte = [0; 1];
+                    let mut read = Box::pin(pending_stream.read(&mut byte));
+                    assert!(futures::poll!(&mut read).is_pending());
+                    pending_tx.send(()).unwrap();
+                    read.await
+                });
+                pending_rx.await.unwrap();
+                if explicit_close {
+                    pair.peer.close().await.unwrap();
+                } else {
+                    drop(pair.peer);
+                }
+                let result = tokio::time::timeout(Duration::from_secs(2), reader)
+                    .await
+                    .expect("reader hung after remote shutdown")
+                    .unwrap();
+                assert_eq!(result.unwrap(), 0);
+                tokio::time::timeout(Duration::from_secs(2), pair.released)
+                    .await
+                    .expect("driver retained IO after remote shutdown")
+                    .unwrap();
+                let mut buffered = Vec::new();
+                buffered_stream.read_to_end(&mut buffered).await.unwrap();
+                assert_eq!(buffered, b"uffered");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_error_wakes_pending_reader_and_preserves_buffered_reads() {
+        for mode in [Mode::Client, Mode::Server] {
+            let mut pair = ObservedPair::new(mode);
+            let (mut pending_stream, _peer_pending_stream) = pair.streams(true).await;
+            let (mut buffered_stream, mut peer_buffered_stream) = pair.streams(false).await;
+            peer_buffered_stream.write_all(b"buffered").await.unwrap();
+            buffered_stream.read_exact(&mut [0; 1]).await.unwrap();
+            let (pending_tx, pending_rx) = oneshot::channel();
+            let reader = tokio::spawn(async move {
+                let mut byte = [0; 1];
+                let mut read = Box::pin(pending_stream.read(&mut byte));
+                assert!(futures::poll!(&mut read).is_pending());
+                pending_tx.send(()).unwrap();
+                read.await
+            });
+            pending_rx.await.unwrap();
+            pair.probe.fail_reads();
+            let result = tokio::time::timeout(Duration::from_secs(2), reader)
+                .await
+                .expect("reader hung after transport error")
+                .unwrap();
+            assert_eq!(result.unwrap(), 0);
+            tokio::time::timeout(Duration::from_secs(2), pair.released)
+                .await
+                .expect("driver retained IO after transport error")
+                .unwrap();
+            let mut buffered = Vec::new();
+            buffered_stream.read_to_end(&mut buffered).await.unwrap();
+            assert_eq!(buffered, b"uffered");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

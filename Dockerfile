@@ -13,6 +13,7 @@ COPY crates/tnl-protocol/Cargo.toml crates/tnl-protocol/Cargo.toml
 COPY crates/tnld/Cargo.toml         crates/tnld/Cargo.toml
 COPY crates/tnl/Cargo.toml          crates/tnl/Cargo.toml
 COPY crates/tnl-e2e/Cargo.toml      crates/tnl-e2e/Cargo.toml
+COPY vendor/yamux/ vendor/yamux/
 RUN set -eux; \
     for c in tnl-protocol tnl-e2e; do \
         mkdir -p crates/$c/src && echo 'pub fn _stub() {}' > crates/$c/src/lib.rs; \
