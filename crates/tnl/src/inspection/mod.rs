@@ -6,8 +6,9 @@ mod redact;
 mod server;
 pub use history::Inspection;
 pub use model::{
-    BodyPreview, CaptureId, GenerationState, Header, InspectionRecord, Message, PreviewMode, State,
-    Summary, TunnelGeneration, TunnelStatus,
+    BodyPreview, BodyState, CaptureId, GenerationState, Header, HeadersState, InspectionRecord,
+    Message, Origin, PreviewMode, RequestBoundary, ResponseSource, State, Summary,
+    TunnelGeneration, TunnelStatus, Visitor,
 };
 pub use observe::{
     Capture, CaptureContext, ConsumerFactory, Direction, Observation, ObservationConsumer,
@@ -19,4 +20,10 @@ pub(crate) fn safe_target(value: &str) -> String {
 }
 pub(crate) fn safe_method(value: &str) -> String {
     redact::text(value, 32)
+}
+
+pub(crate) use model::{wall_ms, TransportCounters};
+
+pub(crate) fn safe_tunnel(value: &str) -> String {
+    redact::text(value, 64)
 }

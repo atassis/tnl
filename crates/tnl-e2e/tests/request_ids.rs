@@ -3,6 +3,9 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tnl::inspection::{
+    Inspection, PreviewMode, RequestBoundary, ResponseSource, State, TunnelGeneration,
+};
 use tnld::auth::{hash_plaintext, TokenEntry, TokensFile};
 
 #[derive(Clone, Default)]
@@ -99,11 +102,54 @@ async fn backend() -> (u16, tokio::task::JoinHandle<()>) {
     (port, task)
 }
 
+async fn assert_capture(history: &Inspection, id: &str, source: ResponseSource) {
+    let row = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(row) = history.search("").into_iter().find(|row| {
+                row.request_id
+                    .is_some_and(|request_id| request_id.to_string() == id)
+                    && row.state != State::Active
+            }) {
+                break row;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(row.response_source, source);
+    assert_eq!(row.visitor_source, Some("peer"));
+    assert_eq!(
+        row.byte_count_semantics,
+        "successful_local_writes_not_delivery"
+    );
+    assert_eq!(row.request_boundary, RequestBoundary::PreconnectUnavailable);
+    if source == ResponseSource::ClientSynth {
+        assert_eq!(row.failure_kind, Some("connect-refused"));
+        assert_eq!(row.bytes_to_backend, 0);
+        assert_eq!(row.bytes_from_backend, 0);
+        assert_eq!(row.resolved_addr, None);
+    } else {
+        // The original 9-KiB header deliberately exceeds the bounded head
+        // probe: forwarding continues, but display must not invent a complete
+        // effective request boundary or admit raw capture from that prefix.
+        assert_eq!(
+            row.request.headers_state,
+            tnl::inspection::HeadersState::Unavailable
+        );
+        assert_eq!(row.failure_kind, None);
+        assert!(row.resolved_addr.is_some());
+        assert!(row.bytes_to_backend > 128 * 1024);
+    }
+    assert!(row.bytes_to_client > 0);
+}
+
 async fn concurrent_uploads(
     client: &reqwest::Client,
     addr: std::net::SocketAddr,
     rx: &mut tokio::sync::mpsc::Receiver<tnl::inspector::LogLine>,
     sink: &VecWriter,
+    history: Option<&Inspection>,
 ) {
     let mut tasks = Vec::new();
     for n in 0..8 {
@@ -147,6 +193,9 @@ async fn concurrent_uploads(
         assert_eq!(log.status, Some(418));
         let id = log.req_id.to_string();
         assert!(ids.remove(&id), "unexpected or duplicate log ID {id}");
+        if let Some(history) = history {
+            assert_capture(history, &id, ResponseSource::Backend).await;
+        }
         assert!(
             captured
                 .lines()
@@ -167,6 +216,12 @@ async fn request_ids_correlate_concurrent_uploads_spoofed_headers_and_local_erro
         .with_writer(sink.clone())
         .try_init()
         .unwrap();
+    for inspect in [false, true] {
+        request_id_scenario(&sink, inspect).await;
+    }
+}
+
+async fn request_id_scenario(sink: &VecWriter, inspect: bool) {
     let (_file, daemon) = daemon().await;
     let (port, backend) = backend().await;
     let session = tnl::client::connect_and_create(
@@ -178,10 +233,12 @@ async fn request_ids_correlate_concurrent_uploads_spoofed_headers_and_local_erro
     .unwrap();
     let _control = session.control;
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let history = Inspection::new(PreviewMode::Off);
     let accept = tokio::spawn(tnl::client::run_accept_loop(
         session.session,
         tnl::target::Target::LocalhostPort(port),
         tnl::forwarder::ForwardCtx {
+            inspection: inspect.then(|| (history.clone(), TunnelGeneration::new())),
             data_stream_protocol: session.data_stream_protocol,
             ..tnl::forwarder::ForwardCtx::new("ids".into(), Some(tx), env!("CARGO_PKG_VERSION"))
         },
@@ -191,7 +248,14 @@ async fn request_ids_correlate_concurrent_uploads_spoofed_headers_and_local_erro
         .pool_max_idle_per_host(0)
         .build()
         .unwrap();
-    concurrent_uploads(&client, daemon.local_addr, &mut rx, &sink).await;
+    concurrent_uploads(
+        &client,
+        daemon.local_addr,
+        &mut rx,
+        sink,
+        inspect.then_some(&history),
+    )
+    .await;
 
     // Stop the backend: the daemon, client synth body and inspector must agree.
     backend.abort();
@@ -212,6 +276,9 @@ async fn request_ids_correlate_concurrent_uploads_spoofed_headers_and_local_erro
         let log = record(&mut rx).await;
         assert_eq!(log.req_id.to_string(), id);
         assert_eq!(log.failure_kind.as_deref(), Some("connect-refused"));
+        if inspect {
+            assert_capture(&history, &id, ResponseSource::ClientSynth).await;
+        }
         let captured = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
         assert!(
             captured

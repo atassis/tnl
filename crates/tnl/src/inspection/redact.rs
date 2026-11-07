@@ -66,9 +66,10 @@ pub(super) fn target(value: &str) -> String {
     }
     out.into_boxed_str().into_string()
 }
-pub(super) fn headers(headers: &[httparse::Header<'_>]) -> Vec<Header> {
+pub(super) fn headers(headers: &[httparse::Header<'_>]) -> (Vec<Header>, bool) {
     let mut out = Vec::new();
     let mut budget = 8192usize;
+    let mut capped = headers.len() > 64;
     for header in headers.iter().take(64) {
         let name = text(header.name, 128).to_ascii_lowercase();
         let allowed = matches!(
@@ -92,6 +93,14 @@ pub(super) fn headers(headers: &[httparse::Header<'_>]) -> Vec<Header> {
                 | "x-tnl-origin-failure"
                 | "x-tnl-request-id"
         );
+        capped |= header.name.len() > 128
+            || (allowed
+                && std::str::from_utf8(header.value).is_ok_and(|s| {
+                    s.chars()
+                        .map(|ch| if ch.is_control() { 3 } else { ch.len_utf8() })
+                        .sum::<usize>()
+                        > 1024
+                }));
         let value = if allowed {
             std::str::from_utf8(header.value)
                 .map_or_else(|_| "[unavailable]".into(), |s| text(s, 1024))
@@ -100,6 +109,7 @@ pub(super) fn headers(headers: &[httparse::Header<'_>]) -> Vec<Header> {
         };
         let size = name.len() + value.len();
         if size > budget {
+            capped = true;
             break;
         }
         budget -= size;
@@ -109,7 +119,7 @@ pub(super) fn headers(headers: &[httparse::Header<'_>]) -> Vec<Header> {
             redacted: !allowed,
         });
     }
-    out.into_boxed_slice().into_vec()
+    (out.into_boxed_slice().into_vec(), capped)
 }
 fn secret(key: &str) -> bool {
     matches!(
@@ -128,7 +138,7 @@ fn secret(key: &str) -> bool {
             | "set-cookie"
     )
 }
-fn sanitize(value: &mut serde_json::Value, depth: usize) -> bool {
+fn sanitize(value: &mut serde_json::Value, depth: usize, redacted: &mut bool) -> bool {
     if depth > 32 {
         return false;
     }
@@ -136,15 +146,16 @@ fn sanitize(value: &mut serde_json::Value, depth: usize) -> bool {
         serde_json::Value::Object(map) => {
             for (key, value) in map {
                 if secret(key) {
+                    *redacted = true;
                     *value = serde_json::Value::String(MASK.into());
-                } else if !sanitize(value, depth + 1) {
+                } else if !sanitize(value, depth + 1, redacted) {
                     return false;
                 }
             }
         }
         serde_json::Value::Array(values) => {
             for value in values {
-                if !sanitize(value, depth + 1) {
+                if !sanitize(value, depth + 1, redacted) {
                     return false;
                 }
             }
@@ -167,7 +178,7 @@ impl std::io::Write for BoundedJson {
     }
 }
 
-pub(super) fn json(bytes: &[u8]) -> Option<String> {
+pub(super) fn json(bytes: &[u8]) -> Result<(String, bool), &'static str> {
     // Bound the parsed tree before serde allocates it. This deliberately omits
     // structurally dense JSON as well as deep JSON, even below the byte cap.
     let mut quoted = false;
@@ -190,23 +201,27 @@ pub(super) fn json(bytes: &[u8]) -> Option<String> {
                     depth += 1;
                     structure += 1;
                 }
-                b']' | b'}' => depth = depth.checked_sub(1)?,
+                b']' | b'}' => depth = depth.checked_sub(1).ok_or("invalid-json")?,
                 b',' | b':' => structure += 1,
                 _ => {}
             }
             if depth > 32 || structure > 64 {
-                return None;
+                return Err("capture-limit");
             }
         }
     }
 
-    let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    if !sanitize(&mut value, 0) {
-        return None;
+    let mut value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| "invalid-json")?;
+    let mut redacted = false;
+    if !sanitize(&mut value, 0, &mut redacted) {
+        return Err("capture-limit");
     }
     let mut output = BoundedJson(Vec::with_capacity(4096));
-    serde_json::to_writer(&mut output, &value).ok()?;
-    String::from_utf8(output.0).ok()
+    serde_json::to_writer(&mut output, &value).map_err(|_| "too-large")?;
+    Ok((
+        String::from_utf8(output.0).map_err(|_| "invalid-json")?,
+        redacted,
+    ))
 }
 
 #[cfg(test)]
@@ -223,9 +238,11 @@ mod tests {
             assert_eq!(target(target_), "[unavailable]");
         }
         assert_eq!(
-            json(br#"{"nested":[{"ToKeN":"CANARY"}],"ok":1}"#).unwrap(),
+            json(br#"{"nested":[{"ToKeN":"CANARY"}],"ok":1}"#)
+                .unwrap()
+                .0,
             r#"{"nested":[{"ToKeN":"[REDACTED]"}],"ok":1}"#
         );
-        assert!(json(b"{\"token\":\"CANARY").is_none());
+        assert!(json(b"{\"token\":\"CANARY").is_err());
     }
 }

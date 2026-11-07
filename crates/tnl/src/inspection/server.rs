@@ -467,13 +467,42 @@ fn route(head: &[u8], body: &[u8], state: &ServerState) -> Reply {
                 return error(404);
             };
             match state.history.api_detail(CaptureId(id)) {
-                Ok(Some(record)) => json(&record),
+                Ok(Some(record)) => detail_json(record),
                 Ok(None) => error(404),
                 Err(()) => error(503),
             }
         }
         _ => error(404),
     }
+}
+// Omit preview text before headers if escaping pushes a detail past the wire
+// cap. Each bounded retry serializes outside history/replay locks.
+fn detail_json(mut detail: super::model::Detail) -> Reply {
+    let reply = json(&detail);
+    if reply.status == 200 {
+        return reply;
+    }
+    drop(reply);
+    for message in [&mut detail.record.request, &mut detail.record.response] {
+        if message.body.text.take().is_some() {
+            message.body.retained_bytes = 0;
+            message.body.state = super::BodyState::Omitted;
+            message.body.reason = Some("capture-limit");
+        }
+    }
+    detail.record.omit("capture-limit");
+    let reply = json(&detail);
+    if reply.status == 200 {
+        return reply;
+    }
+    drop(reply);
+    for message in [&mut detail.record.request, &mut detail.record.response] {
+        if !message.headers.is_empty() {
+            message.headers.clear();
+            message.headers_state = super::HeadersState::Capped;
+        }
+    }
+    json(&detail)
 }
 #[derive(Serialize)]
 struct AvailabilityReply {
@@ -639,7 +668,7 @@ impl Filter {
                 "state"
                     if matches!(
                         value.as_ref(),
-                        "active" | "complete" | "incomplete" | "upgraded"
+                        "active" | "complete" | "failed" | "incomplete" | "upgraded"
                     ) =>
                 {
                     out.state = Some(value.into_owned());
@@ -729,6 +758,23 @@ mod tests {
         assert!(TcpStream::connect(addr).await.is_err());
     }
     #[test]
+    fn detail_wire_limit_omits_body_before_returning_valid_json() {
+        let history = Inspection::new(super::super::PreviewMode::Json);
+        let capture = history
+            .admit(super::super::TunnelGeneration::new(), None)
+            .unwrap();
+        let mut detail = history.api_detail(capture.id()).unwrap().unwrap();
+        // Stress the output guard independently of stricter observation caps.
+        detail.record.request.body.text = Some("\"".repeat(40000));
+        let reply = detail_json(detail);
+        assert_eq!(reply.status, 200);
+        assert!(reply.body.len() <= RESPONSE_LIMIT);
+        let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert!(body["request"]["body"]["text"].is_null());
+        assert_eq!(body["request"]["body"]["state"], "omitted");
+        assert_eq!(body["request"]["body"]["reason"], "capture-limit");
+    }
+    #[test]
     fn serialized_output_never_exceeds_64kib() {
         assert_eq!(json(&"x".repeat(65534)).body.len(), 65536);
         let capped = json(&"x".repeat(65535));
@@ -736,3 +782,6 @@ mod tests {
         assert!(capped.body.len() < 1024);
     }
 }
+
+#[cfg(test)]
+mod pressure_tests;

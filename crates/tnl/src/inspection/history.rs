@@ -23,6 +23,7 @@ pub(super) struct History {
     rows: VecDeque<Row>,
     next: u64,
     tunnel: TunnelStatus,
+    tunnel_id: Option<ulid::Ulid>,
     replay: Option<crate::replay::ReplayController>,
 }
 impl History {
@@ -94,6 +95,7 @@ impl Inspection {
                 history: Mutex::new(History {
                     rows: VecDeque::with_capacity(MAX_RECORDS),
                     next: 0,
+                    tunnel_id: None,
                     replay: None,
                     tunnel: TunnelStatus {
                         generation: None,
@@ -119,7 +121,7 @@ impl Inspection {
         generation: TunnelGeneration,
         metadata: Option<&RequestMetadataV1>,
     ) -> Option<Capture> {
-        self.admit_inner(generation, metadata, None)
+        self.admit_inner(generation, metadata, None, true)
     }
     pub fn admit_backend(
         &self,
@@ -127,13 +129,21 @@ impl Inspection {
         metadata: Option<&RequestMetadataV1>,
         backend: std::net::SocketAddr,
     ) -> Option<Capture> {
-        self.admit_inner(generation, metadata, Some(backend))
+        self.admit_inner(generation, metadata, Some(backend), true)
+    }
+    pub(crate) fn admit_preconnect(
+        &self,
+        generation: TunnelGeneration,
+        metadata: Option<&RequestMetadataV1>,
+    ) -> Option<Capture> {
+        self.admit_inner(generation, metadata, None, false)
     }
     fn admit_inner(
         &self,
         generation: TunnelGeneration,
         metadata: Option<&RequestMetadataV1>,
         backend: Option<std::net::SocketAddr>,
+        raw_consumer: bool,
     ) -> Option<Capture> {
         if self.inner.closed.load(Ordering::Acquire) {
             return None;
@@ -151,6 +161,34 @@ impl Inspection {
             backend,
         };
         let record = InspectionRecord {
+            schema_version: 1,
+            tunnel: String::new(),
+            tunnel_id: None,
+            origin: super::Origin::External,
+            started_at_ms: super::model::wall_ms(),
+            duration_ms: 0,
+            started: Instant::now(),
+            terminal: false,
+            counters: None,
+            failure_kind: None,
+            display_target: String::new(),
+            resolved_addr: None,
+            response_source: super::ResponseSource::Unavailable,
+            request_boundary: if raw_consumer {
+                super::RequestBoundary::EffectiveBackend
+            } else {
+                super::RequestBoundary::PreconnectUnavailable
+            },
+            bytes_to_backend: 0,
+            bytes_from_backend: 0,
+            bytes_to_client: 0,
+            byte_count_semantics: "successful_local_writes_not_delivery",
+            omission_reasons: Vec::new(),
+            visitor: super::Visitor {
+                available: metadata.is_some(),
+                source: metadata.map(|m| m.visitor.source.as_str()),
+                display_ip: metadata.map(|_| "[REDACTED]"),
+            },
             capture_id: context.capture_id,
             generation,
             request_id: context.request_id,
@@ -172,14 +210,24 @@ impl Inspection {
         }
         let mut record = record;
         record.connection = generation_state(history.tunnel, generation);
+        record.tunnel_id = (history.tunnel.generation == Some(generation))
+            .then_some(history.tunnel_id)
+            .flatten();
         history.insert(record, Instant::now());
         // Replay admission and row insertion share this lease, so an eviction
         // cannot forget a row before its raw consumer has even been admitted.
+        let create = || {
+            if raw_consumer {
+                Capture::new(self.clone(), context)
+            } else {
+                Capture::display_only(self.clone(), context)
+            }
+        };
         if history.replay.is_some() {
-            return Some(Capture::new(self.clone(), context));
+            return Some(create());
         }
         drop(history);
-        Some(Capture::new(self.clone(), context))
+        Some(create())
     }
     pub(super) fn update(&self, id: CaptureId, update: impl FnOnce(&mut InspectionRecord)) {
         if self.inner.closed.load(Ordering::Acquire) {
@@ -198,7 +246,7 @@ impl Inspection {
             .rows
             .iter()
             .find(|r| r.record.capture_id == id)
-            .map(|r| r.record.clone())
+            .map(|r| r.record.snapshot())
     }
     /// Literal, bounded search of sanitized fields only; at most 100 results.
     pub fn search(&self, query: &str) -> Vec<InspectionRecord> {
@@ -228,10 +276,16 @@ impl Inspection {
                     })
             })
             .take(100)
-            .map(|r| r.record.clone())
+            .map(|r| r.record.snapshot())
             .collect()
     }
     pub fn activate(&self, generation: TunnelGeneration) {
+        self.activate_identity(generation, None);
+    }
+    pub(crate) fn activate_tunnel(&self, generation: TunnelGeneration, tunnel_id: ulid::Ulid) {
+        self.activate_identity(generation, Some(tunnel_id));
+    }
+    fn activate_identity(&self, generation: TunnelGeneration, tunnel_id: Option<ulid::Ulid>) {
         let mut h = self.inner.history.lock();
         if self.inner.closed.load(Ordering::Acquire) {
             return;
@@ -239,6 +293,7 @@ impl Inspection {
         if let Some(replay) = &h.replay {
             replay.activate(generation);
         }
+        h.tunnel_id = tunnel_id;
         h.tunnel = TunnelStatus {
             generation: Some(generation),
             connected: true,
@@ -351,13 +406,33 @@ impl Inspection {
         h.sweep(Instant::now());
         Ok((h.rows.len(), h.tunnel))
     }
-    pub(super) fn api_detail(&self, id: CaptureId) -> Result<Option<InspectionRecord>, ()> {
+    pub(super) fn api_detail(&self, id: CaptureId) -> Result<Option<super::model::Detail>, ()> {
         let mut h = self.inner.history.try_lock().ok_or(())?;
         h.sweep(Instant::now());
-        Ok(h.rows
-            .iter()
-            .find(|row| row.record.capture_id == id)
-            .map(|row| row.record.clone()))
+        let Some(row) = h.rows.iter().find(|row| row.record.capture_id == id) else {
+            return Ok(None);
+        };
+        let record = row.record.snapshot();
+        let (replay, last_replay_outcome) = h.replay.as_ref().map_or_else(
+            || {
+                (
+                    crate::replay::ReplayAvailability {
+                        state: crate::replay::AvailabilityState::Disabled,
+                        reason: Some(crate::replay::ReplayError::Disabled),
+                        request_body_bytes: None,
+                        raw_expires_at_unix_ms: None,
+                    },
+                    None,
+                )
+            },
+            |replay| (replay.availability(id), replay.latest_outcome(id)),
+        );
+        drop(h);
+        Ok(Some(super::model::Detail {
+            record,
+            replay: replay.into(),
+            last_replay_outcome,
+        }))
     }
     // At most one charged 64-KiB record clone at a time; search and serialization
     // run outside the history lock. Never call legacy search() from the service.
@@ -373,7 +448,7 @@ impl Inspection {
                     .iter()
                     .rev()
                     .find(|row| row.record.sequence < cursor)
-                    .map(|row| row.record.clone())
+                    .map(|row| row.record.snapshot())
             };
             let Some(r) = record else {
                 break;
@@ -382,12 +457,19 @@ impl Inspection {
             if !filter.matches(&r) {
                 continue;
             }
-            let cost = 512 + 6 * (r.method.len() + r.request_target.len());
+            let cost = 1024 + 6 * (r.method.len() + r.request_target.len());
             if cost > budget {
                 break;
             }
             budget -= cost;
             summaries.push(Summary {
+                started_at_ms: r.started_at_ms,
+                duration_ms: r.duration_ms,
+                response_source: r.response_source,
+                request_boundary: r.request_boundary,
+                failure_kind: r.failure_kind,
+                bytes_to_backend: r.bytes_to_backend,
+                bytes_from_backend: r.bytes_from_backend,
                 capture_id: r.capture_id,
                 generation: r.generation,
                 request_id: r.request_id,
@@ -585,5 +667,30 @@ mod replay_lease_tests {
         assert!(history.inner.history.lock().rows.is_empty());
         assert_eq!(replay.raw_bytes(), 0);
         service.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+impl Inspection {
+    pub(super) fn allocated_capacity(&self) -> usize {
+        let h = self.inner.history.lock();
+        let records = h
+            .rows
+            .iter()
+            .map(|row| {
+                let capacity = row.record.allocated_capacity();
+                assert!(capacity <= RECORD_RESERVATION);
+                capacity
+            })
+            .sum::<usize>();
+        // Deliberately double-count inline row/record storage, rather than
+        // understating capacity by summing only serialized lengths.
+        let bytes = records
+            + h.rows.capacity() * std::mem::size_of::<Row>()
+            + std::mem::size_of::<Inner>()
+            + 2 * std::mem::size_of::<usize>();
+        drop(h);
+        assert!(bytes <= HISTORY_BYTES);
+        bytes
     }
 }

@@ -165,7 +165,7 @@ pub async fn run_with_options(
         );
         last_tunnel = Some((session.tunnel_id, session.subdomain.clone()));
         if let Some(inspection) = &hooks.inspection {
-            inspection.activate(generation);
+            inspection.activate_tunnel(generation, session.tunnel_id);
         }
 
         if !printed_banner {
@@ -189,6 +189,10 @@ pub async fn run_with_options(
         // Keep the control stream alive for the duration of the session.
         let _ctrl_keep = session.control;
         let ctx = crate::forwarder::ForwardCtx {
+            #[cfg(test)]
+            inspection_ownership_check: None,
+            #[cfg(test)]
+            connect_failure: None,
             inspection: hooks
                 .inspection
                 .clone()

@@ -46,7 +46,7 @@ async fn full_summary_channel_and_tracing_never_print_capture_secrets() {
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
     let reserved = tx.reserve().await.unwrap();
     let mut ctx = ForwardCtx::new("trace".into(), Some(tx.clone()), env!("CARGO_PKG_VERSION"));
-    ctx.inspection = Some((history, TunnelGeneration::new()));
+    ctx.inspection = Some((history.clone(), TunnelGeneration::new()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (mut visitor, substream) = tokio::io::duplex(1024);
@@ -66,12 +66,39 @@ async fn full_summary_channel_and_tracing_never_print_capture_secrets() {
             result.unwrap();
         }).await.unwrap();
     }.await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let mut ctx = ForwardCtx::new(
+        "trace-failure".into(),
+        Some(tx.clone()),
+        env!("CARGO_PKG_VERSION"),
+    );
+    ctx.inspection = Some((history.clone(), TunnelGeneration::new()));
+    let (mut visitor, stream) = tokio::io::duplex(8192);
+    let client = async {
+        visitor.write_all(b"GET /failure?token=FAILURE_QUERY_CANARY HTTP/1.1\r\nHost: local\r\nAuthorization: FAILURE_HEADER_CANARY\r\n\r\n").await.unwrap();
+        visitor.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        visitor.read_to_end(&mut response).await.unwrap();
+    };
+    let (result, ()) = tokio::join!(
+        Box::pin(forward(Box::pin(stream), Target::Explicit(addr), ctx)),
+        client
+    );
+    result.unwrap();
+    let rows = history.search("");
+    assert_eq!(rows.len(), 2);
+    assert!(!format!("{rows:?}").contains("CANARY"));
+    assert!(!serde_json::to_string(&rows).unwrap().contains("CANARY"));
+    assert!(history.search("CANARY").is_empty());
     drop(guard);
     drop(reserved);
     let output = output.0.lock().unwrap();
     let trace = std::str::from_utf8(&output).unwrap();
     assert!(trace.contains("request head parsed"), "{trace}");
     assert!(trace.contains("dropping log line"));
+    assert!(trace.contains("connect-refused"));
     assert!(!trace.contains("CANARY"));
     drop(output);
 }

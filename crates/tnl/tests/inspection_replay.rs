@@ -72,6 +72,11 @@ async fn authenticated_browser_replay_preserves_original_bytes_and_never_redirec
     let (status, availability) = call(&service, "GET", &path, "", None).await;
     assert_eq!(status, 200);
     assert_eq!(availability["availability"]["state"], "eligible");
+    let detail = call(&service, "GET", &format!("/api/v1/requests/{id}"), "", None)
+        .await
+        .1;
+    assert_eq!(detail["replay"]["state"], "eligible");
+    assert_eq!(detail["replay"]["eligible"], true);
     let (status, preview) = call(
         &service,
         "POST",
@@ -146,6 +151,13 @@ async fn authenticated_browser_replay_preserves_original_bytes_and_never_redirec
     .unwrap();
     assert_eq!(outcome["outcome"]["status"], 302, "{outcome}");
     assert_eq!(outcome["outcome"]["delivery"], "response_received");
+    let completed_detail = call(&service, "GET", &format!("/api/v1/requests/{id}"), "", None)
+        .await
+        .1;
+    assert_eq!(
+        completed_detail["last_replay_outcome"]["replay_id"],
+        outcome["outcome"]["replay_id"]
+    );
     for safe in [
         preview,
         availability,

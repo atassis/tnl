@@ -351,6 +351,8 @@ async fn actual_shared_run_retains_policy_name_and_generation_through_network_lo
         .current_session_id(&first.id)
         .unwrap();
     let initial_record = observed_request(&mut fixture, &assigned, &history).await;
+    assert_eq!(initial_record.tunnel_id, Some(first_id));
+    assert_eq!(initial_record.tunnel, assigned);
     cut_first.send(()).unwrap();
 
     let (proceed, cut_second) = ready(&mut events, 2).await;
@@ -389,6 +391,8 @@ async fn actual_shared_run_retains_policy_name_and_generation_through_network_lo
     assert_ne!(second_session, first_session);
     let reattached_record = observed_request(&mut fixture, &assigned, &history).await;
     assert_eq!(initial_record.generation, reattached_record.generation);
+    assert_eq!(reattached_record.tunnel_id, Some(first_id));
+    assert_eq!(reattached_record.tunnel, assigned);
     assert_ne!(initial_record.request_id, reattached_record.request_id);
     cut_second.send(()).unwrap();
 
@@ -504,6 +508,8 @@ async fn actual_shared_run_retains_policy_name_and_generation_through_network_lo
     assert!(backend_head.contains(&request_id.to_ascii_lowercase()));
     let recreated_record = captured_record(&history, &request_id).await;
     assert_ne!(initial_record.generation, recreated_record.generation);
+    assert_eq!(recreated_record.tunnel_id, Some(recreated_id));
+    assert_eq!(recreated_record.tunnel, assigned);
     assert!(!run.is_finished());
     assert!(
         events.try_recv().is_err(),
