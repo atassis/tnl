@@ -93,3 +93,47 @@ production credentials, or deployment is performed. It prints the version and
 test-only effective Caddyfile. Do not publish the fixture's incoming-XFF
 preservation as safe production upstream-trust configuration. A missing binary
 or ignored test is not ingress proof.
+
+## Application WebSockets
+
+Classic HTTP/1.1 WebSocket upgrades use the same tunnel host and paths as HTTP.
+This is separate from the owner's authenticated `/control` WSS transport. Deploy
+an upgrade-capable daemon **and** the updated Caddyfile together: do not add
+`header_up Connection close` to the wildcard site. Caddy handles the upgrade;
+`flush_interval -1` remains for streaming HTTP, and the more-specific API site
+remains separate. Existing explicit daemon routes (including `/control`,
+`/whoami`, `/healthz`, and admin routes) are reserved, not backend WS paths.
+
+Public `wss://` terminates TLS at Caddy; the configured local backend still uses
+plain HTTP/TCP. Only classic WebSocket upgrades are supported, not generic
+Upgrade, CONNECT, h2c, or HTTP/2 extended CONNECT. The daemon validates the
+handshake then relays opaque bytes with bounded buffers. It does not interpret,
+capture, or replay WebSocket frames, decompress extensions, or synthesize pings.
+The existing client request summary is emitted at connection close, not live for
+each frame. A backend non-101 response (including auth/Origin refusal) remains a
+normal streamed HTTP response; it is never retried to bypass rejection.
+
+Origin and visitor Authorization/Cookie are passed through. The existing
+`--host-header` modes change only Host, **not Origin**: configure the backend's
+allowed origins explicitly rather than assuming Host rewriting grants access.
+The tunnel owner's `/control` token does not authenticate visitors. Backend
+Origin/auth checks remain essential; this feature does not add visitor policy.
+
+An upgrade has a 30-second complete-response deadline and a 5-second visitor
+socket rendezvous deadline. After 101, errors only close the connection; no HTTP
+error body is injected. There is no new idle/max-age timer or half-close drain
+timeout. An uncooperative half-open peer can persist until session/process loss.
+Reconnect creates new connections, never resumes an existing WebSocket. Caddy
+reloads and deployments may disconnect upgraded connections; applications must
+handle reconnect themselves.
+
+The source tests exercise the daemon and real tunnel directly. Actual Caddy
+runtime behavior, public TLS/browser WSS, reload behavior, and combined rollout
+remain separate release gates; see the local fixture in
+[`../docs/RUNBOOK.md`](../docs/RUNBOOK.md#application-websocket-release-check).
+
+Handshake framing validation operates on Hyper's normalized HTTP headers:
+repeated identical `Content-Length: 0` lines can arrive as one zero-length
+field and are accepted. Nonzero, conflicting, malformed framing and transfer
+encoding are rejected; no HTTP handshake body is forwarded as WebSocket data.
+This is not a guarantee about singleton cardinality of the original wire bytes.

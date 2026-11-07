@@ -16,6 +16,7 @@ anyhow.workspace = true
 async-tungstenite = { workspace = true }
 axum.workspace = true
 http = { workspace = true }
+futures.workspace = true
 rcgen = "0.13"
 reqwest = { workspace = true, features = ["rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }

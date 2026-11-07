@@ -90,3 +90,54 @@ logs.
 
 Ctrl-C terminal C (backend), then B (`tnl http`, prints `✓ stopping tunnel`),
 then A (`tnld serve`).
+
+## Application WebSocket release check
+
+Run the automated direct-daemon/tunnel scenarios first:
+
+```bash
+cargo test --offline -p tnld --test data_plane_websocket
+cargo test --offline -p tnl-e2e --test websocket_roundtrip
+cargo test --offline -p tnl-e2e --test full_roundtrip_response_framing
+```
+
+These are **not** Caddy runtime validation. For an offline loopback-only check,
+run the daemon/client from the earlier steps with a local WebSocket echo backend
+instead of Python's HTTP-only server. With an already installed Caddy binary,
+use this separate plaintext fixture (no DNS module, ACME, or certificates):
+
+```caddyfile
+{
+	admin off
+	auto_https off
+}
+http://:8080 {
+	bind 127.0.0.1
+	reverse_proxy 127.0.0.1:7777 {
+		flush_interval -1
+	}
+}
+```
+
+Start Caddy with `caddy run --config /tmp/tnl-smoke/Caddyfile --adapter caddyfile`.
+Use a WebSocket client targeting `ws://127.0.0.1:8080/socket` with Host
+`demo.t.example.com` (or resolve that host to loopback). Require a valid 101,
+text/binary echo, ping/pong and close. Check backend Origin/auth refusal is still
+HTTP, not a retry or Origin rewrite. Send two ordinary requests over one
+keepalive socket and verify streaming/SSE is flushed while a WebSocket stays
+open. Also point a test owner's endpoint at this proxy to check `/control` still
+works. Stop only this local fixture afterward.
+
+Before rollout, adapt the reference `deploy/Caddyfile` using dummy environment
+values and the installed DNS module, and verify the wildcard block has no
+Connection-close rewrite. Adaptation alone is not a runtime check. The combined
+release campaign must still qualify the actual candidate binaries/Caddy,
+public TLS/browser WSS, reload/disconnect behavior, and rollback. This work does
+not promise uninterrupted WebSockets across tunnel reconnect or proxy reload.
+
+Release inspection qualification must also pass
+`cargo test --offline -p tnl --test forwarder_binary_status`: it tracks a
+pre-existing client observer limitation exposed by application WS tests
+(binary frame/body bytes can erase an otherwise valid status). Do not infer
+that a working 101 relay proves correct inspector status reporting. The observer
+follow-up must qualify both WS 101 and ordinary binary HTTP final status.

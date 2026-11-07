@@ -54,6 +54,221 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
 }
 
+const WEBSOCKET_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const WEBSOCKET_RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+struct WebSocketHandshake {
+    expected_accept: String,
+    offered_protocols: Vec<String>,
+}
+
+fn header_tokens(headers: &HeaderMap, name: &str) -> Result<Vec<String>, &'static str> {
+    let mut tokens = Vec::new();
+    for value in headers.get_all(name) {
+        let value = value
+            .to_str()
+            .map_err(|_| "Invalid handshake header encoding.")?;
+        for token in value.split(',') {
+            let token = token.trim_matches([' ', '\t']);
+            if token.is_empty() || !token.bytes().all(is_token_byte) {
+                return Err("Invalid handshake token list.");
+            }
+            tokens.push(token.to_string());
+        }
+    }
+    Ok(tokens)
+}
+
+const fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn singleton_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, &'static str> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next().ok_or("Missing WebSocket handshake header.")?;
+    if values.next().is_some() {
+        return Err("Duplicate WebSocket handshake header.");
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| "Invalid handshake header encoding.")?
+        .trim_matches([' ', '\t']);
+    if value.is_empty() {
+        return Err("Empty WebSocket handshake header.");
+    }
+    Ok(value)
+}
+
+fn validate_upgrade_headers(headers: &HeaderMap, response: bool) -> Result<(), &'static str> {
+    let connection = header_tokens(headers, "connection")?;
+    if !connection.iter().any(|s| s.eq_ignore_ascii_case("upgrade"))
+        || connection.iter().any(|s| s.eq_ignore_ascii_case("close"))
+    {
+        return Err("WebSocket requires Connection upgrade without close.");
+    }
+    for field in &connection {
+        let field = field.to_ascii_lowercase();
+        if matches!(
+            field.as_str(),
+            "host" | "origin" | "authorization" | "cookie"
+        ) || field.starts_with("sec-websocket-")
+            || (response && field == "set-cookie")
+        {
+            return Err("Connection nominates a protected handshake header.");
+        }
+    }
+    if !singleton_header(headers, "upgrade")?.eq_ignore_ascii_case("websocket") {
+        return Err("Only classic WebSocket upgrades are supported.");
+    }
+    Ok(())
+}
+
+fn classify_websocket_upgrade(req: &Request) -> Result<Option<WebSocketHandshake>, &'static str> {
+    let headers = req.headers();
+    // Do not tighten token handling on ordinary HTTP requests. Only Upgrade or
+    // a Connection upgrade token opts into this protocol-specific validation.
+    let attempted = headers.contains_key("upgrade")
+        || headers
+            .get_all("connection")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .any(|v| v.trim().eq_ignore_ascii_case("upgrade"));
+    if !attempted {
+        return Ok(None);
+    }
+    if req.method() != axum::http::Method::GET || req.version() != axum::http::Version::HTTP_11 {
+        return Err("WebSocket requires HTTP/1.1 GET.");
+    }
+    validate_upgrade_headers(headers, false)?;
+    let key = singleton_header(headers, "sec-websocket-key")?;
+    if singleton_header(headers, "sec-websocket-version")? != "13" {
+        return Err("WebSocket version must be 13.");
+    }
+    if headers.contains_key("transfer-encoding") {
+        return Err("WebSocket handshake cannot have a request body.");
+    }
+    // Hyper normalizes identical wire Content-Length values before Axum. We
+    // validate the normalized envelope, not original wire-field cardinality.
+    if headers.contains_key("content-length") {
+        let length = singleton_header(headers, "content-length")?;
+        if !length.bytes().all(|b| b.is_ascii_digit()) || length.parse::<u64>() != Ok(0) {
+            return Err("WebSocket handshake cannot have a request body.");
+        }
+    }
+    let offered_protocols = header_tokens(headers, "sec-websocket-protocol")?;
+    if req
+        .extensions()
+        .get::<hyper::upgrade::OnUpgrade>()
+        .is_none()
+    {
+        return Err("The visitor connection cannot be upgraded.");
+    }
+    Ok(Some(WebSocketHandshake {
+        expected_accept: async_tungstenite::tungstenite::handshake::derive_accept_key(
+            key.as_bytes(),
+        ),
+        offered_protocols,
+    }))
+}
+
+fn validate_websocket_response<B>(
+    resp: &Response<B>,
+    handshake: &WebSocketHandshake,
+) -> Result<(), &'static str> {
+    if resp.version() != axum::http::Version::HTTP_11 {
+        return Err("Backend upgrade requires HTTP/1.1.");
+    }
+    let headers = resp.headers();
+    validate_upgrade_headers(headers, true)?;
+    if singleton_header(headers, "sec-websocket-accept")? != handshake.expected_accept {
+        return Err("Backend WebSocket accept does not match.");
+    }
+    if headers.contains_key("content-length") || headers.contains_key("transfer-encoding") {
+        return Err("Backend upgrade cannot contain HTTP body framing.");
+    }
+    if headers.contains_key("sec-websocket-protocol") {
+        let selected = singleton_header(headers, "sec-websocket-protocol")?;
+        if !selected.bytes().all(is_token_byte)
+            || !handshake.offered_protocols.iter().any(|p| p == selected)
+        {
+            return Err("Backend selected an unoffered WebSocket protocol.");
+        }
+    }
+    Ok(())
+}
+
+fn set_websocket_upgrade_headers(headers: &mut HeaderMap) {
+    headers.insert("connection", HeaderValue::from_static("upgrade"));
+    headers.insert("upgrade", HeaderValue::from_static("websocket"));
+}
+
+/// Cancellation while negotiating must release this request's tunnel IO.
+/// Ordinary streamed responses explicitly detach; upgrades transfer IO to the
+/// relay only after the Hyper driver has completed its handoff.
+struct TunnelConnectionDriver(Option<tokio::task::JoinHandle<()>>);
+
+impl TunnelConnectionDriver {
+    async fn stop(mut self) {
+        if let Some(driver) = self.0.take() {
+            driver.abort();
+            let _ = driver.await;
+        }
+    }
+
+    fn detach(mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for TunnelConnectionDriver {
+    fn drop(&mut self) {
+        if let Some(driver) = &self.0 {
+            driver.abort();
+        }
+    }
+}
+
+/// This future owns both upgraded IOs for their entire lifetime. A later
+/// concurrency lease belongs in this ownership scope, not the returned 101 body.
+async fn relay_websocket(
+    downstream: hyper::upgrade::OnUpgrade,
+    upstream: hyper::upgrade::Upgraded,
+    req_id: ulid::Ulid,
+) {
+    let Ok(Ok(downstream)) = tokio::time::timeout(WEBSOCKET_RENDEZVOUS_TIMEOUT, downstream).await
+    else {
+        warn!(%req_id, "WebSocket visitor upgrade rendezvous failed");
+        return;
+    };
+    // TokioIo retains Hyper's read-ahead buffers on BOTH connections. The raw
+    // copy uses two fixed-size buffers with half-close propagation; no frames
+    // are decoded, queued, recorded, or rewritten here.
+    if let Err(error) =
+        tokio::io::copy_bidirectional(&mut TokioIo::new(downstream), &mut TokioIo::new(upstream))
+            .await
+    {
+        debug!(%req_id, %error, "WebSocket relay ended");
+    }
+}
+
 pub async fn handler(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -65,7 +280,11 @@ pub async fn handler(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn handle_request(state: AppState, req: Request, visitor: VisitorIdentity) -> Response<Body> {
+async fn handle_request(
+    state: AppState,
+    mut req: Request,
+    visitor: VisitorIdentity,
+) -> Response<Body> {
     use tnl_protocol::error_page::{parse_accept, Component, ErrorContext};
     use ulid::Ulid;
 
@@ -167,6 +386,44 @@ async fn handle_request(state: AppState, req: Request, visitor: VisitorIdentity)
             Some("1"),
         );
     };
+
+    // Validate before opening a substream. The downstream socket capability must
+    // stay here, never in the upstream request's extensions.
+    let upgrade_error = |status: StatusCode, component: Component, kind, reason| {
+        if status.is_server_error() {
+            warn!(target: "tnl::data_plane::server_failure",
+                component = component.as_header(), %kind, %req_id,
+                tunnel = %tunnel.subdomain, "served WebSocket handshake error");
+        }
+        error_response(
+            status,
+            component,
+            &ErrorContext {
+                component,
+                kind: Some(kind),
+                tunnel: Some(&tunnel.subdomain),
+                target: None,
+                reason,
+                hint: "Check the application WebSocket handshake.",
+                req_id,
+                version,
+            },
+            accept,
+            None,
+        )
+    };
+    let websocket = match classify_websocket_upgrade(&req) {
+        Ok(ws) => ws,
+        Err(reason) => {
+            return upgrade_error(
+                StatusCode::BAD_REQUEST,
+                Component::Registry,
+                "invalid-websocket-request",
+                reason,
+            );
+        }
+    };
+    let downstream_upgrade = websocket.as_ref().map(|_| hyper::upgrade::on(&mut req));
 
     // ---- Open a fresh substream to the client session -----------------------
     let mut session_guard = handle.session.lock().await;
@@ -272,29 +529,49 @@ async fn handle_request(state: AppState, req: Request, visitor: VisitorIdentity)
     // The connection future drives IO; it completes once the response body has
     // been consumed and the substream closes. It must run concurrently with the
     // response read below, so spawn it.
-    tokio::spawn(
+    let driver = TunnelConnectionDriver(Some(tokio::spawn(
         async move {
-            if let Err(e) = conn.await {
+            if let Err(e) = conn.with_upgrades().await {
                 debug!(error = %e, "tunnel client connection ended");
             }
         }
         .in_current_span(),
-    );
+    )));
 
     // ---- Forward the request ------------------------------------------------
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let (mut parts, body) = req.into_parts();
     strip_hop_by_hop(&mut parts.headers);
-    parts.headers.insert(
-        axum::http::header::CONNECTION,
-        HeaderValue::from_static("close"),
-    );
+    if websocket.is_some() {
+        set_websocket_upgrade_headers(&mut parts.headers);
+    } else {
+        parts.headers.insert(
+            axum::http::header::CONNECTION,
+            HeaderValue::from_static("close"),
+        );
+    }
     // hyper's HTTP/1 client speaks 1.1; the loopback hop from Caddy is 1.1.
     parts.version = axum::http::Version::HTTP_11;
     let upstream_req = Request::from_parts(parts, body);
 
-    let resp = match sender.send_request(upstream_req).await {
+    let deadline = tokio::time::Instant::now() + WEBSOCKET_HANDSHAKE_TIMEOUT;
+    let response = if websocket.is_some() {
+        let Ok(result) = tokio::time::timeout_at(deadline, sender.send_request(upstream_req)).await
+        else {
+            driver.stop().await;
+            return upgrade_error(
+                StatusCode::BAD_GATEWAY,
+                Component::Upstream,
+                "websocket-handshake-timeout",
+                "The backend did not complete the WebSocket response in time.",
+            );
+        };
+        result
+    } else {
+        sender.send_request(upstream_req).await
+    };
+    let mut resp = match response {
         Ok(r) => r,
         Err(e) => {
             let (kind, reason): (&str, String) = if e.is_incomplete_message() {
@@ -361,6 +638,55 @@ async fn handle_request(state: AppState, req: Request, visitor: VisitorIdentity)
         .requests
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+    if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+        let validation = websocket
+            .as_ref()
+            .ok_or("Unsolicited backend upgrade.")
+            .and_then(|handshake| validate_websocket_response(&resp, handshake));
+        if let Err(reason) = validation {
+            driver.stop().await;
+            return upgrade_error(
+                StatusCode::BAD_GATEWAY,
+                Component::Upstream,
+                "invalid-websocket-response",
+                reason,
+            );
+        }
+        let Ok(Ok(upstream)) =
+            tokio::time::timeout_at(deadline, hyper::upgrade::on(&mut resp)).await
+        else {
+            driver.stop().await;
+            return upgrade_error(
+                StatusCode::BAD_GATEWAY,
+                Component::Transport,
+                "websocket-upgrade-failed",
+                "Could not acquire the upgraded tunnel connection.",
+            );
+        };
+        // The HTTP driver has handed off the IO. Join it before transferring
+        // ownership to the one rendezvous/relay task. Cancellation before this
+        // point aborts only this per-request Hyper driver, never yamux's driver.
+        driver.stop().await;
+        let Some(downstream) = downstream_upgrade else {
+            return upgrade_error(
+                StatusCode::BAD_GATEWAY,
+                Component::Transport,
+                "websocket-upgrade-failed",
+                "The visitor connection cannot be upgraded.",
+            );
+        };
+        tokio::spawn(relay_websocket(downstream, upstream, req_id).in_current_span());
+        let (mut parts, _) = resp.into_parts();
+        strip_hop_by_hop(&mut parts.headers);
+        set_websocket_upgrade_headers(&mut parts.headers);
+        info!(host = %host_no_port, method = %method, path = %path,
+            status = 101, req_id = %req_id, "data-plane request");
+        return Response::from_parts(parts, Body::empty());
+    }
+
+    // A non-101 (including an application auth/Origin refusal) is ordinary
+    // streamed HTTP, not a retry. Its driver must outlive the response body.
+    driver.detach();
     let (mut resp_parts, incoming) = resp.into_parts();
     let status = resp_parts.status;
     strip_hop_by_hop(&mut resp_parts.headers);
