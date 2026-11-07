@@ -1,5 +1,6 @@
 //! Shared wire types and transport traits used by `tnl` and `tnld`.
 
+pub mod access;
 pub mod error_page;
 pub mod messages;
 pub mod request_metadata;

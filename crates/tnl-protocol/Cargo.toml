@@ -11,13 +11,16 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+argon2.workspace = true
 async-tungstenite.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
 http.workspace = true
+ipnet.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -25,6 +28,7 @@ tracing.workspace = true
 ulid = { workspace = true, features = ["serde"] }
 ws_stream_tungstenite.workspace = true
 yamux.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 async-tungstenite.workspace = true

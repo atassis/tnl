@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+argon2.workspace = true
 async-trait.workspace = true
 dialoguer.workspace = true
 http = "1"
@@ -22,6 +23,7 @@ bytes.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 futures.workspace = true
+libc.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -35,6 +37,7 @@ tracing-subscriber.workspace = true
 ulid = { workspace = true, features = ["serde"] }
 ws_stream_tungstenite.workspace = true
 yamux.workspace = true
+zeroize.workspace = true
 
 tnl-protocol = { path = "../tnl-protocol" }
 nu-ansi-term = "0.50"
