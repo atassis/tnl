@@ -86,6 +86,7 @@ async fn local_backend_down_returns_502_with_attribution() {
         public_url: "http://test".into(),
         hostname_root: "t.example.com".into(),
         tokens_file: tmp_tokens.path().to_string_lossy().into_owned(),
+        trusted_proxies: vec![],
         session_grace_sec: 30,
     };
     let tnld_handle = spawn_server(cfg).await.unwrap();
@@ -104,7 +105,10 @@ async fn local_backend_down_returns_502_with_attribution() {
     let _accept = tokio::spawn(tnl::client::run_accept_loop(
         session.session,
         tnl::target::Target::LocalhostPort(dead_port),
-        tnl::forwarder::ForwardCtx::new("smoke-down".into(), None, env!("CARGO_PKG_VERSION")),
+        tnl::forwarder::ForwardCtx {
+            data_stream_protocol: session.data_stream_protocol,
+            ..tnl::forwarder::ForwardCtx::new("smoke-down".into(), None, env!("CARGO_PKG_VERSION"))
+        },
     ));
     tokio::time::sleep(Duration::from_millis(100)).await;
 

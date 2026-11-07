@@ -12,6 +12,7 @@ async fn serve_refuses_to_start_with_empty_token_store() {
         public_url: "https://api.tnl.example.com".into(),
         hostname_root: "t.example.com".into(),
         tokens_file: tokens.path().display().to_string(),
+        trusted_proxies: vec![],
         session_grace_sec: 30,
     };
 

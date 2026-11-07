@@ -20,6 +20,10 @@ use std::time::{Duration, Instant};
 use bytes::BytesMut;
 use parking_lot::Mutex;
 use tnl_protocol::error_page::{parse_accept, Accept};
+use tnl_protocol::request_metadata::{
+    read_request_metadata, DataStreamProtocol, RequestMetadataV1, VisitorIdentity,
+    REQUEST_METADATA_TIMEOUT,
+};
 use tnl_protocol::Stream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -62,6 +66,7 @@ fn first_byte_timeout() -> Duration {
 /// Context carried through one forwarded substream.
 #[derive(Clone)]
 pub struct ForwardCtx {
+    pub data_stream_protocol: DataStreamProtocol,
     pub tunnel: String,
     pub log_tx: Option<mpsc::Sender<LogLine>>,
     /// Crate version string used in error bodies (`env!("CARGO_PKG_VERSION")`).
@@ -87,6 +92,7 @@ impl ForwardCtx {
         version: &'static str,
     ) -> Self {
         Self {
+            data_stream_protocol: DataStreamProtocol::RawHttp1,
             tunnel,
             log_tx,
             version,
@@ -101,6 +107,7 @@ impl ForwardCtx {
 impl std::fmt::Debug for ForwardCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ForwardCtx")
+            .field("data_stream_protocol", &self.data_stream_protocol)
             .field("tunnel", &self.tunnel)
             .field("log_tx", &self.log_tx.as_ref().map(|_| "<sender>"))
             .field("version", &self.version)
@@ -173,6 +180,19 @@ pub mod peek {
     }
 }
 
+/// Authoritative context decoded before HTTP probing. Legacy sessions have no
+/// metadata; request-ID propagation is intentionally owned by the next lane.
+#[derive(Debug)]
+struct RequestContext {
+    metadata: Option<RequestMetadataV1>,
+}
+
+impl RequestContext {
+    fn visitor(&self) -> Option<&VisitorIdentity> {
+        self.metadata.as_ref().map(|metadata| &metadata.visitor)
+    }
+}
+
 /// Single entry point for the forwarder. Returns `Ok(())` even when a synth
 /// response was written for a local-side failure; returns `Err` only for
 /// unrecoverable I/O on the substream itself.
@@ -184,6 +204,19 @@ pub async fn forward(
 ) -> anyhow::Result<()> {
     let req_id = ulid::Ulid::new();
     let started = Instant::now();
+
+    let request = RequestContext {
+        metadata: match ctx.data_stream_protocol {
+            DataStreamProtocol::RawHttp1 => None,
+            DataStreamProtocol::Http1MetadataV1 => Some(
+                tokio::time::timeout(
+                    REQUEST_METADATA_TIMEOUT,
+                    read_request_metadata(&mut substream),
+                )
+                .await??,
+            ),
+        },
+    };
 
     // Phase 1: peek request head.
     let probe = peek_request_head(
@@ -224,6 +257,9 @@ pub async fn forward(
                 &ctx,
                 LogLine {
                     req_id,
+                    visitor_ip: request.visitor().map(|v| v.visitor_ip),
+                    peer_ip: request.visitor().map(|v| v.peer_ip),
+                    visitor_ip_source: request.visitor().map(|v| v.source),
                     timestamp: std::time::SystemTime::now(),
                     method,
                     path,
@@ -260,6 +296,7 @@ pub async fn forward(
         return synth_phase2(
             &mut substream,
             &ctx,
+            &request,
             &target,
             resolved_addr,
             req_id,
@@ -280,6 +317,7 @@ pub async fn forward(
             return synth_phase2(
                 &mut substream,
                 &ctx,
+                &request,
                 &target,
                 resolved_addr,
                 req_id,
@@ -305,6 +343,7 @@ pub async fn forward(
             return synth_phase2(
                 &mut substream,
                 &ctx,
+                &request,
                 &target,
                 resolved_addr,
                 req_id,
@@ -324,6 +363,7 @@ pub async fn forward(
             return synth_phase2(
                 &mut substream,
                 &ctx,
+                &request,
                 &target,
                 resolved_addr,
                 req_id,
@@ -343,6 +383,7 @@ pub async fn forward(
             return synth_phase2(
                 &mut substream,
                 &ctx,
+                &request,
                 &target,
                 resolved_addr,
                 req_id,
@@ -444,6 +485,9 @@ pub async fn forward(
         &ctx,
         LogLine {
             req_id,
+            visitor_ip: request.visitor().map(|v| v.visitor_ip),
+            peer_ip: request.visitor().map(|v| v.peer_ip),
+            visitor_ip_source: request.visitor().map(|v| v.source),
             timestamp: std::time::SystemTime::now(),
             method,
             path,
@@ -463,6 +507,7 @@ pub async fn forward(
 async fn synth_phase2(
     substream: &mut Pin<Box<dyn Stream>>,
     ctx: &ForwardCtx,
+    request: &RequestContext,
     target: &Target,
     resolved_addr: std::net::SocketAddr,
     req_id: ulid::Ulid,
@@ -493,6 +538,9 @@ async fn synth_phase2(
         ctx,
         LogLine {
             req_id,
+            visitor_ip: request.visitor().map(|v| v.visitor_ip),
+            peer_ip: request.visitor().map(|v| v.peer_ip),
+            visitor_ip_source: request.visitor().map(|v| v.source),
             timestamp: std::time::SystemTime::now(),
             method,
             path,

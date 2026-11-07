@@ -84,6 +84,7 @@ async fn subdomain_is_released_after_client_disconnect() {
         tokens_file: tmp_tokens.path().to_string_lossy().into_owned(),
         // grace=0 means drop_session removes tunnels immediately — the
         // existing test asserts that after disconnect the subdomain is freed.
+        trusted_proxies: vec![],
         session_grace_sec: 0,
     };
     let handle = spawn_server(cfg).await.unwrap();

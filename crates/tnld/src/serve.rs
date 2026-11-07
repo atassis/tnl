@@ -17,10 +17,23 @@ use crate::auth::TokenStore;
 use crate::config::Config;
 use crate::registry::Registry;
 
-pub type SessionHandle = Arc<Mutex<Box<dyn tnl_protocol::transport::Session>>>;
+#[derive(Clone)]
+pub struct SessionHandle {
+    pub session: Arc<Mutex<Box<dyn tnl_protocol::transport::Session>>>,
+    pub data_stream_protocol: tnl_protocol::request_metadata::DataStreamProtocol,
+}
+
+impl std::fmt::Debug for SessionHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionHandle")
+            .field("data_stream_protocol", &self.data_stream_protocol)
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
+    pub trusted_proxies: Arc<crate::visitor_ip::TrustedProxies>,
     pub tokens: Arc<TokenStore>,
     pub registry: Arc<Registry>,
     pub session_handles: Arc<DashMap<String, SessionHandle>>,
@@ -69,6 +82,9 @@ pub async fn spawn_server(cfg: Config) -> anyhow::Result<ServerHandle> {
 /// Like [`spawn_server`] but also returns the [`AppState`] so tests can
 /// pre-populate the registry or session handles before sending requests.
 pub async fn spawn_server_with_state(cfg: Config) -> anyhow::Result<(ServerHandle, AppState)> {
+    let trusted_proxies = Arc::new(crate::visitor_ip::TrustedProxies::from_cidrs(
+        &cfg.trusted_proxies,
+    )?);
     let tokens = Arc::new(TokenStore::load(std::path::Path::new(&cfg.tokens_file))?);
     let registry = Arc::new(Registry::new(cfg.hostname_root.clone()));
     let pair_registry = Arc::new(crate::pair::PairRegistry::new());
@@ -97,6 +113,7 @@ pub async fn spawn_server_with_state(cfg: Config) -> anyhow::Result<(ServerHandl
     }
 
     let state = AppState {
+        trusted_proxies,
         tokens: tokens.clone(),
         registry: registry.clone(),
         session_handles: Arc::new(DashMap::new()),

@@ -31,6 +31,7 @@ async fn client_reattaches_within_grace_window() {
         public_url: "http://x".into(),
         hostname_root: "t.x".into(),
         tokens_file: tmp.path().to_string_lossy().into_owned(),
+        trusted_proxies: vec![],
         session_grace_sec: 30,
     };
     let (h, state) = spawn_server_with_state(cfg).await.unwrap();

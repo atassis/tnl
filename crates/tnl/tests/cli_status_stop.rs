@@ -23,6 +23,7 @@ async fn tnl_status_returns_empty_when_no_tunnels() {
         public_url: "http://x".into(),
         hostname_root: "t.x".into(),
         tokens_file: tmp.path().to_string_lossy().into_owned(),
+        trusted_proxies: vec![],
         session_grace_sec: 30,
     };
     let h = spawn_server(cfg).await.unwrap();
@@ -70,6 +71,7 @@ async fn tnl_stop_unknown_subdomain_errors() {
         public_url: "http://x".into(),
         hostname_root: "t.x".into(),
         tokens_file: tmp.path().to_string_lossy().into_owned(),
+        trusted_proxies: vec![],
         session_grace_sec: 30,
     };
     let h = spawn_server(cfg).await.unwrap();

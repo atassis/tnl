@@ -92,3 +92,25 @@ docs/             design spec, implementation history, runbook
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE), at your option.
+
+### Request-log visitor identity
+
+`tnl http` request rows append `ip=<address> source=<provenance>`. JSON request
+records include additive `visitor_ip`, `peer_ip`, and `visitor_ip_source` fields;
+`resolved_addr` continues to mean the **local backend**, not the visitor.
+Provenance is `peer`, `x_forwarded_for`, `peer_missing_forwarding`,
+`peer_invalid_forwarding`, or `peer_all_trusted`. Fallbacks report the actual
+socket peer rather than claiming a verified original visitor.
+
+New clients/daemons negotiate a bounded metadata prelude over the authenticated
+control WebSocket. Public HTTP headers cannot forge it. Legacy raw forwarding
+still works, with JSON identity fields explicitly `null` and text
+`ip=- source=unavailable`; the reconnect run warns once on stderr. No client-side
+inference from public forwarding headers is performed. Quiet suppresses request
+records; existing verbosity/color behavior is unchanged. Existing banner/shutdown
+output means the entire `--json` stdout stream is not promised to be pure NDJSON.
+
+Daemon proxy-header trust defaults to none. See [deployment guidance](deploy/README.md#visitor-ip-attribution-and-trusted-proxies)
+for explicit CIDRs, conservative XFF chain handling, privacy, and required real
+Caddy ingress validation. Existing lossy inspector-channel delivery and transport
+failure record omissions remain unchanged.

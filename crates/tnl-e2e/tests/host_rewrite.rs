@@ -78,6 +78,7 @@ async fn spawn_tnld() -> String {
         public_url: "http://test".into(),
         hostname_root: "t.example.com".into(),
         tokens_file,
+        trusted_proxies: vec![],
         session_grace_sec: 30,
     };
     spawn_server(cfg).await.unwrap().local_addr.to_string()
@@ -112,7 +113,10 @@ async fn auto_rewrite_after_block() {
             .await
             .unwrap();
     let _ctrl = session.control;
-    let ctx = ForwardCtx::new("auto".into(), None, env!("CARGO_PKG_VERSION"));
+    let ctx = ForwardCtx {
+        data_stream_protocol: session.data_stream_protocol,
+        ..ForwardCtx::new("auto".into(), None, env!("CARGO_PKG_VERSION"))
+    };
     let _accept = tokio::spawn(tnl::client::run_accept_loop(
         session.session,
         tnl::target::Target::LocalhostPort(backend),
@@ -145,6 +149,7 @@ async fn preserve_never_rewrites() {
             .unwrap();
     let _ctrl = session.control;
     let ctx = ForwardCtx {
+        data_stream_protocol: session.data_stream_protocol,
         tunnel: "keep".into(),
         log_tx: None,
         version: env!("CARGO_PKG_VERSION"),

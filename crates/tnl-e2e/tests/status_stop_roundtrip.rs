@@ -32,6 +32,7 @@ async fn status_and_stop_round_trip() {
         public_url: "http://x".into(),
         hostname_root: "t.x".into(),
         tokens_file: tmp.path().to_string_lossy().into_owned(),
+        trusted_proxies: vec![],
         session_grace_sec: 30,
     };
     let daemon_handle = spawn_server(cfg).await.unwrap();
@@ -46,7 +47,10 @@ async fn status_and_stop_round_trip() {
     let _accept = tokio::spawn(tnl::client::run_accept_loop(
         session.session,
         tnl::target::Target::LocalhostPort(backend_port),
-        tnl::forwarder::ForwardCtx::new("demo".into(), None, env!("CARGO_PKG_VERSION")),
+        tnl::forwarder::ForwardCtx {
+            data_stream_protocol: session.data_stream_protocol,
+            ..tnl::forwarder::ForwardCtx::new("demo".into(), None, env!("CARGO_PKG_VERSION"))
+        },
     ));
     tokio::time::sleep(Duration::from_millis(150)).await;
 

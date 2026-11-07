@@ -8,6 +8,9 @@ use tokio::sync::mpsc;
 #[derive(Debug, Clone, Serialize)]
 pub struct LogLine {
     pub req_id: ulid::Ulid,
+    pub visitor_ip: Option<std::net::IpAddr>,
+    pub peer_ip: Option<std::net::IpAddr>,
+    pub visitor_ip_source: Option<tnl_protocol::request_metadata::VisitorIpSource>,
     pub timestamp: SystemTime,
     pub method: String,
     pub path: String,
@@ -64,21 +67,23 @@ impl Inspector {
 
     pub async fn run(mut self) {
         while let Some(line) = self.rx.recv().await {
-            if matches!(self.verbosity, Verbosity::Quiet) {
-                continue;
-            }
-            match self.format {
-                Format::Json => {
-                    if let Ok(s) = serde_json::to_string(&line) {
-                        println!("{s}");
-                    }
-                }
-                Format::Text => self.print_text(&line),
+            if let Some(rendered) = self.format_line(&line) {
+                println!("{rendered}");
             }
         }
     }
 
-    fn print_text(&self, l: &LogLine) {
+    fn format_line(&self, line: &LogLine) -> Option<String> {
+        if matches!(self.verbosity, Verbosity::Quiet) {
+            return None;
+        }
+        match self.format {
+            Format::Json => serde_json::to_string(line).ok(),
+            Format::Text => Some(self.format_text(line)),
+        }
+    }
+
+    fn format_text(&self, l: &LogLine) -> String {
         let t = chrono_like_hms(l.timestamp);
         let status_str = l.status.map_or_else(|| "---".into(), |s| s.to_string());
         let status_col = if self.use_color {
@@ -93,16 +98,21 @@ impl Inspector {
             .failure_kind
             .as_ref()
             .map_or_else(|| fmt_bytes(l.bytes_out), std::clone::Clone::clone);
-        println!(
-            "{}  {:<6} {:<26}\u{2192} {:<21} {}  {:>6}ms  {}",
+        format!(
+            "{}  {:<6} {:<26}\u{2192} {:<21} {}  {:>6}ms  {}  ip={} source={}",
             t,
             l.method,
             truncate(&l.path, 26),
             target,
             status_col,
             l.duration_ms,
-            kind_or_bytes
-        );
+            kind_or_bytes,
+            l.visitor_ip.map_or_else(|| "-".into(), |ip| ip.to_string()),
+            l.visitor_ip_source.map_or(
+                "unavailable",
+                tnl_protocol::request_metadata::VisitorIpSource::as_str
+            )
+        )
     }
 }
 
@@ -175,9 +185,12 @@ mod tests {
     }
 
     #[test]
-    fn log_line_failure_has_kind() {
-        let l = LogLine {
+    fn visitor_identity_text_json_and_quiet() {
+        let mut l = LogLine {
             req_id: ulid::Ulid::nil(),
+            visitor_ip: None,
+            peer_ip: None,
+            visitor_ip_source: None,
             timestamp: SystemTime::UNIX_EPOCH,
             method: "GET".into(),
             path: "/".into(),
@@ -189,7 +202,24 @@ mod tests {
             bytes_out: 0,
             failure_kind: Some("connect-refused".into()),
         };
-        let inspector = Inspector::new(mpsc::channel(1).1, Verbosity::Default, Format::Text);
-        inspector.print_text(&l);
+        let mut inspector = Inspector::new(mpsc::channel(1).1, Verbosity::Default, Format::Text);
+        inspector.use_color = false;
+        let rendered = inspector.format_line(&l).unwrap();
+        assert!(rendered.ends_with("  ip=- source=unavailable"));
+        assert!(!rendered.contains('\u{1b}'));
+        l.visitor_ip = Some("2001:db8:1234:5678:abcd:ef01:2345:6789".parse().unwrap());
+        l.peer_ip = Some("::1".parse().unwrap());
+        l.visitor_ip_source = Some(tnl_protocol::request_metadata::VisitorIpSource::XForwardedFor);
+        let rendered = inspector.format_line(&l).unwrap();
+        assert!(rendered
+            .ends_with("  ip=2001:db8:1234:5678:abcd:ef01:2345:6789 source=x_forwarded_for"));
+        let json_inspector = Inspector::new(mpsc::channel(1).1, Verbosity::Verbose, Format::Json);
+        let json: serde_json::Value =
+            serde_json::from_str(&json_inspector.format_line(&l).unwrap()).unwrap();
+        assert_eq!(json["visitor_ip"], "2001:db8:1234:5678:abcd:ef01:2345:6789");
+        assert_eq!(json["peer_ip"], "::1");
+        assert_eq!(json["visitor_ip_source"], "x_forwarded_for");
+        let quiet = Inspector::new(mpsc::channel(1).1, Verbosity::Quiet, Format::Json);
+        assert!(quiet.format_line(&l).is_none());
     }
 }

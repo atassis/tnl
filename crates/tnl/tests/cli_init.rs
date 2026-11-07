@@ -24,6 +24,7 @@ async fn init_with_invite_url_saves_config() {
         public_url: String::new(),
         hostname_root: "t.x".into(),
         tokens_file: tmp.path().to_string_lossy().into_owned(),
+        trusted_proxies: vec![],
         session_grace_sec: 30,
     };
     let h = spawn_server(cfg).await.unwrap();
@@ -87,6 +88,7 @@ async fn init_with_endpoint_token_saves_config() {
         public_url: "http://x".into(),
         hostname_root: "t.x".into(),
         tokens_file: tmp.path().to_string_lossy().into_owned(),
+        trusted_proxies: vec![],
         session_grace_sec: 30,
     };
     let h = spawn_server(cfg).await.unwrap();

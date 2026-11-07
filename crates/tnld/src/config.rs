@@ -5,6 +5,9 @@ use serde::Deserialize;
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
+    /// Explicit proxy CIDRs; empty means public forwarding headers are untrusted.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
     pub listen: String,
     pub public_url: String,
     pub hostname_root: String,
@@ -81,6 +84,23 @@ impl Config {
                 .parse()
                 .context("TNLD_SESSION_GRACE_SEC must be a non-negative integer")?;
         }
+        if let Some(v) = env("TNLD_TRUSTED_PROXIES") {
+            note_overlap(
+                &mut warnings,
+                &table,
+                "trusted_proxies",
+                "TNLD_TRUSTED_PROXIES",
+                &where_,
+            );
+            cfg.trusted_proxies = if v.trim_ascii().is_empty() {
+                Vec::new()
+            } else {
+                v.split(',')
+                    .map(|entry| entry.trim_ascii().to_string())
+                    .collect()
+            };
+        }
+        crate::visitor_ip::TrustedProxies::from_cidrs(&cfg.trusted_proxies)?;
         Ok((cfg, warnings))
     }
 
@@ -129,6 +149,47 @@ tokens_file   = "/etc/tnld/tokens.toml"
         )
         .unwrap();
         tmp
+    }
+
+    #[test]
+    fn visitor_ip_config_rejects_invalid_trust() {
+        let tmp = write_cfg();
+        for value in [
+            "127.0.0.1",
+            "192.0.2.7/24",
+            "localhost/32",
+            "::1/129",
+            "127.0.0.1/32,,::1/128",
+        ] {
+            let env = |k: &str| (k == "TNLD_TRUSTED_PROXIES").then(|| value.to_string());
+            assert!(
+                Config::load_with_env(tmp.path(), &env).is_err(),
+                "accepted {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn visitor_ip_config_defaults_and_env_replacement() {
+        let tmp = write_cfg();
+        let (cfg, _) = Config::load_with_env(tmp.path(), &|_| None).unwrap();
+        assert!(cfg.trusted_proxies.is_empty());
+        writeln!(tmp.as_file(), "trusted_proxies = [\"127.0.0.1/32\"]").unwrap();
+        let (cfg, _) = Config::load_with_env(tmp.path(), &|_| None).unwrap();
+        assert_eq!(cfg.trusted_proxies, ["127.0.0.1/32"]);
+        for value in [" 192.0.2.0/24, ::1/128 ", " "] {
+            let env = |key: &str| (key == "TNLD_TRUSTED_PROXIES").then(|| value.to_string());
+            let (cfg, warnings) = Config::load_with_env(tmp.path(), &env).unwrap();
+            assert!(warnings.iter().any(|w| w.contains("TNLD_TRUSTED_PROXIES")));
+            assert_eq!(
+                cfg.trusted_proxies,
+                if value.trim().is_empty() {
+                    vec![]
+                } else {
+                    vec!["192.0.2.0/24", "::1/128"]
+                }
+            );
+        }
     }
 
     #[test]

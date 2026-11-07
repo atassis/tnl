@@ -41,6 +41,7 @@ impl std::fmt::Debug for Hooks {
 /// cancels the outer `tokio::select!`.
 ///
 /// Prints a one-time banner on the first successful connect.
+#[allow(clippy::too_many_lines)]
 pub async fn run(
     endpoint: &str,
     token: &str,
@@ -52,6 +53,7 @@ pub async fn run(
     let mut backoff_ms: u64 = 1_000;
     let mut last_tunnel: Option<(ulid::Ulid, String)> = None;
     let mut printed_banner = false;
+    let mut warned_raw_metadata = false;
     // Per-tunnel host-rewrite state, persisted across reconnects so a learned
     // dev-server block survives a reattach.
     let rewrite_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -123,10 +125,18 @@ pub async fn run(
             println!("└────────────────────────────────────────────────");
         }
 
+        if session.data_stream_protocol
+            == tnl_protocol::request_metadata::DataStreamProtocol::RawHttp1
+            && !warned_raw_metadata
+        {
+            warned_raw_metadata = true;
+            eprintln!("warning: daemon did not negotiate request metadata; authoritative visitor identity is unavailable");
+        }
         let cancel = hooks.cancel_first_session.take();
         // Keep the control stream alive for the duration of the session.
         let _ctrl_keep = session.control;
         let ctx = crate::forwarder::ForwardCtx {
+            data_stream_protocol: session.data_stream_protocol,
             tunnel: session.subdomain.clone(),
             log_tx: hooks.log_tx.clone(),
             version: env!("CARGO_PKG_VERSION"),

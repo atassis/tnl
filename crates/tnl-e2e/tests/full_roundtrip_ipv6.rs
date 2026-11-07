@@ -61,6 +61,7 @@ async fn end_to_end_http_request_reaches_ipv6_local_backend() {
         public_url: "http://test".into(),
         hostname_root: "t.example.com".into(),
         tokens_file: tmp_tokens.path().to_string_lossy().into_owned(),
+        trusted_proxies: vec![],
         session_grace_sec: 30,
     };
     let tnld_handle = spawn_server(cfg).await.unwrap();
@@ -79,7 +80,10 @@ async fn end_to_end_http_request_reaches_ipv6_local_backend() {
     let _accept = tokio::spawn(tnl::client::run_accept_loop(
         session_box,
         tnl::target::Target::LocalhostPort(backend_port),
-        tnl::forwarder::ForwardCtx::new("smoke-v6".into(), None, env!("CARGO_PKG_VERSION")),
+        tnl::forwarder::ForwardCtx {
+            data_stream_protocol: session.data_stream_protocol,
+            ..tnl::forwarder::ForwardCtx::new("smoke-v6".into(), None, env!("CARGO_PKG_VERSION"))
+        },
     ));
 
     // give the daemon a moment to register

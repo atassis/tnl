@@ -41,6 +41,7 @@ async fn data_plane_request_emits_tracing_output() {
     let sink = VecWriter::default();
     let _ = tracing_subscriber::fmt()
         .with_env_filter("tnld=debug")
+        .with_ansi(false)
         .with_writer(sink.clone())
         .try_init();
 
@@ -58,6 +59,7 @@ async fn data_plane_request_emits_tracing_output() {
         public_url: "http://test".into(),
         hostname_root: "t.example.com".into(),
         tokens_file: tmp.path().to_string_lossy().into_owned(),
+        trusted_proxies: vec![],
         session_grace_sec: 30,
     };
     let handle = spawn_server(cfg).await.unwrap();
@@ -75,6 +77,12 @@ async fn data_plane_request_emits_tracing_output() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let captured = String::from_utf8_lossy(&sink.0.lock().unwrap()).to_string();
+    assert!(captured.contains("visitor_ip=127.0.0.1"), "{captured}");
+    assert!(captured.contains("peer_ip=127.0.0.1"), "{captured}");
+    assert!(
+        captured.contains("visitor_ip_source=\"peer\""),
+        "{captured}"
+    );
     assert!(
         captured.contains("no tunnel registered") || captured.contains("data-plane request"),
         "expected data-plane tracing output, got: {captured:?}"
