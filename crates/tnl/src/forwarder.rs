@@ -318,7 +318,7 @@ pub async fn forward(
         .inspection
         .as_ref()
         .and_then(|(inspection, generation)| {
-            inspection.admit(*generation, request.metadata.as_ref())
+            inspection.admit_backend(*generation, request.metadata.as_ref(), resolved_addr)
         })
         .map(|mut capture| {
             capture.request(&head_bytes);

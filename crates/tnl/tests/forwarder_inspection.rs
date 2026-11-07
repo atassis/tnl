@@ -281,6 +281,7 @@ async fn actual_forwarder_consumer_records_exact_decoded_leftover_prefix_and_pum
     let records = history.search("");
     let seen = seen.lock().unwrap();
     assert_eq!(seen.context.unwrap().capture_id, records[0].capture_id);
+    assert_eq!(seen.context.unwrap().backend, Some(addr));
     assert_eq!(seen.request, entity);
     assert_eq!(seen.response, response_entity);
     assert_eq!(seen.statuses, [103, 200]);

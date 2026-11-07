@@ -72,6 +72,14 @@ enum Cmd {
         very_verbose: bool,
         #[arg(long)]
         json: bool,
+        /// Enable private, authenticated loopback browser inspection.
+        #[arg(long)]
+        inspect: bool,
+        #[arg(long, requires = "inspect")]
+        inspect_port: Option<u16>,
+        /// Sanitized body preview policy; off by default. Never raw replay consent.
+        #[arg(long, value_enum, requires = "inspect")]
+        inspect_bodies: Option<tnl::inspection::PreviewMode>,
     },
     /// List active tunnels for the configured bearer.
     Status {
@@ -199,6 +207,9 @@ fn real_main() -> anyhow::Result<()> {
             verbose,
             very_verbose,
             json,
+            inspect,
+            inspect_port,
+            inspect_bodies,
         } => {
             let verbosity = if quiet {
                 tnl::inspector::Verbosity::Quiet
@@ -215,12 +226,16 @@ fn real_main() -> anyhow::Result<()> {
                 tnl::inspector::Format::Text
             };
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(tnl::commands::http::run(
+            rt.block_on(tnl::commands::http::run_with_inspection(
                 target,
                 subdomain.as_deref(),
                 tnl::host_header::HostHeader::parse(host_header.as_deref()),
                 verbosity,
                 format,
+                inspect.then_some(tnl::commands::http::InspectionOptions {
+                    port: inspect_port.unwrap_or(0),
+                    bodies: inspect_bodies.unwrap_or(tnl::inspection::PreviewMode::Off),
+                }),
             ))
         }
         Cmd::Status { all, json } => {
