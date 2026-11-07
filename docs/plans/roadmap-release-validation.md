@@ -537,3 +537,35 @@ Final follow-up logs: `target/packaged-qualification/actual-binaries.log`,
 debug executable digests remain those recorded above. All prior packaging,
 public-TLS, final-schema/review and single-combined-campaign gaps remain open;
 independent parent recheck is required before commit.
+
+
+## 14. Final beta.5 artifact and public-ingress qualification
+
+The parent completed the single combined rollout after explicit approval of
+the maintenance interruption and rollback scope. Released source is 45e0b7a;
+all source lanes and independent reviews are composed. The frozen manifest is
+release-validation/target/release-candidate/45e0b7a/manifest.json (SHA256
+`d19c9551767d20b510e9add30e33589db6729f18bc9319b93d57875d6d61716b`).
+The actual beta.5 image, native binaries, extracted musl daemon, Caddy and full
+workspace were qualified together: 439 reported passed with all ignored tests
+included, plus six image-daemon executable harness cases and eleven actual
+image runtime checks. Two obsolete beta.1 packaging tests internally SKIP;
+actual beta.5 runtime checks, not those legacy tests, establish package proof.
+
+The image now installed on ru-mos-gw has digest
+`sha256:d7d0b367b2084d4d08cb0c8b6291247b665f5e0ab01a1be5b6c0225780792b16`.
+Public valid-root HTTPS/WSS positive protected access and application WebSocket
+acceptance passed, as did public visitor/IP forgery refusal, canonical IDs,
+Basic consumption/refusal, rate/concurrency/WS lifetime checks, and isolated
+Brave privacy/confirmed replay using the frozen release client. No browser
+security overrides, TLS verification exceptions or system CA changes were used.
+The separately approved local installed client is byte-identical to that
+candidate. Public test tunnels were cleaned up.
+
+The supplementary stop-as-network-loss fixture was invalid and timed out; its
+failure is preserved and not counted as automatic reconnect proof. Controlled
+reattach/recreation is covered by the enabled local TLS/e2e campaign. No
+production network-chaos or actual rollback rehearsal is claimed. The pinned
+old-image rollback and three-file backups remain available; other Caddy files
+were hash-verified unchanged. No Git publication was performed. Detailed
+chronology and remaining qualifications are in roadmap-execution.md.

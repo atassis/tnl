@@ -1,5 +1,10 @@
 # T4 inspection schema / failure checkpoint
 
+**Final parent status:** reviewed, integrated, qualified on frozen beta.5
+artifacts and accepted through deployed public ingress on 2026-11-07. See
+`roadmap-execution.md` final delivery checkpoint. The narrative below preserves
+the earlier bounded checkpoint and original failure evidence.
+
 This follows the reviewed browser/replay baseline `42169c8`. It supersedes the
 older phase2 document's *unimplemented display schema* gap, not its historical
 validation chronology. It is a bounded implementation checkpoint, **not whole-T4

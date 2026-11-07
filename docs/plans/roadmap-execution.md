@@ -1,5 +1,9 @@
 # tnl roadmap execution tracker
 
+**Current state (2026-11-07): beta.5 deployed and accepted; local main and
+installed client updated. See the final delivery checkpoint below. Earlier
+blocked/pending statements are retained as historical evidence.**
+
 ## Approved direction
 
 User approved implementation via separate high-reasoning subagents/worktrees, eventual integration into main, and one combined deployment/acceptance campaign. Existing root checkout AGENTS.md edit is not ours and must remain untouched. Baseline: 43f2bc0. Local main is 20 commits behind this baseline; reconcile only during reviewed local integration. No push or publication authorized.
@@ -166,3 +170,60 @@ packaged/public-TLS campaign, main integration, publication or deployment has
 been completed. Root checkout's unrelated AGENTS.md modification is preserved.
 Earlier worker checkpoint statements about UU entries and pending browser
 acceptance are historical and superseded by this parent qualification.
+
+
+## Parent final beta.5 delivery
+
+Released source: `45e0b7a213b81421b94cc4d0f7c179375bfb1030`. Reviewed schema and
+all-feature composition are integrated; local main was fast-forwarded to this
+candidate before deployment. Later changes to this tracker are documentation
+only, not a replacement candidate. No push, remote Git publication, or tag was
+performed. Root prep-public's unrelated AGENTS.md change remains untouched.
+
+- Frozen local release workspace campaign explicitly includes every ignored
+  case: 439 reported passed, zero failed, zero ignored. Two legacy tests
+  internally SKIP the absent beta.1 image; they are not packaging proof. Actual
+  beta.5 image qualification provides eleven separate runtime checks, including
+  UID100, real serve, read-only mounted config/token store, healthcheck and
+  released-CLI control/data/shared-ID traffic. Extracted image daemon executable
+  harness: six passed. Artifact hashes remain unchanged.
+- Native client SHA256:
+  `23d5c1cf73f2c0894b1f58c6820f511f0b30fa7a719d2969671273418c88b6e1`.
+  Image daemon SHA256:
+  `6e88c85fce141b6e4fe41bc40cb6046cc388e6bc80b4157b298a203f3e4da300`.
+- After explicit maintenance-window approval, ru-mos-gw now runs
+  `tnld@sha256:d7d0b367b2084d4d08cb0c8b6291247b665f5e0ab01a1be5b6c0225780792b16`.
+  Daemon version, binary hash, OCI source revision and healthy state were
+  independently checked after public acceptance. Its only trusted proxy is
+  127.0.0.1/32. The tnl wildcard snippet no longer forces Connection close.
+- Shared Caddy live configuration matched disk before mutation and after the
+  validated graceful reload. Other snippets/root Caddyfile hashes did not
+  change. Caddy and gost remained running without restart.
+- Public production-root-verified HTTPS/WSS campaign passed: public-default
+  application Authorization preserved; forged visitor/request IDs replaced;
+  combined Basic/exact-IP/rate/concurrency policy positively acknowledged;
+  missing/wrong Basic denied without backend delivery; Basic consumed before
+  forwarding; denied IP cannot spoof allowlisting; exact burst and Retry-After;
+  binary WebSocket/read-ahead/subprotocol/Origin/shared IDs; WS holds the
+  concurrency lease until closure and releases it afterwards.
+- Isolated Brave acceptance using the frozen release client and actual public
+  ingress passed canonical backend/public/capture ID correlation, redaction,
+  fragment removal, no HTML execution, explicit confirmation, exact local
+  replay, duplicate-click/polling single execution and linked safe outcome.
+- A supplementary public probe incorrectly used `tnl stop` as physical control
+  loss and timed out waiting for automatic recreation. The failed artifact is
+  retained and is NOT a passing reconnect test: close_by_subdomain removes
+  routing registry entries but does not close the still-live control session.
+  Automatic reattach/recreation remains qualified by the enabled local trusted
+  TLS/shared-loop and eight recreation tests, not production network-chaos.
+- After separate approval, ~/.cargo/bin/tnl was atomically replaced with the
+  exact frozen native client. The previous beta.4 binary is retained privately.
+  Installed `tnl version`, artifact hash and `tnl doctor` pass; config/token and
+  already-running processes were not changed. Synthetic acceptance tunnels
+  were cleaned up.
+
+Rollback backups and a syntax/compose-validated pinned-old-image rollback
+script remain at `/opt/tnld/releases/beta5-45e0b7a-20261107T194526Z`. Rollback was
+not needed and no live rollback rehearsal is claimed. Full frozen manifest,
+logs, artifact hashes, public fixtures/results and old client backup are under
+release-validation/target/release-candidate/45e0b7a (private ignored artifacts).
