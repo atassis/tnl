@@ -13,7 +13,7 @@ cargo build --release --workspace
 
 Rust 1.94 is pinned via `rust-toolchain.toml`; rustup installs it on first run.
 You'll get `./target/release/tnld` (daemon) and `./target/release/tnl` (client).
-Both `tnld --version` / `tnl version` print `0.1.0-beta.1`.
+Both `tnld --version` / `tnl version` print `0.1.0-beta.5`.
 
 ## 2. Create config + a token
 

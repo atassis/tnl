@@ -14,8 +14,13 @@ it works from anywhere behind NAT, with no mesh required.
 
 ## Status
 
-**v0.1.0-beta.1** — 170 tests green, `clippy` clean under `pedantic` + `nursery`,
-`unsafe_code = "forbid"`. The beta feature set ships and is tested: reverse-tunneling
+**v0.1.0-beta.5** adds classic HTTP/1.1 application WebSockets, shared request
+IDs, trusted-proxy visitor attribution, opt-in authenticated browser history and
+confirmed replay, and optional per-tunnel visitor access controls. Inspection
+and raw replay retention are off by default; normal tunnels remain public.
+The workspace forbids unsafe code and uses pedantic/nursery Clippy checks.
+
+The beta feature set also includes reverse-tunneling
 end-to-end, a live request inspector in the CLI, structured error attribution
 (`X-Tnl-Component` + content-negotiated HTML/JSON/plain error pages, IPv6 backends),
 argon2id token administration (`tnld token add/list/revoke`), client pairing, a

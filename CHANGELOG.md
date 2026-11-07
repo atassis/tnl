@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.0-beta.5] - 2026-11-07
+
+### Added
+- Explicit trusted-proxy visitor attribution and negotiated request metadata.
+- Daemon-authoritative request IDs shared by backend requests, public responses,
+  client summaries and inspection records, including WebSocket handshakes.
+- Classic HTTP/1.1 application WebSocket upgrades and bidirectional relay.
+- Opt-in authenticated loopback browser history with bounded memory retention,
+  redacted request details and separately enabled JSON previews.
+- Explicit raw-retention consent and confirmed replay to the original loopback
+  backend, without request editing, redirects or automatic retries.
+- Optional per-tunnel Basic authentication, IP allowlists, rate and concurrency
+  limits with exact policy acknowledgment and protected reconnect/recreation.
+
+### Fixed
+- Continue uploads while probing and forwarding early backend responses.
+- Preserve response status across binary payloads and informational heads.
+- Wake pending yamux stream readers/writers during graceful session close while
+  preserving buffered data, using a minimal licensed dependency patch.
+- Bound inspection allocations before admission and distinguish observed bytes,
+  successful local writes, synthetic responses and transport failures.
+
 ## [0.1.0-beta.4] - 2026-07-19
 
 ### Added

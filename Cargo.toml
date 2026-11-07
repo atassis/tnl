@@ -4,7 +4,7 @@ members = ["crates/tnl-protocol", "crates/tnld", "crates/tnl", "crates/tnl-e2e"]
 exclude = ["vendor/yamux"]
 
 [workspace.package]
-version = "0.1.0-beta.4"
+version = "0.1.0-beta.5"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["atassis <atassikay38@gmail.com>"]
