@@ -6,6 +6,7 @@ pub struct CaptureContext {
     pub capture_id: CaptureId,
     pub generation: TunnelGeneration,
     pub request_id: Option<ulid::Ulid>,
+    pub backend: Option<std::net::SocketAddr>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
@@ -643,12 +644,10 @@ impl Capture {
                 self.request.eof(&mut emit);
                 self.response.eof(&mut emit);
             } else {
-                if !self.request.complete {
-                    self.request.stop("cancelled", &mut emit);
-                }
-                if !self.response.complete {
-                    self.response.stop("cancelled", &mut emit);
-                }
+                // Framed completion is provisional, including on cancellation
+                // after both MessageEnd callbacks. Finished alone is not success.
+                self.request.stop("cancelled", &mut emit);
+                self.response.stop("cancelled", &mut emit);
             }
         }
         if let Some(c) = consumer {

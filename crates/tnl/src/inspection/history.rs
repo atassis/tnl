@@ -101,6 +101,7 @@ impl Inspection {
             capture_id: CaptureId(ulid::Ulid::new()),
             generation,
             request_id: metadata.map(|m| m.request_id),
+            backend: None,
         };
         let record = InspectionRecord {
             capture_id: context.capture_id,
