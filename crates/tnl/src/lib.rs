@@ -1,3 +1,4 @@
+pub mod access;
 pub mod block_detect;
 pub mod client;
 pub mod commands;

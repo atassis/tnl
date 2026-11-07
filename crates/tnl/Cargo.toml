@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+argon2.workspace = true
 async-trait.workspace = true
 dialoguer.workspace = true
 http = "1"
@@ -23,12 +24,14 @@ bytes.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 futures.workspace = true
+libc.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 async-tungstenite.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tokio-util.workspace = true
 toml.workspace = true
 tracing.workspace = true
@@ -36,6 +39,7 @@ tracing-subscriber.workspace = true
 ulid = { workspace = true, features = ["serde"] }
 ws_stream_tungstenite.workspace = true
 yamux.workspace = true
+zeroize.workspace = true
 
 tnl-protocol = { path = "../tnl-protocol" }
 nu-ansi-term = "0.50"
@@ -43,6 +47,8 @@ parking_lot = "0.12"
 url = "2"
 
 [dev-dependencies]
+rcgen.workspace = true
+rustls.workspace = true
 tempfile = "3"
 tnld = { path = "../tnld" }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

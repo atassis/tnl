@@ -22,6 +22,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 tempfile = "3"
 async-trait.workspace = true
 axum.workspace = true
+base64.workspace = true
 bytes.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
@@ -30,6 +31,7 @@ dialoguer.workspace = true
 futures.workspace = true
 governor = "0.7"
 http.workspace = true
+http-body.workspace = true
 httparse.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
@@ -48,6 +50,7 @@ tracing-subscriber.workspace = true
 ulid = { workspace = true, features = ["serde"] }
 ws_stream_tungstenite.workspace = true
 yamux.workspace = true
+zeroize.workspace = true
 reqwest = { workspace = true, features = ["rustls"] }
 
 tnl-protocol = { path = "../tnl-protocol" }

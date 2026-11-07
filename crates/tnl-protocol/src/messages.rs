@@ -13,6 +13,9 @@ pub enum ControlMsg {
     CreateTunnel(CreateTunnelReq),
     ReattachTunnel(ReattachReq),
     TunnelCreated(TunnelCreatedResp),
+    CreateProtectedTunnel(CreateProtectedTunnelReq),
+    ReattachProtectedTunnel(ReattachProtectedTunnelReq),
+    ProtectedTunnelCreated(ProtectedTunnelCreatedResp),
     Heartbeat,
     HeartbeatAck,
     Close,
@@ -36,6 +39,49 @@ pub struct TunnelCreatedResp {
     pub subdomain: String,
 }
 
+/// Protected lifecycle policy delivery only. Metadata remains negotiated on
+/// the authenticated WebSocket upgrade, never in this payload.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CreateProtectedTunnelReq {
+    #[serde(default)]
+    pub subdomain: Option<String>,
+    pub access: crate::access::VisitorAccessPolicyV1,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReattachProtectedTunnelReq {
+    pub tunnel_id: ulid::Ulid,
+    pub subdomain: String,
+    #[serde(deserialize_with = "deserialize_fingerprint")]
+    pub policy_fingerprint: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProtectedTunnelCreatedResp {
+    pub tunnel_id: ulid::Ulid,
+    pub hostname: String,
+    pub subdomain: String,
+    #[serde(deserialize_with = "deserialize_fingerprint")]
+    pub policy_fingerprint: String,
+}
+
+fn deserialize_fingerprint<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(serde::de::Error::custom("invalid policy fingerprint"));
+    }
+    Ok(value)
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum ErrorCode {
     InvalidSubdomain,
@@ -43,6 +89,10 @@ pub enum ErrorCode {
     TunnelNotFound,
     TunnelLost,
     Unauthorized,
+    InvalidAccessPolicy,
+    AccessPolicyMismatch,
+    UnsupportedProtocol,
+    AccessUnavailable,
     Internal,
 }
 

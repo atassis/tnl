@@ -1841,6 +1841,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2105,6 +2116,7 @@ name = "tnl"
 version = "0.1.0-beta.4"
 dependencies = [
  "anyhow",
+ "argon2",
  "async-trait",
  "async-tungstenite",
  "bytes",
@@ -2114,9 +2126,12 @@ dependencies = [
  "futures",
  "http",
  "httparse",
+ "libc",
  "nu-ansi-term",
  "parking_lot",
+ "rcgen",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
@@ -2124,6 +2139,7 @@ dependencies = [
  "tnl-protocol",
  "tnld",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "toml",
  "tracing",
@@ -2132,6 +2148,7 @@ dependencies = [
  "url",
  "ws_stream_tungstenite",
  "yamux",
+ "zeroize",
 ]
 
 [[package]]
@@ -2162,13 +2179,16 @@ name = "tnl-protocol"
 version = "0.1.0-beta.4"
 dependencies = [
  "anyhow",
+ "argon2",
  "async-trait",
  "async-tungstenite",
  "bytes",
  "futures",
  "http",
+ "ipnet",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -2176,6 +2196,7 @@ dependencies = [
  "ulid",
  "ws_stream_tungstenite",
  "yamux",
+ "zeroize",
 ]
 
 [[package]]
@@ -2188,6 +2209,7 @@ dependencies = [
  "async-trait",
  "async-tungstenite",
  "axum",
+ "base64",
  "bytes",
  "clap",
  "clap_complete",
@@ -2196,6 +2218,7 @@ dependencies = [
  "futures",
  "governor",
  "http",
+ "http-body",
  "httparse",
  "hyper",
  "hyper-util",
@@ -2219,6 +2242,7 @@ dependencies = [
  "ulid",
  "ws_stream_tungstenite",
  "yamux",
+ "zeroize",
 ]
 
 [[package]]

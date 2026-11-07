@@ -108,10 +108,17 @@ async fn control_loop(
         if n > 1024 * 1024 {
             return Err(anyhow::anyhow!("control message too large: {n}"));
         }
-        let mut payload = vec![0u8; n];
+        let mut payload = zeroize::Zeroizing::new(vec![0u8; n]);
         stream.read_exact(&mut payload).await?;
-        let msg: ControlMsg = serde_json::from_slice(&payload).context("decode ControlMsg")?;
-        debug!(?msg, "control msg in");
+        let msg: ControlMsg = serde_json::from_slice(&payload).map_err(|error| {
+            anyhow::anyhow!(
+                "invalid control message ({:?}, line {}, column {})",
+                error.classify(),
+                error.line(),
+                error.column()
+            )
+        })?;
+        debug!("control message decoded");
 
         let response = match msg {
             ControlMsg::CreateTunnel(req) => {
@@ -183,11 +190,19 @@ async fn control_loop(
                 }
             }
 
+            // Fail closed until immutable registry binding and HTTP/WS admission
+            // are integrated together. Never publish a temporarily public tunnel.
+            ControlMsg::CreateProtectedTunnel(_) | ControlMsg::ReattachProtectedTunnel(_) => {
+                ControlMsg::Error {
+                    code: ErrorCode::AccessUnavailable,
+                    message: "protected tunnels are not available".into(),
+                }
+            }
             ControlMsg::Heartbeat => ControlMsg::HeartbeatAck,
             ControlMsg::Close => return Ok(()),
-            other => ControlMsg::Error {
+            _ => ControlMsg::Error {
                 code: ErrorCode::Internal,
-                message: format!("unexpected message: {other:?}"),
+                message: "unexpected control message".into(),
             },
         };
 

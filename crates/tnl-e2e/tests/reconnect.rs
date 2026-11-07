@@ -9,6 +9,15 @@ use tnld::serve::{spawn_server_with_state, AppState};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn client_reattaches_within_grace_window() {
+    assert_public_reattach(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn public_options_reattach_preserves_inspection_generation_and_metadata_ids() {
+    assert_public_reattach(Some(tnl::client::TunnelOptions::default())).await;
+}
+
+async fn assert_public_reattach(options: Option<tnl::client::TunnelOptions>) {
     // 1. Local backend that returns 200 "ok".
     let backend_port = spawn_request_id_echo_backend().await;
 
@@ -42,19 +51,12 @@ async fn client_reattaches_within_grace_window() {
     let capture_history = history.clone();
     let mut task = tokio::spawn(async move {
         start_rx.await?;
-        tnl::reconnect::run(
-            &endpoint,
-            "tnl_U",
-            Some("foo"),
-            tnl::target::Target::LocalhostPort(backend_port),
-            tnl::host_header::HostHeader::Auto,
-            tnl::reconnect::Hooks {
-                inspection: Some(capture_history),
-                cancel_first_session: Some(cancel_rx),
-                log_tx: Some(log_tx),
-            },
-        )
-        .await
+        let hooks = tnl::reconnect::Hooks {
+            inspection: Some(capture_history),
+            cancel_first_session: Some(cancel_rx),
+            log_tx: Some(log_tx),
+        };
+        run_public_reconnect(&endpoint, backend_port, hooks, options).await
     });
 
     // Deterministically hold startup beyond the old 400ms sleep: readiness must
@@ -116,6 +118,33 @@ async fn client_reattaches_within_grace_window() {
     assert_inspection_reattach(&history, &[id, reattached_id]).await;
 
     task.abort();
+}
+
+async fn run_public_reconnect(
+    endpoint: &str,
+    backend_port: u16,
+    hooks: tnl::reconnect::Hooks,
+    options: Option<tnl::client::TunnelOptions>,
+) -> anyhow::Result<()> {
+    let target = tnl::target::Target::LocalhostPort(backend_port);
+    let host_header = tnl::host_header::HostHeader::Auto;
+    match options {
+        Some(options) => {
+            tnl::reconnect::run_with_options(
+                endpoint,
+                "tnl_U",
+                Some("foo"),
+                target,
+                host_header,
+                &options,
+                hooks,
+            )
+            .await
+        }
+        None => {
+            tnl::reconnect::run(endpoint, "tnl_U", Some("foo"), target, host_header, hooks).await
+        }
+    }
 }
 
 async fn spawn_request_id_echo_backend() -> u16 {
