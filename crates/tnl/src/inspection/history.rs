@@ -23,15 +23,28 @@ pub(super) struct History {
     rows: VecDeque<Row>,
     next: u64,
     tunnel: TunnelStatus,
+    replay: Option<crate::replay::ReplayController>,
 }
 impl History {
+    // All dual-store operations take history -> replay. The controller never
+    // calls history; no await or network operation runs under this lock.
+    fn pop_front(&mut self) {
+        if let Some(row) = self.rows.pop_front() {
+            if let Some(replay) = &self.replay {
+                replay.forget(row.record.capture_id);
+            }
+        }
+    }
     fn sweep(&mut self, now: Instant) {
         while self
             .rows
             .front()
             .is_some_and(|r| now.saturating_duration_since(r.admitted) >= TTL)
         {
-            self.rows.pop_front();
+            self.pop_front();
+        }
+        if let Some(replay) = &self.replay {
+            replay.sweep();
         }
     }
     fn insert(&mut self, mut record: InspectionRecord, now: Instant) {
@@ -39,7 +52,7 @@ impl History {
         while self.rows.len() >= MAX_RECORDS
             || (self.rows.len() + 1) * RECORD_RESERVATION > HISTORY_BYTES
         {
-            self.rows.pop_front();
+            self.pop_front();
         }
         self.next = self.next.saturating_add(1);
         record.sequence = self.next;
@@ -81,6 +94,7 @@ impl Inspection {
                 history: Mutex::new(History {
                     rows: VecDeque::with_capacity(MAX_RECORDS),
                     next: 0,
+                    replay: None,
                     tunnel: TunnelStatus {
                         generation: None,
                         connected: false,
@@ -92,6 +106,13 @@ impl Inspection {
                 consumer,
             }),
         }
+    }
+    /// The same controller is both the single observer consumer and replay
+    /// authority. Bind its forbidden inspector port before constructing it.
+    pub fn with_replay(mode: PreviewMode, replay: crate::replay::ReplayController) -> Self {
+        let inspection = Self::with_consumer(mode, Some(Arc::new(replay.clone())));
+        inspection.inner.history.lock().replay = Some(replay);
+        inspection
     }
     pub fn admit(
         &self,
@@ -152,6 +173,11 @@ impl Inspection {
         let mut record = record;
         record.connection = generation_state(history.tunnel, generation);
         history.insert(record, Instant::now());
+        // Replay admission and row insertion share this lease, so an eviction
+        // cannot forget a row before its raw consumer has even been admitted.
+        if history.replay.is_some() {
+            return Some(Capture::new(self.clone(), context));
+        }
         drop(history);
         Some(Capture::new(self.clone(), context))
     }
@@ -210,6 +236,9 @@ impl Inspection {
         if self.inner.closed.load(Ordering::Acquire) {
             return;
         }
+        if let Some(replay) = &h.replay {
+            replay.activate(generation);
+        }
         h.tunnel = TunnelStatus {
             generation: Some(generation),
             connected: true,
@@ -221,6 +250,9 @@ impl Inspection {
     }
     pub fn disconnected(&self) {
         let mut h = self.inner.history.lock();
+        if let Some(replay) = &h.replay {
+            replay.deactivate();
+        }
         h.tunnel.connected = false;
         let tunnel = h.tunnel;
         for row in &mut h.rows {
@@ -234,7 +266,85 @@ impl Inspection {
         self.inner.closed.store(true, Ordering::Release);
         let mut h = self.inner.history.lock();
         h.tunnel.connected = false;
+        if let Some(replay) = &h.replay {
+            replay.shutdown();
+        }
         h.rows.clear();
+    }
+    /// Row reachability, TTL/eviction revocation and controller acceptance are
+    /// one critical section. Never use a detached `get()` snapshot for authority.
+    pub(super) fn with_replay_row<T>(
+        &self,
+        id: CaptureId,
+        operation: impl FnOnce(
+            &crate::replay::ReplayController,
+            &InspectionRecord,
+        ) -> Result<T, crate::replay::ReplayError>,
+    ) -> Result<T, crate::replay::ReplayError> {
+        use crate::replay::ReplayError;
+        let mut h = self
+            .inner
+            .history
+            .try_lock()
+            .ok_or(ReplayError::Overloaded)?;
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(ReplayError::TunnelUnavailable);
+        }
+        h.sweep(Instant::now());
+        let row = h
+            .rows
+            .iter()
+            .find(|r| r.record.capture_id == id)
+            .ok_or(ReplayError::NotRetained)?;
+        let replay = h.replay.as_ref().ok_or(ReplayError::Disabled)?;
+        let result = operation(replay, &row.record);
+        drop(h);
+        result
+    }
+    /// Consumed tickets recover safe metadata even after display eviction. Every
+    /// new acceptance still requires the row and controller under this lease.
+    pub(super) fn confirm_replay(
+        &self,
+        id: CaptureId,
+        replay_id: ulid::Ulid,
+        token: &str,
+        confirm_side_effects: bool,
+    ) -> Result<crate::replay::ReplayOutcome, crate::replay::ReplayError> {
+        use crate::replay::ReplayError;
+        let mut h = self
+            .inner
+            .history
+            .try_lock()
+            .ok_or(ReplayError::Overloaded)?;
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(ReplayError::TunnelUnavailable);
+        }
+        h.sweep(Instant::now());
+        let controller = h.replay.as_ref().ok_or(ReplayError::Disabled)?;
+        if let Some(outcome) =
+            controller.consumed_confirmation(id, replay_id, token, confirm_side_effects)?
+        {
+            return Ok(outcome);
+        }
+        if !h.rows.iter().any(|row| row.record.capture_id == id) {
+            return Err(ReplayError::NotRetained);
+        }
+        let result = controller.confirm(id, replay_id, token, confirm_side_effects);
+        drop(h);
+        result
+    }
+    pub(super) fn replay_outcome(
+        &self,
+        id: ulid::Ulid,
+    ) -> Result<Option<crate::replay::ReplayOutcome>, crate::replay::ReplayError> {
+        use crate::replay::ReplayError;
+        let mut h = self
+            .inner
+            .history
+            .try_lock()
+            .ok_or(ReplayError::Overloaded)?;
+        h.sweep(Instant::now());
+        Ok(h.replay.as_ref().ok_or(ReplayError::Disabled)?.outcome(id))
     }
     pub(super) fn api_status(&self) -> Result<(usize, TunnelStatus), ()> {
         let mut h = self.inner.history.try_lock().ok_or(())?;
@@ -383,6 +493,97 @@ mod lifecycle_tests {
         tokio::task::yield_now().await;
         assert!(inspection.inner.history.lock().rows.is_empty());
         drop(capture);
+        service.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod replay_lease_tests {
+    use super::*;
+    #[tokio::test]
+    async fn replay_authority_holds_display_lease_and_eviction_forgets_raw() {
+        let bound = super::super::BoundInspector::bind(0).await.unwrap();
+        let replay = crate::replay::ReplayController::new(true, bound.addr().port()).unwrap();
+        let history = Inspection::with_replay(PreviewMode::Off, replay.clone());
+        let generation = TunnelGeneration::new();
+        history.activate(generation);
+        let mut capture = history
+            .admit_backend(generation, None, "127.0.0.1:3000".parse().unwrap())
+            .unwrap();
+        let id = capture.id();
+        capture.request(b"GET / HTTP/1.1\r\nHost: fixed.example\r\n\r\n");
+        capture.response(b"HTTP/1.1 204 No Content\r\n\r\n");
+        capture.finish();
+        let preview = history
+            .with_replay_row(id, |controller, row| {
+                assert_eq!(row.capture_id, id);
+                assert!(
+                    history.inner.history.try_lock().is_none(),
+                    "authority must hold the history lease"
+                );
+                controller.prepare(id)
+            })
+            .unwrap();
+        let confirm =
+            || history.confirm_replay(id, preview.replay_id, &preview.confirmation_token, true);
+        history.inner.closed.store(true, Ordering::Release);
+        assert_eq!(
+            confirm().unwrap_err(),
+            crate::replay::ReplayError::TunnelUnavailable
+        );
+        assert_eq!(
+            history
+                .with_replay_row(id, |controller, _| controller.prepare(id))
+                .unwrap_err(),
+            crate::replay::ReplayError::TunnelUnavailable
+        );
+        history.inner.closed.store(false, Ordering::Release);
+        let mut lock = history.inner.history.lock();
+        assert_eq!(
+            confirm().unwrap_err(),
+            crate::replay::ReplayError::Overloaded
+        );
+        assert_eq!(
+            history
+                .with_replay_row(id, |controller, _| controller.prepare(id))
+                .unwrap_err(),
+            crate::replay::ReplayError::Overloaded
+        );
+        lock.pop_front();
+        drop(lock);
+        assert_eq!(replay.raw_bytes(), 0);
+        assert_eq!(
+            confirm().unwrap_err(),
+            crate::replay::ReplayError::NotRetained
+        );
+        assert_eq!(
+            history
+                .with_replay_row(id, |controller, _| controller.prepare(id))
+                .unwrap_err(),
+            crate::replay::ReplayError::NotRetained
+        );
+        history.shutdown();
+    }
+    #[tokio::test(start_paused = true)]
+    async fn idle_service_eviction_forgets_raw_without_an_api_read() {
+        let bound = super::super::BoundInspector::bind(0).await.unwrap();
+        let replay = crate::replay::ReplayController::new(true, bound.addr().port()).unwrap();
+        let history = Inspection::with_replay(PreviewMode::Off, replay.clone());
+        let generation = TunnelGeneration::new();
+        history.activate(generation);
+        let mut capture = history
+            .admit_backend(generation, None, "127.0.0.1:3000".parse().unwrap())
+            .unwrap();
+        capture.request(b"GET / HTTP/1.1\r\nHost: fixed.example\r\n\r\n");
+        capture.response(b"HTTP/1.1 204 No Content\r\n\r\n");
+        capture.finish();
+        assert!(replay.raw_bytes() > 0);
+        let service = bound.start(history.clone());
+        history.inner.history.lock().rows[0].admitted = Instant::now().checked_sub(TTL).unwrap();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(history.inner.history.lock().rows.is_empty());
+        assert_eq!(replay.raw_bytes(), 0);
         service.shutdown().await;
     }
 }

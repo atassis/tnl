@@ -5,6 +5,7 @@ use crate::target::Target;
 #[derive(Clone, Copy, Debug)]
 pub struct InspectionOptions {
     pub port: u16,
+    pub replay_retain_secrets: bool,
     pub bodies: crate::inspection::PreviewMode,
 }
 
@@ -29,13 +30,20 @@ pub async fn run_with_inspection(
     let cfg_path = resolve_config_path()?;
     let cfg = Config::load_resolved(&cfg_path)?;
     let (inspection, service) = if let Some(options) = options {
-        let inspection = crate::inspection::Inspection::new(options.bodies);
-        let service =
-            crate::inspection::InspectorService::start(inspection.clone(), options.port).await?;
+        let bound = crate::inspection::BoundInspector::bind(options.port).await?;
+        let replay = crate::replay::ReplayController::new(
+            options.replay_retain_secrets,
+            bound.addr().port(),
+        )?;
+        let inspection = crate::inspection::Inspection::with_replay(options.bodies, replay);
+        let service = bound.start(inspection.clone());
         eprintln!(
             "Inspector (private; do not share): {}",
             service.bootstrap_url()
         );
+        if options.replay_retain_secrets {
+            eprintln!("WARNING: raw replay retention ENABLED: original query, credentials, cookies and body secrets remain in memory. Caps: 20 requests, 10 minutes, 16 MiB total, 1 MiB body/request; one execution, explicit confirmation for every method. Previews are separate. Do not expose/share this inspector.");
+        }
         (Some(inspection), Some(service))
     } else {
         (None, None)
