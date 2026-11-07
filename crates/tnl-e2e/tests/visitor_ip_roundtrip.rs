@@ -42,11 +42,12 @@ async fn backend() -> (u16, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let router = axum::Router::new().fallback(|req: axum::extract::Request| async move {
+        let request_id = req.headers().get("x-tnl-request-id").map(|v| v.to_str().unwrap().to_string());
         let xff = req.headers().get("x-forwarded-for").map(|v| v.to_str().unwrap().to_string());
         let capability = req.headers().get(DATA_STREAM_PROTOCOL_HEADER).map(|v| v.to_str().unwrap().to_string());
         let claim = req.headers().get("x-tnl-visitor-ip").map(|v| v.to_str().unwrap().to_string());
         let body = axum::body::to_bytes(req.into_body(), 65536).await.unwrap();
-        axum::Json(serde_json::json!({"xff": xff, "capability": capability, "claim": claim, "body": String::from_utf8_lossy(&body)}))
+        axum::Json(serde_json::json!({"backend_id": request_id, "xff": xff, "capability": capability, "claim": claim, "body": String::from_utf8_lossy(&body)}))
     });
     (
         port,
@@ -319,15 +320,29 @@ async fn visitor_ip_roundtrip_legacy_and_metadata_sessions_do_not_share_mode() {
         metadata.request_id.to_string(),
         "metadata must reuse the daemon's existing error-context ID"
     );
-    request(
-        daemon.local_addr,
-        "legacy",
-        "/raw",
-        "X-Forwarded-For: 203.0.113.66\r\nX-Tnl-Data-Stream-Protocol: http1-metadata-v1\r\n",
-    )
-    .await;
+    let response = reqwest::Client::new()
+        .get(format!("http://{}/raw", daemon.local_addr))
+        .header("host", "legacy.t.x")
+        .header("x-tnl-request-id", "01BX5ZZKBKACTAV9WEVGEMMVRZ")
+        .header("x-tnl-data-stream-protocol", "http1-metadata-v1")
+        .send()
+        .await
+        .unwrap();
+    let daemon_id = response.headers()["x-tnl-request-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(daemon_id, "01BX5ZZKBKACTAV9WEVGEMMVRZ");
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["backend_id"], daemon_id);
     let record = log(&mut rx).await;
     assert_eq!(record.status, Some(200));
+    assert_ne!(
+        record.req_id.to_string(),
+        daemon_id,
+        "raw client IDs are local-only"
+    );
+    assert_ne!(record.req_id.to_string(), "01BX5ZZKBKACTAV9WEVGEMMVRZ");
     assert_eq!(
         (record.visitor_ip, record.peer_ip, record.visitor_ip_source),
         (None, None, None)

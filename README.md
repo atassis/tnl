@@ -93,9 +93,9 @@ docs/             design spec, implementation history, runbook
 
 Dual-licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE), at your option.
 
-### Request-log visitor identity
+### Request IDs and visitor identity
 
-`tnl http` request rows append `ip=<address> source=<provenance>`. JSON request
+`tnl http` request rows append `ip=<address> source=<provenance> req_id=<ID>`. JSON request
 records include additive `visitor_ip`, `peer_ip`, and `visitor_ip_source` fields;
 `resolved_addr` continues to mean the **local backend**, not the visitor.
 Provenance is `peer`, `x_forwarded_for`, `peer_missing_forwarding`,
@@ -103,11 +103,27 @@ Provenance is `peer`, `x_forwarded_for`, `peer_missing_forwarding`,
 socket peer rather than claiming a verified original visitor.
 
 New clients/daemons negotiate a bounded metadata prelude over the authenticated
-control WebSocket. Public HTTP headers cannot forge it. Legacy raw forwarding
+control WebSocket. That single envelope carries visitor identity and the daemon's
+request ID, a canonical nonzero ULID. The client uses that ID for inspector
+`req_id` (unchanged JSON key) and its generated error pages. The daemon replaces
+all inbound `X-Tnl-Request-Id` values with its ID on the backend request, and
+always sets exactly one matching final public response header, after hop-by-hop
+filtering. Visitor/backend ID headers and `Connection` nominations cannot choose
+or remove it. `X-Request-Id`, `traceparent`, and backend body properties remain
+application data; shared IDs do not authenticate component/origin headers.
+
+This guarantee covers parsed data-plane handler ingress, not control/admin routes
+or HTTP parse errors rejected before the handler. Inspector delivery remains
+best-effort. Public HTTP headers cannot forge the metadata. Legacy raw forwarding
 still works, with JSON identity fields explicitly `null` and text
 `ip=- source=unavailable`; the reconnect run warns once on stderr. No client-side
 inference from public forwarding headers is performed. Quiet suppresses request
-records; existing verbosity/color behavior is unchanged. Existing banner/shutdown
+records; existing verbosity/color behavior is unchanged. Raw client inspector and
+synth IDs are **local-only**, never inferred from HTTP headers, and may differ
+from an updated daemon's authoritative response ID. Older daemons' relayed
+headers are not promoted to trusted identity. Invalid negotiated metadata closes
+that stream before backend connect, without raw fallback or a fabricated shared
+ID; the existing 8 KiB HTTP-head probe is unchanged. Existing banner/shutdown
 output means the entire `--json` stdout stream is not promised to be pure NDJSON.
 
 Daemon proxy-header trust defaults to none. See [deployment guidance](deploy/README.md#visitor-ip-attribution-and-trusted-proxies)

@@ -130,7 +130,7 @@ pub async fn run(
             && !warned_raw_metadata
         {
             warned_raw_metadata = true;
-            eprintln!("warning: daemon did not negotiate request metadata; authoritative visitor identity is unavailable");
+            eprintln!("warning: legacy raw HTTP mode: visitor identity unavailable; request IDs are local and not shared with the daemon");
         }
         let cancel = hooks.cancel_first_session.take();
         // Keep the control stream alive for the duration of the session.
