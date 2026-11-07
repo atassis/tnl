@@ -5,7 +5,8 @@
 //! onto the substream and close.
 //!
 //! Phase 2: write the buffered head + leftover body to the backend, then
-//! probe the first response bytes. If the backend sends a malformed prefix
+//! concurrently upload the remaining request and probe the first response bytes.
+//! If the backend sends a malformed prefix
 //! or EOFs before any bytes, synthesise a 502. Otherwise pump bidirectionally
 //! to completion (with response tee for the inspector).
 //!
@@ -21,7 +22,7 @@ use bytes::BytesMut;
 use parking_lot::Mutex;
 use tnl_protocol::error_page::{parse_accept, Accept};
 use tnl_protocol::Stream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -270,7 +271,7 @@ pub async fn forward(
             "local-eof",
             "Backend closed connection while we wrote the request head.",
             "Verify the local server is listening on the right interface.",
-            head_bytes.len() + leftover.len(),
+            u64::try_from(head_bytes.len() + leftover.len()).unwrap_or(0),
             &format!("write to backend failed: {e}"),
         )
         .await;
@@ -290,95 +291,21 @@ pub async fn forward(
                 "local-eof",
                 "Backend closed connection while we wrote the request body.",
                 "Verify the local server is listening on the right interface.",
-                head_bytes.len() + leftover.len(),
+                u64::try_from(head_bytes.len() + leftover.len()).unwrap_or(0),
                 &format!("write body to backend failed: {e}"),
             )
             .await;
         }
     }
 
-    // Phase 2: probe response first line.
-    let probe_res = peek_response_first_line(&mut tcp, first_byte_timeout()).await?;
-    let prefix_bytes = match probe_res {
-        ResponseProbe::LooksHttp(prefix) => prefix,
-        ResponseProbe::Eof => {
-            return synth_phase2(
-                &mut substream,
-                &ctx,
-                &target,
-                resolved_addr,
-                req_id,
-                started,
-                method,
-                path,
-                accept,
-                "local-eof",
-                "Backend closed connection without sending a response.",
-                "Try restarting your dev server.",
-                head_bytes.len() + leftover.len(),
-                "Backend closed connection without sending a response.",
-            )
-            .await;
-        }
-        ResponseProbe::NotHttp(_) => {
-            return synth_phase2(
-                &mut substream,
-                &ctx,
-                &target,
-                resolved_addr,
-                req_id,
-                started,
-                method,
-                path,
-                accept,
-                "local-malformed",
-                "Backend sent bytes that are not a valid HTTP response.",
-                "Verify the local server is speaking HTTP/1.x.",
-                head_bytes.len() + leftover.len(),
-                "Backend sent bytes that are not a valid HTTP response.",
-            )
-            .await;
-        }
-        ResponseProbe::Timeout => {
-            return synth_phase2(
-                &mut substream,
-                &ctx,
-                &target,
-                resolved_addr,
-                req_id,
-                started,
-                method,
-                path,
-                accept,
-                "local-no-response",
-                "Backend accepted the connection but did not send a response within the first-byte timeout.",
-                "Local server is hung or slow on first response byte.",
-                head_bytes.len() + leftover.len(),
-                "Backend accepted the connection but did not send a response within the first-byte timeout.",
-            )
-            .await;
-        }
-    };
-
-    // Success path: bidirectional pump.
+    // Start uploading before probing: many backends wait for the entire body
+    // before responding. Both futures stay in this task so cancellation drops
+    // both directions without leaving a detached upload behind.
     let (mut yr, mut yw) = tokio::io::split(substream);
     let (mut tr, mut tw) = tokio::io::split(tcp);
-
-    let resp_peek = Arc::new(Mutex::new({
-        let mut b = BytesMut::with_capacity(1024);
-        b.extend_from_slice(&prefix_bytes);
-        b
-    }));
     let bytes_in = Arc::new(AtomicU64::new(
         u64::try_from(head_bytes.len() + leftover.len()).unwrap_or(0),
     ));
-    let bytes_out = Arc::new(AtomicU64::new(
-        u64::try_from(prefix_bytes.len()).unwrap_or(0),
-    ));
-
-    // Replay the prefix bytes already consumed from the backend into the substream.
-    yw.write_all(&prefix_bytes).await?;
-
     let bin = bytes_in.clone();
     let req_pump = async move {
         let mut buf = [0u8; 8192];
@@ -393,10 +320,97 @@ pub async fn forward(
         tw.shutdown().await?;
         Ok::<_, anyhow::Error>(())
     };
+    tokio::pin!(req_pump);
+
+    // Keep one probe future/deadline even if the upload finishes first. An
+    // upload write failure must not discard an early backend response.
+    let mut req_result = None;
+    let probe_res = {
+        let probe = peek_response_first_line(&mut tr, first_byte_timeout());
+        tokio::pin!(probe);
+        tokio::select! {
+            result = &mut probe => result?,
+            result = &mut req_pump => {
+                req_result = Some(result);
+                probe.await?
+            }
+        }
+    };
+    let prefix_bytes = match probe_res {
+        ResponseProbe::LooksHttp(prefix) => prefix,
+        ResponseProbe::Eof => {
+            return synth_phase2(
+                &mut yw,
+                &ctx,
+                &target,
+                resolved_addr,
+                req_id,
+                started,
+                method,
+                path,
+                accept,
+                "local-eof",
+                "Backend closed connection without sending a response.",
+                "Try restarting your dev server.",
+                bytes_in.load(Ordering::Relaxed),
+                "Backend closed connection without sending a response.",
+            )
+            .await;
+        }
+        ResponseProbe::NotHttp(_) => {
+            return synth_phase2(
+                &mut yw,
+                &ctx,
+                &target,
+                resolved_addr,
+                req_id,
+                started,
+                method,
+                path,
+                accept,
+                "local-malformed",
+                "Backend sent bytes that are not a valid HTTP response.",
+                "Verify the local server is speaking HTTP/1.x.",
+                bytes_in.load(Ordering::Relaxed),
+                "Backend sent bytes that are not a valid HTTP response.",
+            )
+            .await;
+        }
+        ResponseProbe::Timeout => {
+            return synth_phase2(
+                &mut yw,
+                &ctx,
+                &target,
+                resolved_addr,
+                req_id,
+                started,
+                method,
+                path,
+                accept,
+                "local-no-response",
+                "Backend accepted the connection but did not send a response within the first-byte timeout.",
+                "Local server is hung or slow on first response byte.",
+                bytes_in.load(Ordering::Relaxed),
+                "Backend accepted the connection but did not send a response within the first-byte timeout.",
+            )
+            .await;
+        }
+    };
+
+    let resp_peek = Arc::new(Mutex::new({
+        let mut b = BytesMut::with_capacity(1024);
+        b.extend_from_slice(&prefix_bytes);
+        b
+    }));
+    let bytes_out = Arc::new(AtomicU64::new(
+        u64::try_from(prefix_bytes.len()).unwrap_or(0),
+    ));
 
     let resp_peek_a = resp_peek.clone();
     let bout = bytes_out.clone();
     let resp_pump = async move {
+        // Prefix replay can backpressure too; keep uploading while it writes.
+        yw.write_all(&prefix_bytes).await?;
         let mut buf = [0u8; 8192];
         loop {
             let n = tr.read(&mut buf).await?;
@@ -417,7 +431,12 @@ pub async fn forward(
         Ok::<_, anyhow::Error>(())
     };
 
-    tokio::try_join!(req_pump, resp_pump)?;
+    if let Some(result) = req_result {
+        resp_pump.await?;
+        result?;
+    } else {
+        tokio::try_join!(req_pump, resp_pump)?;
+    }
 
     let resp_buf = resp_peek.lock().to_vec();
     let status = self::peek::parse_response_status(&resp_buf);
@@ -460,8 +479,8 @@ pub async fn forward(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn synth_phase2(
-    substream: &mut Pin<Box<dyn Stream>>,
+async fn synth_phase2<W: AsyncWrite + Unpin>(
+    substream: &mut W,
     ctx: &ForwardCtx,
     target: &Target,
     resolved_addr: std::net::SocketAddr,
@@ -473,7 +492,7 @@ async fn synth_phase2(
     kind: &str,
     reason: &str,
     hint: &str,
-    bytes_in: usize,
+    bytes_in: u64,
     log_reason_for_warn: &str,
 ) -> anyhow::Result<()> {
     warn!(error = %log_reason_for_warn, %kind, "phase-2 failure → synth");
@@ -500,7 +519,7 @@ async fn synth_phase2(
             resolved_addr: Some(resolved_addr),
             status: Some(502),
             duration_ms: ms_since(started),
-            bytes_in: u64::try_from(bytes_in).unwrap_or(0),
+            bytes_in,
             bytes_out: u64::try_from(synth.len()).unwrap_or(0),
             failure_kind: Some(kind.to_string()),
         },
