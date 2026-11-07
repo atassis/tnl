@@ -24,6 +24,7 @@ pub async fn run(
             target,
             host_header,
             crate::reconnect::Hooks {
+                inspection: None,
                 cancel_first_session: None,
                 log_tx: Some(log_tx),
             },

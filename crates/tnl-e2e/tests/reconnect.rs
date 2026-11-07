@@ -10,21 +10,7 @@ use tnld::serve::{spawn_server_with_state, AppState};
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn client_reattaches_within_grace_window() {
     // 1. Local backend that returns 200 "ok".
-    let backend = axum::Router::new().route(
-        "/",
-        axum::routing::get(|headers: axum::http::HeaderMap| async move {
-            let mut response = axum::http::Response::new(axum::body::Body::from("ok"));
-            response
-                .headers_mut()
-                .insert("x-backend-id", headers["x-tnl-request-id"].clone());
-            response
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let backend_port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        axum::serve(listener, backend).await.unwrap();
-    });
+    let backend_port = spawn_request_id_echo_backend().await;
 
     // 2. Daemon with a 30-second grace window.
     let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -52,6 +38,8 @@ async fn client_reattaches_within_grace_window() {
     let endpoint = format!("http://{daemon_addr}");
     let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
     let (log_tx, mut log_rx) = tokio::sync::mpsc::channel(8);
+    let history = tnl::inspection::Inspection::new(tnl::inspection::PreviewMode::Off);
+    let capture_history = history.clone();
     let mut task = tokio::spawn(async move {
         start_rx.await?;
         tnl::reconnect::run(
@@ -61,6 +49,7 @@ async fn client_reattaches_within_grace_window() {
             tnl::target::Target::LocalhostPort(backend_port),
             tnl::host_header::HostHeader::Auto,
             tnl::reconnect::Hooks {
+                inspection: Some(capture_history),
                 cancel_first_session: Some(cancel_rx),
                 log_tx: Some(log_tx),
             },
@@ -124,7 +113,29 @@ async fn client_reattaches_within_grace_window() {
 
     let reattached_id = assert_correlated_response(r, &mut log_rx).await;
     assert_ne!(reattached_id, id);
+    assert_inspection_reattach(&history, &[id, reattached_id]).await;
+
     task.abort();
+}
+
+async fn spawn_request_id_echo_backend() -> u16 {
+    let backend = axum::Router::new().route(
+        "/",
+        axum::routing::get(|headers: axum::http::HeaderMap| async move {
+            let mut response = axum::http::Response::new(axum::body::Body::from("ok"));
+            response
+                .headers_mut()
+                .insert("x-backend-id", headers["x-tnl-request-id"].clone());
+            response
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, backend).await.unwrap();
+    });
+
+    backend_port
 }
 
 async fn assert_correlated_response(
@@ -185,4 +196,37 @@ async fn wait_for_tunnel_session(
             )
         }),
     }
+}
+
+async fn assert_inspection_reattach(history: &tnl::inspection::Inspection, request_ids: &[String]) {
+    let records = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let records = history.search("");
+            if records.len() == 2
+                && records
+                    .iter()
+                    .all(|r| r.state != tnl::inspection::State::Active)
+            {
+                break records;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        records[0].generation, records[1].generation,
+        "reattach changed generation"
+    );
+    assert_ne!(records[0].capture_id, records[1].capture_id);
+    assert!(records.iter().all(|r| r.request_id.is_some()));
+    let mut captured_ids: Vec<_> = records
+        .iter()
+        .map(|r| r.request_id.unwrap().to_string())
+        .collect();
+    captured_ids.sort();
+    let mut expected_ids = request_ids.to_vec();
+    expected_ids.sort();
+    assert_eq!(captured_ids, expected_ids);
+    assert!(records.iter().all(|r| r.visitor_source == Some("peer")));
 }

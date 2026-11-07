@@ -67,6 +67,11 @@ fn first_byte_timeout() -> Duration {
 /// Context carried through one forwarded substream.
 #[derive(Clone)]
 pub struct ForwardCtx {
+    /// Opt-in process-scoped sanitized observation; absent means no scratch.
+    pub inspection: Option<(
+        crate::inspection::Inspection,
+        crate::inspection::TunnelGeneration,
+    )>,
     pub data_stream_protocol: DataStreamProtocol,
     pub tunnel: String,
     pub log_tx: Option<mpsc::Sender<LogLine>>,
@@ -93,6 +98,7 @@ impl ForwardCtx {
         version: &'static str,
     ) -> Self {
         Self {
+            inspection: None,
             data_stream_protocol: DataStreamProtocol::RawHttp1,
             tunnel,
             log_tx,
@@ -108,6 +114,7 @@ impl ForwardCtx {
 impl std::fmt::Debug for ForwardCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ForwardCtx")
+            .field("inspection", &self.inspection)
             .field("data_stream_protocol", &self.data_stream_protocol)
             .field("tunnel", &self.tunnel)
             .field("log_tx", &self.log_tx.as_ref().map(|_| "<sender>"))
@@ -241,7 +248,11 @@ pub async fn forward(
         | RequestHeadProbe::Timeout(buf) => (buf, Vec::new()),
     };
     let (method, path, accept) = parse_head_for_synth(&head_bytes);
-    debug!(%req_id, %method, %path, "request head parsed");
+    if ctx.inspection.is_some() {
+        debug!(%req_id, method = %crate::inspection::safe_method(&method), path = %crate::inspection::safe_target(&path), "request head parsed");
+    } else {
+        debug!(%req_id, %method, %path, "request head parsed");
+    }
 
     // Phase 1: connect.
     let connect_outcome = connect_local(&target, LOCAL_CONNECT_TIMEOUT).await;
@@ -300,6 +311,21 @@ pub async fn forward(
         None => head_bytes,
     };
 
+    // One backend-facing seam, after Host rewriting. Callback inputs are
+    // intended writes, not successful-delivery counters. Errors never reject
+    // forwarding; the lifetime guard records truncation on every early return.
+    let observation = ctx
+        .inspection
+        .as_ref()
+        .and_then(|(inspection, generation)| {
+            inspection.admit(*generation, request.metadata.as_ref())
+        })
+        .map(|mut capture| {
+            capture.request(&head_bytes);
+            capture.request(&leftover);
+            Arc::new(Mutex::new(capture))
+        });
+
     // Phase 2: write head + leftover body to backend.
     if let Err(e) = tcp.write_all(&head_bytes).await {
         return synth_phase2(
@@ -353,12 +379,16 @@ pub async fn forward(
         u64::try_from(head_bytes.len() + leftover.len()).unwrap_or(0),
     ));
     let bin = bytes_in.clone();
+    let request_observation = observation.clone();
     let req_pump = async move {
         let mut buf = [0u8; 8192];
         loop {
             let n = yr.read(&mut buf).await?;
             if n == 0 {
                 break;
+            }
+            if let Some(capture) = &request_observation {
+                capture.lock().request(&buf[..n]);
             }
             tw.write_all(&buf[..n]).await?;
             bin.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed);
@@ -446,6 +476,10 @@ pub async fn forward(
         }
     };
 
+    if let Some(capture) = &observation {
+        capture.lock().response(&prefix_bytes);
+    }
+
     let resp_peek = Arc::new(Mutex::new({
         let mut b = BytesMut::with_capacity(1024);
         b.extend_from_slice(&prefix_bytes);
@@ -457,6 +491,7 @@ pub async fn forward(
 
     let resp_peek_a = resp_peek.clone();
     let bout = bytes_out.clone();
+    let response_observation = observation.clone();
     let resp_pump = async move {
         // Prefix replay can backpressure too; keep uploading while it writes.
         yw.write_all(&prefix_bytes).await?;
@@ -473,6 +508,9 @@ pub async fn forward(
                     p.extend_from_slice(&buf[..take]);
                 }
             }
+            if let Some(capture) = &response_observation {
+                capture.lock().response(&buf[..n]);
+            }
             yw.write_all(&buf[..n]).await?;
             bout.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed);
         }
@@ -488,14 +526,22 @@ pub async fn forward(
     }
 
     let resp_buf = resp_peek.lock().to_vec();
-    let status = self::peek::parse_response_status(&resp_buf);
+    // Live Host policy uses only its independent bounded prefix evidence.
+    // A display observer may know a later final status, but cannot reinterpret
+    // an informational prefix as evidence about that later response.
+    let forwarding_status = final_response_status_prefix(&resp_buf);
+    let status = observation.as_ref().map_or(forwarding_status, |capture| {
+        let mut capture = capture.lock();
+        capture.finish();
+        capture.final_status().or(forwarding_status)
+    });
 
     // Evidence-driven dev-server host smoothing: on a recognized host block in
     // `Auto` mode, flip on Host rewrite for subsequent requests and notify once.
     if matches!(ctx.host_header, crate::host_header::HostHeader::Auto)
         && !ctx.rewrite_active.load(Ordering::Relaxed)
     {
-        if let Some(fw) = crate::block_detect::detect(status, &resp_buf) {
+        if let Some(fw) = crate::block_detect::detect(forwarding_status, &resp_buf) {
             ctx.rewrite_active.store(true, Ordering::Relaxed);
             if !ctx.warned.swap(true, Ordering::Relaxed) {
                 eprintln!(
@@ -591,14 +637,59 @@ fn parse_head_for_synth(head: &[u8]) -> (String, String, Accept) {
     (method, path, accept)
 }
 
+/// Independent status fallback for Host smoothing when observation rejects a
+/// head. It accepts CRLF or LF within the bounded prefix, never decodes binary
+/// entity bytes, and skips only complete informational heads.
+fn final_response_status_prefix(mut prefix: &[u8]) -> Option<u16> {
+    for informational in 0..=8 {
+        let line_end = prefix.iter().position(|&byte| byte == b'\n')?;
+        let line = &prefix[..line_end];
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.len() < 12
+            || !(line.starts_with(b"HTTP/1.1 ") || line.starts_with(b"HTTP/1.0 "))
+            || !line[9..12].iter().all(u8::is_ascii_digit)
+            || line.get(12).is_some_and(|byte| *byte != b' ')
+        {
+            return None;
+        }
+        let status = line[9..12]
+            .iter()
+            .fold(0u16, |n, byte| n * 10 + u16::from(byte - b'0'));
+        if !(100..=599).contains(&status) {
+            return None;
+        }
+        if !(100..200).contains(&status) || status == 101 {
+            return Some(status);
+        }
+        if informational == 8 {
+            return None;
+        }
+        let mut head = prefix;
+        loop {
+            let line_end = head.iter().position(|&byte| byte == b'\n')?;
+            let line = &head[..line_end];
+            head = &head[line_end + 1..];
+            if line.is_empty() || line == b"\r" {
+                prefix = head;
+                break;
+            }
+        }
+    }
+    None
+}
+
 fn ms_since(t: Instant) -> u64 {
     u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-fn emit_log(ctx: &ForwardCtx, line: LogLine) {
+fn emit_log(ctx: &ForwardCtx, mut line: LogLine) {
+    if ctx.inspection.is_some() {
+        line.path = crate::inspection::safe_target(&line.path);
+        line.method = crate::inspection::safe_method(&line.method);
+    }
     if let Some(tx) = &ctx.log_tx {
-        if let Err(e) = tx.try_send(line) {
-            warn!(error = ?e, "inspector channel full or closed; dropping log line");
+        if tx.try_send(line).is_err() {
+            warn!("inspector channel full or closed; dropping log line");
         }
     }
 }

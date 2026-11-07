@@ -161,9 +161,9 @@ async fn early_response_is_relayed_before_upload_finishes() {
         );
         result.unwrap();
         let log = log_rx.recv().await.unwrap();
-        // Existing observer limitation: this opaque relay records the first
-        // status (100), not the final 200. P0 does not redesign HTTP observation.
-        assert_eq!(log.status, Some(100));
+        // T4's independent status fallback now skips the provisional 100;
+        // upload/response ordering still belongs to this P0 regression.
+        assert_eq!(log.status, Some(200));
         assert_eq!(log.failure_kind, None);
     })
     .await
