@@ -2,6 +2,7 @@
 
 pub mod error_page;
 pub mod messages;
+pub mod request_metadata;
 pub mod transport;
 pub mod wordlists;
 

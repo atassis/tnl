@@ -33,6 +33,7 @@ http.workspace = true
 httparse.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+ipnet.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

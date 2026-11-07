@@ -17,3 +17,9 @@ tokens_file   = "/etc/tnld/tokens.toml"
 # Seconds a tunnel stays reserved after its control connection drops, before the
 # subdomain is freed (default 30; set 0 to free immediately).
 # session_grace_sec = 30
+
+# Trust no forwarding headers by default. Opt in ONLY to observed proxy peers.
+# For the checked-in host-loopback Caddy topology (trusts local processes too):
+# trusted_proxies = ["127.0.0.1/32"]
+# Add "::1/128" only if the proxy actually connects via IPv6 loopback.
+# TNLD_TRUSTED_PROXIES is a comma-separated replacement list; empty disables trust.

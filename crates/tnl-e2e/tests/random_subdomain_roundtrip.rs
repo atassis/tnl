@@ -32,6 +32,7 @@ async fn server_picks_subdomain_when_client_omits() {
         public_url: "http://test".into(),
         hostname_root: "t.example.com".into(),
         tokens_file: tmp.path().to_string_lossy().into_owned(),
+        trusted_proxies: vec![],
         session_grace_sec: 30,
     };
     let h = spawn_server(cfg).await.unwrap();
@@ -60,7 +61,10 @@ async fn server_picks_subdomain_when_client_omits() {
     let _accept = tokio::spawn(tnl::client::run_accept_loop(
         session_box,
         tnl::target::Target::LocalhostPort(backend_port),
-        tnl::forwarder::ForwardCtx::new(subdomain, None, env!("CARGO_PKG_VERSION")),
+        tnl::forwarder::ForwardCtx {
+            data_stream_protocol: session.data_stream_protocol,
+            ..tnl::forwarder::ForwardCtx::new(subdomain, None, env!("CARGO_PKG_VERSION"))
+        },
     ));
     tokio::time::sleep(Duration::from_millis(250)).await;
 

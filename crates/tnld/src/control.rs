@@ -4,6 +4,9 @@ use anyhow::Context as _;
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::IntoResponse;
+use tnl_protocol::request_metadata::{
+    DataStreamProtocol, DATA_STREAM_PROTOCOL_HEADER, HTTP1_METADATA_V1,
+};
 use tnl_protocol::transport::server_session_from_ws_generic;
 use tnl_protocol::{ControlMsg, ErrorCode, ReattachReq, Session, TunnelCreatedResp};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -14,13 +17,29 @@ use crate::serve::{AppState, AuthedToken, SessionHandle};
 
 pub async fn handler(
     ws: WebSocketUpgrade,
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
     axum::Extension(token): axum::Extension<AuthedToken>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| run_session(socket, state, token))
+    let protocol = DataStreamProtocol::from_offer(&headers);
+    let mut response = ws
+        .on_upgrade(move |socket| run_session(socket, state, token, protocol))
+        .into_response();
+    if protocol == DataStreamProtocol::Http1MetadataV1 {
+        response.headers_mut().insert(
+            DATA_STREAM_PROTOCOL_HEADER,
+            axum::http::HeaderValue::from_static(HTTP1_METADATA_V1),
+        );
+    }
+    response
 }
 
-async fn run_session(socket: WebSocket, state: AppState, token: AuthedToken) {
+async fn run_session(
+    socket: WebSocket,
+    state: AppState,
+    token: AuthedToken,
+    data_stream_protocol: DataStreamProtocol,
+) {
     let registry = state.registry.clone();
     let grace_sec = state.session_grace_sec;
     // Build async-tungstenite WS stream from axum WebSocket via the bridge.
@@ -55,7 +74,10 @@ async fn run_session(socket: WebSocket, state: AppState, token: AuthedToken) {
     // Move session into Mutex-wrapped handle and publish in session_handles
     // so the data plane (Task 14) can locate it by session id.
     let session_box: Box<dyn tnl_protocol::transport::Session> = Box::new(session);
-    let handle: SessionHandle = Arc::new(tokio::sync::Mutex::new(session_box));
+    let handle = SessionHandle {
+        session: Arc::new(tokio::sync::Mutex::new(session_box)),
+        data_stream_protocol,
+    };
     state.session_handles.insert(sess_id.clone(), handle);
 
     if let Err(e) = control_loop(ctrl_stream, &registry, &sess_id, &token.name).await {

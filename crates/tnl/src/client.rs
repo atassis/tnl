@@ -2,6 +2,9 @@ use std::pin::Pin;
 
 use anyhow::{bail, Context};
 use async_tungstenite::tungstenite::handshake::client::generate_key;
+use tnl_protocol::request_metadata::{
+    DataStreamProtocol, DATA_STREAM_PROTOCOL_HEADER, HTTP1_METADATA_V1,
+};
 use tnl_protocol::{
     messages::ReattachReq, ControlMsg, CreateTunnelReq, Session as _, TunnelCreatedResp,
 };
@@ -9,6 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
 pub struct ConnectedSession {
+    pub data_stream_protocol: DataStreamProtocol,
     pub session: Box<dyn tnl_protocol::Session>,
     pub control: Pin<Box<dyn tnl_protocol::Stream>>,
     pub hostname: String,
@@ -19,6 +23,7 @@ pub struct ConnectedSession {
 impl std::fmt::Debug for ConnectedSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectedSession")
+            .field("data_stream_protocol", &self.data_stream_protocol)
             .field("hostname", &self.hostname)
             .field("subdomain", &self.subdomain)
             .field("tunnel_id", &self.tunnel_id)
@@ -34,6 +39,7 @@ async fn dial_and_open_control(
 ) -> anyhow::Result<(
     Box<dyn tnl_protocol::Session>,
     Pin<Box<dyn tnl_protocol::Stream>>,
+    DataStreamProtocol,
 )> {
     let ws_url = endpoint
         .replace("http://", "ws://")
@@ -49,6 +55,7 @@ async fn dial_and_open_control(
     let req = http::Request::builder()
         .uri(&url)
         .header("Authorization", format!("Bearer {token}"))
+        .header(DATA_STREAM_PROTOCOL_HEADER, HTTP1_METADATA_V1)
         .header("Host", authority)
         .header("Upgrade", "websocket")
         .header("Connection", "Upgrade")
@@ -56,9 +63,10 @@ async fn dial_and_open_control(
         .header("Sec-WebSocket-Version", "13")
         .body(())
         .context("build ws upgrade request")?;
-    let (ws, _resp) = async_tungstenite::tokio::connect_async(req)
+    let (ws, resp) = async_tungstenite::tokio::connect_async(req)
         .await
         .with_context(|| format!("connect to {url}"))?;
+    let data_stream_protocol = DataStreamProtocol::from_echo(resp.headers())?;
     info!(%url, "connected via WSS");
 
     let mut session = tnl_protocol::transport::client_session_from_ws_generic(ws);
@@ -66,7 +74,11 @@ async fn dial_and_open_control(
         .open_stream()
         .await
         .context("open control substream")?;
-    Ok((Box::new(session) as Box<dyn tnl_protocol::Session>, ctrl))
+    Ok((
+        Box::new(session) as Box<dyn tnl_protocol::Session>,
+        ctrl,
+        data_stream_protocol,
+    ))
 }
 
 /// Write a length-prefixed JSON `ControlMsg` to the control stream.
@@ -114,7 +126,7 @@ async fn connect_and_create_inner(
     token: &str,
     subdomain: Option<&str>,
 ) -> anyhow::Result<ConnectedSession> {
-    let (session, mut ctrl) = dial_and_open_control(endpoint, token).await?;
+    let (session, mut ctrl, data_stream_protocol) = dial_and_open_control(endpoint, token).await?;
 
     let req = ControlMsg::CreateTunnel(CreateTunnelReq {
         subdomain: subdomain.map(ToString::to_string),
@@ -133,6 +145,7 @@ async fn connect_and_create_inner(
     };
 
     Ok(ConnectedSession {
+        data_stream_protocol,
         session,
         control: ctrl,
         hostname,
@@ -150,7 +163,7 @@ pub async fn connect_and_reattach(
     tunnel_id: ulid::Ulid,
     subdomain: &str,
 ) -> anyhow::Result<ConnectedSession> {
-    let (session, mut ctrl) = dial_and_open_control(endpoint, token).await?;
+    let (session, mut ctrl, data_stream_protocol) = dial_and_open_control(endpoint, token).await?;
 
     let req = ControlMsg::ReattachTunnel(ReattachReq {
         tunnel_id,
@@ -170,6 +183,7 @@ pub async fn connect_and_reattach(
     };
 
     Ok(ConnectedSession {
+        data_stream_protocol,
         session,
         control: ctrl,
         hostname,

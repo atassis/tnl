@@ -174,6 +174,8 @@ public_url       = "{}"
 hostname_root    = "{}"
 tokens_file      = "{}"
 session_grace_sec = {session_grace_sec}
+# Forwarding headers are untrusted by default. Opt in only to actual proxy CIDRs.
+# trusted_proxies = ["127.0.0.1/32"]
 "#,
         r.listen,
         r.public_url,

@@ -15,6 +15,7 @@ fn make_cfg(tokens_file: String) -> Config {
         hostname_root: "t.example.com".into(),
         tokens_file,
         // Long grace window so GC never fires during this test.
+        trusted_proxies: vec![],
         session_grace_sec: 300,
     }
 }

@@ -1,8 +1,15 @@
+use std::net::SocketAddr;
+
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::header::HeaderName;
 use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use tnl_protocol::request_metadata::{
+    write_request_metadata, DataStreamProtocol, RequestMetadataV1, VisitorIdentity,
+    REQUEST_METADATA_TIMEOUT,
+};
+use tracing::Instrument as _;
 use tracing::{debug, error, info, warn};
 
 use crate::serve::AppState;
@@ -47,8 +54,18 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
 }
 
+pub async fn handler(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+) -> Response<Body> {
+    let visitor = state.trusted_proxies.resolve(peer.ip(), req.headers());
+    let span = tracing::info_span!("data_plane_request", visitor_ip = %visitor.visitor_ip, peer_ip = %visitor.peer_ip, visitor_ip_source = visitor.source.as_str());
+    handle_request(state, req, visitor).instrument(span).await
+}
+
 #[allow(clippy::too_many_lines)]
-pub async fn handler(State(state): State<AppState>, req: Request) -> Response<Body> {
+async fn handle_request(state: AppState, req: Request, visitor: VisitorIdentity) -> Response<Body> {
     use tnl_protocol::error_page::{parse_accept, Component, ErrorContext};
     use ulid::Ulid;
 
@@ -152,8 +169,8 @@ pub async fn handler(State(state): State<AppState>, req: Request) -> Response<Bo
     };
 
     // ---- Open a fresh substream to the client session -----------------------
-    let mut session_guard = handle.lock().await;
-    let substream = match session_guard.open_stream().await {
+    let mut session_guard = handle.session.lock().await;
+    let mut substream = match session_guard.open_stream().await {
         Ok(s) => s,
         Err(e) => {
             error!(?e, "open_stream failed");
@@ -185,6 +202,37 @@ pub async fn handler(State(state): State<AppState>, req: Request) -> Response<Bo
         }
     };
     drop(session_guard);
+
+    if handle.data_stream_protocol == DataStreamProtocol::Http1MetadataV1 {
+        let metadata = RequestMetadataV1 {
+            request_id: req_id,
+            visitor,
+        };
+        let result = tokio::time::timeout(
+            REQUEST_METADATA_TIMEOUT,
+            write_request_metadata(&mut substream, &metadata),
+        )
+        .await;
+        if !matches!(result, Ok(Ok(()))) {
+            warn!(component = "transport", kind = "request-metadata-write", %req_id, error = ?result, "served 502 from daemon: request metadata write");
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                Component::Transport,
+                &ErrorContext {
+                    component: Component::Transport,
+                    kind: Some("request-metadata-write"),
+                    tunnel: Some(&tunnel.subdomain),
+                    target: None,
+                    reason: "Could not write tunnel request metadata.",
+                    hint: "Daemon transport is degraded; check tnld logs.",
+                    req_id,
+                    version,
+                },
+                accept,
+                None,
+            );
+        }
+    }
 
     // ---- Drive the substream as an HTTP/1 client connection -----------------
     //
@@ -224,11 +272,14 @@ pub async fn handler(State(state): State<AppState>, req: Request) -> Response<Bo
     // The connection future drives IO; it completes once the response body has
     // been consumed and the substream closes. It must run concurrently with the
     // response read below, so spawn it.
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            debug!(error = %e, "tunnel client connection ended");
+    tokio::spawn(
+        async move {
+            if let Err(e) = conn.await {
+                debug!(error = %e, "tunnel client connection ended");
+            }
         }
-    });
+        .in_current_span(),
+    );
 
     // ---- Forward the request ------------------------------------------------
     let method = req.method().clone();

@@ -31,6 +31,7 @@ async fn inspector_emits_one_log_per_request() {
         public_url: "http://x".into(),
         hostname_root: "t.x".into(),
         tokens_file: tmp.path().to_string_lossy().into_owned(),
+        trusted_proxies: vec![],
         session_grace_sec: 30,
     };
     let h = spawn_server(cfg).await.unwrap();
@@ -47,7 +48,10 @@ async fn inspector_emits_one_log_per_request() {
     let _accept = tokio::spawn(tnl::client::run_accept_loop(
         session.session,
         tnl::target::Target::LocalhostPort(backend_port),
-        tnl::forwarder::ForwardCtx::new("demo".into(), Some(tx), env!("CARGO_PKG_VERSION")),
+        tnl::forwarder::ForwardCtx {
+            data_stream_protocol: session.data_stream_protocol,
+            ..tnl::forwarder::ForwardCtx::new("demo".into(), Some(tx), env!("CARGO_PKG_VERSION"))
+        },
     ));
     tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -66,4 +70,11 @@ async fn inspector_emits_one_log_per_request() {
     assert_eq!(log.method, "GET");
     assert_eq!(log.path, "/api/ping");
     assert_eq!(log.status, Some(200));
+    let json = serde_json::to_value(&log).unwrap();
+    assert_eq!(json["visitor_ip"], "127.0.0.1");
+    assert_eq!(json["peer_ip"], "127.0.0.1");
+    assert_eq!(json["visitor_ip_source"], "peer");
+    assert!(tokio::time::timeout(Duration::from_millis(100), rx.recv())
+        .await
+        .is_err());
 }

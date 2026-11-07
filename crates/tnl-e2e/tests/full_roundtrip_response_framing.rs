@@ -60,6 +60,7 @@ async fn tunnel_to(
         public_url: "http://test".into(),
         hostname_root: "t.example.com".into(),
         tokens_file,
+        trusted_proxies: vec![],
         session_grace_sec: 30,
     };
     let tnld_handle = spawn_server(cfg).await.unwrap();
@@ -79,7 +80,10 @@ async fn tunnel_to(
         let _ = tnl::client::run_accept_loop(
             session_box,
             tnl::target::Target::LocalhostPort(backend_port),
-            tnl::forwarder::ForwardCtx::new(subdomain.into(), None, env!("CARGO_PKG_VERSION")),
+            tnl::forwarder::ForwardCtx {
+                data_stream_protocol: session.data_stream_protocol,
+                ..tnl::forwarder::ForwardCtx::new(subdomain.into(), None, env!("CARGO_PKG_VERSION"))
+            },
         )
         .await;
     });

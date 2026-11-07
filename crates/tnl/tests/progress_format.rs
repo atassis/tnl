@@ -18,6 +18,9 @@ async fn renders_success_and_failure_without_panic() {
 
     let ok = LogLine {
         req_id: ulid::Ulid::nil(),
+        visitor_ip: None,
+        peer_ip: None,
+        visitor_ip_source: None,
         timestamp: SystemTime::UNIX_EPOCH,
         method: "GET".into(),
         path: "/api".into(),
@@ -31,6 +34,9 @@ async fn renders_success_and_failure_without_panic() {
     };
     let err = LogLine {
         req_id: ulid::Ulid::nil(),
+        visitor_ip: None,
+        peer_ip: None,
+        visitor_ip_source: None,
         timestamp: SystemTime::UNIX_EPOCH,
         method: "POST".into(),
         path: "/login".into(),

@@ -11,6 +11,7 @@ fn make_cfg(tokens_file: String) -> Config {
         public_url: "http://test".into(),
         hostname_root: "t.example.com".into(),
         tokens_file,
+        trusted_proxies: vec![],
         session_grace_sec: 30,
     }
 }
