@@ -166,7 +166,9 @@ pub mod peek {
 
     /// Parse `HTTP/x.y CODE REASON` and return the numeric status code.
     pub fn parse_response_status(bytes: &[u8]) -> Option<u16> {
-        let s = std::str::from_utf8(bytes).ok()?;
+        // Headers, bodies, and upgraded protocol bytes need not be UTF-8.
+        let line_bytes = bytes.split(|&byte| byte == b'\n').next()?;
+        let s = std::str::from_utf8(line_bytes).ok()?;
         let first_line = s.lines().next()?;
         let mut parts = first_line.split_whitespace();
         let _http = parts.next()?;
