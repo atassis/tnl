@@ -10,7 +10,16 @@ use tnld::serve::{spawn_server_with_state, AppState};
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn client_reattaches_within_grace_window() {
     // 1. Local backend that returns 200 "ok".
-    let backend = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+    let backend = axum::Router::new().route(
+        "/",
+        axum::routing::get(|headers: axum::http::HeaderMap| async move {
+            let mut response = axum::http::Response::new(axum::body::Body::from("ok"));
+            response
+                .headers_mut()
+                .insert("x-backend-id", headers["x-tnl-request-id"].clone());
+            response
+        }),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -42,6 +51,7 @@ async fn client_reattaches_within_grace_window() {
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
     let endpoint = format!("http://{daemon_addr}");
     let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+    let (log_tx, mut log_rx) = tokio::sync::mpsc::channel(8);
     let mut task = tokio::spawn(async move {
         start_rx.await?;
         tnl::reconnect::run(
@@ -52,7 +62,7 @@ async fn client_reattaches_within_grace_window() {
             tnl::host_header::HostHeader::Auto,
             tnl::reconnect::Hooks {
                 cancel_first_session: Some(cancel_rx),
-                log_tx: None,
+                log_tx: Some(log_tx),
             },
         )
         .await
@@ -87,7 +97,7 @@ async fn client_reattaches_within_grace_window() {
         .await
         .unwrap();
     assert_eq!(r.status().as_u16(), 200, "first request failed");
-    assert_eq!(r.text().await.unwrap(), "ok");
+    let id = assert_correlated_response(r, &mut log_rx).await;
 
     // 5. Force a disconnect; the reconnect loop should attempt ReattachTunnel.
     cancel_tx.send(()).unwrap();
@@ -110,15 +120,29 @@ async fn client_reattaches_within_grace_window() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        r.status().as_u16(),
-        200,
-        "second request failed after reattach"
-    );
+    assert_eq!(r.status().as_u16(), 200, "reattached request failed");
 
-    assert_eq!(r.text().await.unwrap(), "ok");
-
+    let reattached_id = assert_correlated_response(r, &mut log_rx).await;
+    assert_ne!(reattached_id, id);
     task.abort();
+}
+
+async fn assert_correlated_response(
+    response: reqwest::Response,
+    logs: &mut tokio::sync::mpsc::Receiver<tnl::inspector::LogLine>,
+) -> String {
+    let id = response.headers()["x-tnl-request-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(response.headers()["x-backend-id"], id);
+    assert_eq!(response.text().await.unwrap(), "ok");
+    let log = tokio::time::timeout(Duration::from_secs(2), logs.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(log.req_id.to_string(), id);
+    id
 }
 
 /// Observe daemon-side routing readiness without issuing/retrying HTTP requests.

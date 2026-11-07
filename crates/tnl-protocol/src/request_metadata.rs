@@ -73,8 +73,33 @@ pub struct VisitorIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RequestMetadataV1 {
     /// The existing daemon handler request ID, not a second generated ID.
+    #[serde(with = "request_id")]
     pub request_id: ulid::Ulid,
     pub visitor: VisitorIdentity,
+}
+
+// Keep the wire identity canonical and nonzero, including on the typed writer.
+mod request_id {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use ulid::Ulid;
+
+    pub fn serialize<S: Serializer>(id: &Ulid, serializer: S) -> Result<S::Ok, S::Error> {
+        if *id == Ulid::nil() {
+            return Err(serde::ser::Error::custom("request ID must be nonzero"));
+        }
+        serializer.serialize_str(&id.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Ulid, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        let id = value.parse::<Ulid>().map_err(serde::de::Error::custom)?;
+        if id == Ulid::nil() || value != id.to_string() {
+            return Err(serde::de::Error::custom(
+                "request ID must be a canonical nonzero ULID",
+            ));
+        }
+        Ok(id)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -274,9 +274,12 @@ pub async fn handler(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req: Request,
 ) -> Response<Body> {
+    let req_id = ulid::Ulid::new();
     let visitor = state.trusted_proxies.resolve(peer.ip(), req.headers());
-    let span = tracing::info_span!("data_plane_request", visitor_ip = %visitor.visitor_ip, peer_ip = %visitor.peer_ip, visitor_ip_source = visitor.source.as_str());
-    handle_request(state, req, visitor).instrument(span).await
+    let span = tracing::info_span!("data_plane_request", %req_id, visitor_ip = %visitor.visitor_ip, peer_ip = %visitor.peer_ip, visitor_ip_source = visitor.source.as_str());
+    handle_request(state, req, visitor, req_id)
+        .instrument(span)
+        .await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -284,11 +287,9 @@ async fn handle_request(
     state: AppState,
     mut req: Request,
     visitor: VisitorIdentity,
+    req_id: ulid::Ulid,
 ) -> Response<Body> {
     use tnl_protocol::error_page::{parse_accept, Component, ErrorContext};
-    use ulid::Ulid;
-
-    let req_id = Ulid::new();
     let version = env!("CARGO_PKG_VERSION");
 
     // ---- Accept negotiation -------------------------------------------------
@@ -543,6 +544,7 @@ async fn handle_request(
     let path = req.uri().path().to_string();
     let (mut parts, body) = req.into_parts();
     strip_hop_by_hop(&mut parts.headers);
+    set_request_id(&mut parts.headers, req_id);
     if websocket.is_some() {
         set_websocket_upgrade_headers(&mut parts.headers);
     } else {
@@ -678,6 +680,7 @@ async fn handle_request(
         tokio::spawn(relay_websocket(downstream, upstream, req_id).in_current_span());
         let (mut parts, _) = resp.into_parts();
         strip_hop_by_hop(&mut parts.headers);
+        set_request_id(&mut parts.headers, req_id);
         set_websocket_upgrade_headers(&mut parts.headers);
         info!(host = %host_no_port, method = %method, path = %path,
             status = 101, req_id = %req_id, "data-plane request");
@@ -690,6 +693,7 @@ async fn handle_request(
     let (mut resp_parts, incoming) = resp.into_parts();
     let status = resp_parts.status;
     strip_hop_by_hop(&mut resp_parts.headers);
+    set_request_id(&mut resp_parts.headers, req_id);
 
     info!(
         host = %host_no_port,
@@ -703,6 +707,15 @@ async fn handle_request(
     Response::from_parts(resp_parts, Body::new(incoming))
 }
 
+/// Install authority only after hop filtering: Connection nominations and all
+/// inbound duplicates must lose to the handler's locally minted ID.
+fn set_request_id(headers: &mut HeaderMap, req_id: ulid::Ulid) {
+    let Ok(value) = HeaderValue::from_str(&req_id.to_string()) else {
+        unreachable!("a typed ULID contains only HTTP-safe ASCII");
+    };
+    headers.insert("x-tnl-request-id", value);
+}
+
 fn error_response(
     status: StatusCode,
     component: tnl_protocol::error_page::Component,
@@ -711,6 +724,7 @@ fn error_response(
     retry_after_secs: Option<&str>,
 ) -> Response<Body> {
     use tnl_protocol::error_page::render;
+    debug!(req_id = %ctx.req_id, status = %status.as_u16(), component = component.as_header(), "data-plane error response");
     let body = render(ctx, accept);
     let mut builder = Response::builder()
         .status(status)

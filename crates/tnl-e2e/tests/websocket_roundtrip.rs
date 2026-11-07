@@ -587,3 +587,82 @@ async fn upgrade_local_eof_malformed_and_connect_refusal_remain_safe_http_errors
     .await
     .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn websocket_request_id_overrides_duplicates_and_connection_nominations() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut tunnel = tunnel(listener.local_addr().unwrap(), HostHeader::Preserve, false).await;
+        let backend = tokio::spawn(async move {
+            let mut ids = Vec::new();
+            for nominate_response_id in [false, true, false, true] {
+                let (mut io, _) = listener.accept().await.unwrap();
+                let req = head(&mut io).await;
+                let ids_in_head: Vec<_> = req.lines().filter_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("x-tnl-request-id").then(|| value.trim())
+                }).collect();
+                assert_eq!(ids_in_head.len(), 1, "{req}");
+                ids.push(ids_in_head[0].to_string());
+                assert!(req.to_lowercase().contains("connection: upgrade\r\n"));
+                let nomination = if nominate_response_id {
+                    "Connection: X-Tnl-Request-Id\r\n"
+                } else {
+                    ""
+                };
+                let response = RESPONSE.replace("\r\n\r\n", &format!(
+                    "\r\n{nomination}X-Tnl-Request-Id: backend-forgery\r\nX-Tnl-Request-Id: 01BX5ZZKBKACTAV9WEVGEMMVRZ\r\nSec-WebSocket-Protocol: chat\r\n\r\n"
+                ));
+                io.write_all(response.as_bytes()).await.unwrap();
+                let mut ws = WebSocketStream::from_raw_socket(TokioAdapter::new(io), Role::Server, None).await;
+                let payload = Message::Binary(vec![0, 255, 128, 1, 2].into());
+                assert_eq!(ws.next().await.unwrap().unwrap(), payload);
+                ws.send(payload).await.unwrap();
+                assert!(matches!(ws.next().await.unwrap().unwrap(), Message::Close(_)));
+                ws.flush().await.unwrap();
+            }
+            ids
+        });
+        let mut public_ids = Vec::new();
+        for nominate_request_id in [false, true] {
+            for _ in [false, true] {
+                let mut req = http::Request::builder()
+                    .uri(format!("ws://{}/socket?q=1", tunnel.server.local_addr))
+                    .header("host", "ws.t.example.com")
+                    .header("connection", "upgrade")
+                    .header("upgrade", "websocket")
+                    .header("sec-websocket-key", KEY)
+                    .header("sec-websocket-version", "13")
+                    .header("sec-websocket-protocol", "chat, other")
+                    .header("X-Tnl-Request-Id", "visitor-forgery")
+                    .header("x-tnl-request-id", "01BX5ZZKBKACTAV9WEVGEMMVRZ")
+                    .body(())
+                    .unwrap();
+                if nominate_request_id {
+                    req.headers_mut().append("connection", "X-Tnl-Request-Id".parse().unwrap());
+                }
+                let (mut ws, response) = client_async(req, TcpStream::connect(tunnel.server.local_addr).await.unwrap()).await.unwrap();
+                assert_eq!(response.status(), 101);
+                assert_eq!(response.headers()["sec-websocket-accept"], "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+                assert_eq!(response.headers()["sec-websocket-protocol"], "chat");
+                assert_eq!(response.headers().get_all("x-tnl-request-id").iter().count(), 1);
+                let id = response.headers()["x-tnl-request-id"].to_str().unwrap().to_string();
+                assert_eq!(id.len(), 26);
+                assert_ne!(id, "01BX5ZZKBKACTAV9WEVGEMMVRZ");
+                assert!(!public_ids.contains(&id));
+                public_ids.push(id.clone());
+                let payload = Message::Binary(vec![0, 255, 128, 1, 2].into());
+                ws.send(payload.clone()).await.unwrap();
+                assert_eq!(ws.next().await.unwrap().unwrap(), payload);
+                ws.close(None).await.unwrap();
+                assert!(matches!(ws.next().await.unwrap().unwrap(), Message::Close(_)));
+                drop(ws);
+                let log = tunnel.logs.recv().await.unwrap();
+                assert_eq!(log.req_id.to_string(), id);
+                assert_eq!(log.status, Some(101));
+                assert_eq!(log.path, "/socket?q=1");
+            }
+        }
+        assert_eq!(backend.await.unwrap(), public_ids);
+    }).await.expect("WS request-ID correlation or opaque echo stalled");
+}

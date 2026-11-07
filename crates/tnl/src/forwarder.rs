@@ -184,7 +184,7 @@ pub mod peek {
 }
 
 /// Authoritative context decoded before HTTP probing. Legacy sessions have no
-/// metadata; request-ID propagation is intentionally owned by the next lane.
+/// metadata and use an independent local-only correlation ID.
 #[derive(Debug)]
 struct RequestContext {
     metadata: Option<RequestMetadataV1>,
@@ -205,7 +205,6 @@ pub async fn forward(
     target: Target,
     ctx: ForwardCtx,
 ) -> anyhow::Result<()> {
-    let req_id = ulid::Ulid::new();
     let started = Instant::now();
 
     let request = RequestContext {
@@ -221,6 +220,13 @@ pub async fn forward(
         },
     };
 
+    // Only authenticated metadata can supply a shared ID. Raw HTTP headers are
+    // application data, even when they look like daemon-generated headers.
+    let req_id = request
+        .metadata
+        .as_ref()
+        .map_or_else(ulid::Ulid::new, |m| m.request_id);
+
     // Phase 1: peek request head.
     let probe = peek_request_head(
         &mut substream,
@@ -235,14 +241,14 @@ pub async fn forward(
         | RequestHeadProbe::Timeout(buf) => (buf, Vec::new()),
     };
     let (method, path, accept) = parse_head_for_synth(&head_bytes);
-    debug!(%method, %path, "request head parsed");
+    debug!(%req_id, %method, %path, "request head parsed");
 
     // Phase 1: connect.
     let connect_outcome = connect_local(&target, LOCAL_CONNECT_TIMEOUT).await;
     let (mut tcp, resolved_addr) = match connect_outcome {
         Ok((s, a)) => (s, a),
         Err(e) => {
-            warn!(error = %e, display = %target.display(), "local connect failed");
+            warn!(%req_id, error = %e, display = %target.display(), "local connect failed");
             let reason_str = e.to_string();
             let synth = synth_response_bytes(&SynthInput {
                 kind: e.to_kind(),
@@ -542,7 +548,7 @@ async fn synth_phase2<W: AsyncWrite + Unpin>(
     bytes_in: u64,
     log_reason_for_warn: &str,
 ) -> anyhow::Result<()> {
-    warn!(error = %log_reason_for_warn, %kind, "phase-2 failure → synth");
+    warn!(%req_id, error = %log_reason_for_warn, %kind, "phase-2 failure → synth");
     let synth = synth_response_bytes(&SynthInput {
         kind,
         reason,

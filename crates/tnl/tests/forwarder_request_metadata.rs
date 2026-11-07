@@ -24,7 +24,7 @@ async fn request(port: u16, mode: DataStreamProtocol, prelude: &[u8]) -> tnl::in
     let task = tokio::spawn(forward(Box::pin(reader), Target::LocalhostPort(port), ctx));
     writer.write_all(prelude).await.unwrap();
     writer
-        .write_all(b"GET /hello HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 203.0.113.66\r\n\r\n")
+        .write_all(b"GET /hello HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 203.0.113.66\r\nX-Tnl-Request-Id: 01BX5ZZKBKACTAV9WEVGEMMVRZ\r\nAccept: application/json\r\n\r\n")
         .await
         .unwrap();
     writer.shutdown().await.unwrap();
@@ -38,11 +38,38 @@ async fn request(port: u16, mode: DataStreamProtocol, prelude: &[u8]) -> tnl::in
     assert_eq!(
         log.bytes_in,
         u64::try_from(
-            b"GET /hello HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 203.0.113.66\r\n\r\n".len()
+            b"GET /hello HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 203.0.113.66\r\nX-Tnl-Request-Id: 01BX5ZZKBKACTAV9WEVGEMMVRZ\r\nAccept: application/json\r\n\r\n".len()
         )
         .unwrap()
     );
     assert!(rx.recv().await.is_none(), "duplicate record");
+    if mode == DataStreamProtocol::Http1MetadataV1 {
+        assert_eq!(log.req_id, metadata().request_id);
+        if log.status == Some(502) {
+            let response = String::from_utf8(response).unwrap();
+            assert!(
+                response.to_ascii_lowercase().contains(&format!(
+                    "x-tnl-request-id: {}",
+                    metadata().request_id.to_string().to_ascii_lowercase()
+                )),
+                "{response}"
+            );
+            let body: serde_json::Value =
+                serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(body["request_id"], metadata().request_id.to_string());
+        }
+    } else {
+        assert_ne!(log.req_id.to_string(), "01BX5ZZKBKACTAV9WEVGEMMVRZ");
+        assert_ne!(log.req_id, metadata().request_id);
+        let response = String::from_utf8(response).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            body["request_id"],
+            log.req_id.to_string(),
+            "raw synth ID stays local"
+        );
+    }
     log
 }
 
@@ -56,6 +83,7 @@ async fn forwarder_request_metadata_keeps_identity_on_connect_failure_and_legacy
         .await
         .unwrap();
     let log = request(port, DataStreamProtocol::Http1MetadataV1, &frame).await;
+    assert_eq!(log.req_id, metadata().request_id);
     assert_eq!(log.visitor_ip, Some(metadata().visitor.visitor_ip));
     assert_eq!(log.peer_ip, Some(metadata().visitor.peer_ip));
     assert_eq!(log.visitor_ip_source, Some(VisitorIpSource::XForwardedFor));
@@ -101,6 +129,7 @@ async fn forwarder_request_metadata_is_removed_before_backend_and_survives_phase
         });
         let log = request(port, DataStreamProtocol::Http1MetadataV1, &frame).await;
         assert_eq!(log.status, Some(if failure.is_some() { 502 } else { 200 }));
+        assert_eq!(log.req_id, metadata().request_id);
         assert_eq!(log.visitor_ip, Some(metadata().visitor.visitor_ip));
         assert_eq!(log.visitor_ip_source, Some(VisitorIpSource::XForwardedFor));
         assert_eq!(log.failure_kind.as_deref(), failure);
@@ -110,7 +139,18 @@ async fn forwarder_request_metadata_is_removed_before_backend_and_survives_phase
 
 #[tokio::test(start_paused = true)]
 async fn forwarder_request_metadata_bad_or_stalled_prelude_never_connects() {
-    for bytes in [vec![0, 0, 4, 1], vec![0, 0, 0, 2, b'{'], vec![]] {
+    let good_json = serde_json::to_string(&metadata()).unwrap();
+    let mut invalid_frames = vec![vec![0, 0, 4, 1], vec![0, 0, 0, 2, b'{'], vec![]];
+    for json in [
+        good_json.replace("01ARZ3NDEKTSV4RRFFQ69G5FAV", "00000000000000000000000000"),
+        good_json.replace("01ARZ3NDEKTSV4RRFFQ69G5FAV", "invalid"),
+        good_json.replace("2001:db8::7", "not-an-ip"),
+    ] {
+        let mut frame = u32::try_from(json.len()).unwrap().to_be_bytes().to_vec();
+        frame.extend_from_slice(json.as_bytes());
+        invalid_frames.push(frame);
+    }
+    for bytes in invalid_frames {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (mut writer, reader) = tokio::io::duplex(65536);
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -258,6 +298,7 @@ async fn forwarder_request_metadata_preserves_coalesced_chunked_body_bytes() {
     backend.await.unwrap();
     let log = rx.recv().await.unwrap();
     assert_eq!(log.bytes_in, u64::try_from(http.len()).unwrap());
+    assert_eq!(log.req_id, metadata().request_id);
     assert_eq!(log.visitor_ip, Some(metadata().visitor.visitor_ip));
     assert_eq!(log.status, Some(200));
 }
@@ -296,6 +337,7 @@ async fn forwarder_request_metadata_survives_capped_http_probe() {
     task.await.unwrap().unwrap();
     let log = rx.recv().await.unwrap();
     assert_eq!(log.path, "/large");
+    assert_eq!(log.req_id, metadata().request_id);
     assert_eq!(log.visitor_ip, Some(metadata().visitor.visitor_ip));
     assert_eq!(log.visitor_ip_source, Some(VisitorIpSource::XForwardedFor));
     assert_eq!(log.failure_kind.as_deref(), Some("connect-refused"));

@@ -3,7 +3,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn metadata() -> RequestMetadataV1 {
     RequestMetadataV1 {
-        request_id: ulid::Ulid::nil(),
+        request_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap(),
         visitor: VisitorIdentity {
             visitor_ip: "2001:db8::7".parse().unwrap(),
             peer_ip: "127.0.0.1".parse().unwrap(),
@@ -73,7 +73,7 @@ async fn request_metadata_rejects_invalid_typed_payloads() {
             &good[1..]
         ),
         good.replace("\"source\":", "\"source\":\"peer\",\"source\":"),
-        good.replace("00000000000000000000000000", "invalid-ulid"),
+        good.replace("01ARZ3NDEKTSV4RRFFQ69G5FAV", "invalid-ulid"),
     ];
     for json in invalid {
         let mut frame = u32::try_from(json.len()).unwrap().to_be_bytes().to_vec();
@@ -110,4 +110,45 @@ async fn request_metadata_reader_does_not_consume_http() {
     let mut rest = String::new();
     reader.read_to_string(&mut rest).await.unwrap();
     assert_eq!(rest, "HTTP");
+}
+
+#[tokio::test]
+async fn request_metadata_rejects_noncanonical_or_nil_request_ids() {
+    let visitor = serde_json::to_string(&metadata().visitor).unwrap();
+    for id in [
+        "null",
+        "42",
+        "[]",
+        "\"invalid\"",
+        "\"00000000000000000000000000\"",
+        "\"01arz3ndektsv4rrffq69g5fav\"",
+        "\"81ARZ3NDEKTSV4RRFFQ69G5FAV\"",
+        "\"01ARZ3NDEKTSV4RRFFQ69G5FAI\"",
+        "\" 01ARZ3NDEKTSV4RRFFQ69G5FAV\"",
+        "\"1ARZ3NDEKTSV4RRFFQ69G5FAV\"",
+    ] {
+        let json = format!("{{\"request_id\":{id},\"visitor\":{visitor}}}");
+        let mut frame = u32::try_from(json.len()).unwrap().to_be_bytes().to_vec();
+        frame.extend_from_slice(json.as_bytes());
+        assert!(
+            read_request_metadata(&mut frame.as_slice()).await.is_err(),
+            "accepted {id}"
+        );
+    }
+    for json in [
+        format!("{{\"visitor\":{visitor}}}"),
+        format!("{{\"request_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"request_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"visitor\":{visitor}}}"),
+    ] {
+        let mut frame = u32::try_from(json.len()).unwrap().to_be_bytes().to_vec();
+        frame.extend_from_slice(json.as_bytes());
+        assert!(read_request_metadata(&mut frame.as_slice()).await.is_err());
+    }
+    let mut invalid = metadata();
+    invalid.request_id = ulid::Ulid::nil();
+    let mut bytes = Vec::new();
+    assert!(write_request_metadata(&mut bytes, &invalid).await.is_err());
+    assert!(
+        bytes.is_empty(),
+        "invalid typed values must fail before writing"
+    );
 }

@@ -99,7 +99,7 @@ impl Inspector {
             .as_ref()
             .map_or_else(|| fmt_bytes(l.bytes_out), std::clone::Clone::clone);
         format!(
-            "{}  {:<6} {:<26}\u{2192} {:<21} {}  {:>6}ms  {}  ip={} source={}",
+            "{}  {:<6} {:<26}\u{2192} {:<21} {}  {:>6}ms  {}  ip={} source={} req_id={}",
             t,
             l.method,
             truncate(&l.path, 26),
@@ -111,7 +111,8 @@ impl Inspector {
             l.visitor_ip_source.map_or(
                 "unavailable",
                 tnl_protocol::request_metadata::VisitorIpSource::as_str
-            )
+            ),
+            l.req_id
         )
     }
 }
@@ -205,18 +206,21 @@ mod tests {
         let mut inspector = Inspector::new(mpsc::channel(1).1, Verbosity::Default, Format::Text);
         inspector.use_color = false;
         let rendered = inspector.format_line(&l).unwrap();
-        assert!(rendered.ends_with("  ip=- source=unavailable"));
+        assert!(rendered.ends_with(&format!("  ip=- source=unavailable req_id={}", l.req_id)));
         assert!(!rendered.contains('\u{1b}'));
         l.visitor_ip = Some("2001:db8:1234:5678:abcd:ef01:2345:6789".parse().unwrap());
         l.peer_ip = Some("::1".parse().unwrap());
         l.visitor_ip_source = Some(tnl_protocol::request_metadata::VisitorIpSource::XForwardedFor);
         let rendered = inspector.format_line(&l).unwrap();
-        assert!(rendered
-            .ends_with("  ip=2001:db8:1234:5678:abcd:ef01:2345:6789 source=x_forwarded_for"));
+        assert!(rendered.ends_with(&format!(
+            "  ip=2001:db8:1234:5678:abcd:ef01:2345:6789 source=x_forwarded_for req_id={}",
+            l.req_id
+        )));
         let json_inspector = Inspector::new(mpsc::channel(1).1, Verbosity::Verbose, Format::Json);
         let json: serde_json::Value =
             serde_json::from_str(&json_inspector.format_line(&l).unwrap()).unwrap();
         assert_eq!(json["visitor_ip"], "2001:db8:1234:5678:abcd:ef01:2345:6789");
+        assert_eq!(json["req_id"], l.req_id.to_string());
         assert_eq!(json["peer_ip"], "::1");
         assert_eq!(json["visitor_ip_source"], "x_forwarded_for");
         let quiet = Inspector::new(mpsc::channel(1).1, Verbosity::Quiet, Format::Json);
