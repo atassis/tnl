@@ -1,6 +1,6 @@
 # Roadmap release-validation task specification
 
-**Status:** Sections 1–11 are the original design proposal, not blanket approval. Bounded T7 phase1 actual-Caddy fixture qualification is implemented; see §12 for its authority, measured results, and remaining gates.
+**Status:** Sections 1–11 are the original design proposal, not blanket approval. Bounded T7 phase1 actual-Caddy and phase2 executable-harness qualification are implemented; see §§12–13 for authority, measured results, and remaining gates.
 **Goal:** Qualify one reconciled release containing visitor IP, shared request IDs, application WebSockets, inspection/history, replay, and per-tunnel access controls; perform one coordinated deployment followed by one integrated acceptance campaign, not seven independent deploys.
 **Architecture recommendation:** Keep feature logic and unit tests in its owning lane. Extend the existing Rust e2e crate with isolated interaction fixtures, then add an explicit packaged-binary/Caddy acceptance gate and a deployment evidence/rollback checklist. Test the same candidate artifacts that will be installed.
 **Stack:** Rust 1.94 toolchain, Tokio, axum/hyper, async-tungstenite/yamux, existing Cargo workspace; Caddy and Docker only when explicitly provisioned/authorized.
@@ -378,3 +378,162 @@ hit a 120s outer command deadline; the complete rerun passed.
   campaign remain pending feature reconciliation and operator approval.
 - No staging, commits, merges, pushes, remote changes or paid child execution.
   Parent independent review and commit are required before integration.
+
+
+## 13. T7 phase2: local executable acceptance harness (implemented)
+
+**This qualifies the harness, not an immutable package or final combined release.**
+Source baseline: `53860d467912664835535da24c0882695346f45d`. The supplied
+integration debug client includes browser replay wiring from `42169c8`, which is
+not yet part of this worktree's source baseline. Tests invoke explicit external
+executables; they never substitute Cargo-built product executables or invent
+product flags. Schema/review reconciliation and one final release-binary campaign
+must follow later.
+
+New files: `crates/tnl-e2e/tests/packaged_acceptance.rs` and
+`crates/tnl-e2e/tests/support/packaged.rs`. No dependencies or product code changed.
+The five executable tests are ignored by default, like the actual-Caddy tests;
+explicit execution fails on absent/nonabsolute executable paths rather than
+silently skipping or finding a PATH fallback.
+
+### Reproduction and provisional identities
+
+```sh
+export TNL_TEST_CLIENT_BIN=/home/atassis/.cache/tnl-request-ids-target/debug/tnl
+export TNL_TEST_DAEMON_BIN=/home/atassis/.cache/tnl-request-ids-target/debug/tnld
+export TNL_TEST_CADDY_BIN="$PWD/target/caddy-qualification/caddy"
+export CARGO_TARGET_DIR=/home/atassis/.cache/tnl-websockets-target
+export CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+cargo test --locked --offline -p tnl-e2e --test packaged_acceptance \
+  -- --ignored --nocapture --test-threads=1
+# Also explicitly rerun the existing Caddy forced-close negative control:
+cargo test --locked --offline -p tnl-e2e --test visitor_ip_caddy \
+  -- --include-ignored --nocapture --test-threads=1
+```
+
+Measured debug artifacts (both report `0.1.0-beta.4`; versions alone are not
+candidate identity):
+
+- Client SHA256: `2946f9ed45ed6e48df27b52b01d27d2bc6a6285b0e248e68d4e0cc35ce616727`.
+- Daemon SHA256: `277bef7679f8f522d7109e4f0e17226ebc9de0177441dd6ff0d28bd7b160c862`.
+- Caddy remains the verified v2.11.3 artifact/digest in §12; no SSH was needed.
+- Toolchain remains Rust/Cargo 1.94.1. The exclusive websockets cache is used with
+  debug information disabled; the removed visitor-ip cache was not rebuilt.
+
+### What the real executable tests establish
+
+- Real `tnld token add` mints only a fixture-owned token, captured privately and
+  never printed by the harness. Real daemon, CLI, and actual Caddy processes use
+  isolated private temporary state, cleared child environments, synthetic config,
+  and HOME/XDG isolation from the first launch. Config/log files are private;
+  credentials, bootstrap capabilities and confirmation tickets are not dumped.
+- Both Caddy virtual hosts use reviewed repository proxy directives, adapted only
+  for local HTTP, loopback ports and disabled admin/ACME. All network traffic is
+  to 127/8; no public server, DNS issuer, global CA or external proxy is used.
+- Default CLI without `--inspect` has no inspector bootstrap, forwards normal
+  HTTP unchanged, and emits correlated structured logs. Public spoofed XFF/IDs
+  cannot override `127.0.0.2` visitor attribution or the daemon-owned ID across
+  backend request, public response and CLI log. Backend ID collisions are ignored.
+- A real application 101, not just `/control`, relays binary frames coalesced
+  with both request and response heads, binary echo and graceful close. Ordinary
+  HTTP succeeds while WS remains open. Existing §12 forced-close negative control
+  is rerun against actual Caddy and still detects the upgrade-breaking directive.
+- Real daemon restart causes the running CLI to reconnect/recreate the same
+  explicit public name and resume attributed traffic. The CLI is also stopped by
+  Ctrl-C and restarted as a new process claiming that same name (fixture grace
+  disabled, not a product-default change).
+- Actual `--inspect --replay-retain-secrets` supports authenticated v1 API reads,
+  rejects missing authorization and foreign Origin, correlates complete records,
+  redacts authorization/cookies/body-password/response secrets, and keeps both
+  request/response body previews off by default. A separate CLI run explicitly
+  enables JSON previews and verifies useful sanitized JSON remains visible.
+- Replay POSTs independently require matching Origin, `Sec-Fetch-Site:
+  same-origin`, mode `cors`, and destination `empty`. Missing any one is rejected.
+  Prepare and unacknowledged confirmation deliver zero backend requests.
+  Explicit confirmation sends exactly the original method/target, Host,
+  Authorization, Cookie, Content-Type and secret-bearing body to the fixed local
+  target. Duplicate confirmation is idempotent. One case succeeds; another drops
+  the backend response after delivery and produces a failed/possibly-sent outcome
+  with no automatic retry. Outcomes remain sanitized and linked to the capture.
+- Protected CLI over plain HTTP fails before publishing a tunnel. A protected CLI
+  pointed at a generated, untrusted loopback HTTPS issuer actually rejects its
+  certificate, sends no application traffic and can be stopped cleanly. No
+  insecure TLS flag, product custom CA, or trust-store installation is used.
+- Readiness uses real health and authenticated CLI status, not fixed sleeps or
+  banner-only guesses. Conditions/commands have 10s deadlines, HTTP requests 3s,
+  and test-level budgets are 45–90s. The 25ms interval is conditional polling;
+  150ms negative-delivery checks assert absence, not startup timing. Every child,
+  including token/status/signal helpers, has a kill/wait guard. Fixture children
+  stop before temporary files disappear. Intentional panic and occupied-inspector
+  startup failure regressions prove listener cleanup; Ctrl-C closes the inspector
+  and allows rebinding its exact address.
+
+### Validation and remaining gates
+
+Local ignored evidence is in `target/packaged-qualification/`: `identity.log`,
+`actual-binaries.log`, `green.log`, `fmt.log`, `clippy.log`, and `workspace.log`.
+After the independent-review fixes below, the executable suite passes **5/5**
+plus one nonignored connection-oracle counterfactual; the existing Caddy suite
+passes **5/5**. Workspace validation on this source baseline passes **392 tests,
+0 failures, 10 ignored** (nine environment-dependent fixture tests plus slow
+reattach). The initial pre-review checkpoint was 4 executable cases and 391
+workspace passes / 9 ignores.
+Formatting and workspace all-target clippy with `-D warnings` pass.
+
+This does **not** qualify successful protected TLS with production CLI roots:
+webpki does not trust the fixture's generated issuer. Existing generated-CA
+library tests qualify logic only, and this harness qualifies real CLI rejection.
+Successful protected HTTPS/WSS, valid public certificate/hostname/issuer, real
+proxy/CDN chain, and complete production ingress must be checked after an
+operator-authorized deployment. Local HTTP is never labeled public TLS proof.
+
+Final schema lane/reviews, immutable release tnl/tnld paths and hashes, actual
+packaged image/non-root mounted-config readiness, protected all-feature
+interactions, compatibility/rollback, and the one combined campaign remain
+pending. Re-run this harness with the final explicit release binaries after
+integration; debug evidence above is not transferable to new artifacts. No
+staging, commits, remote actions or deployment occurred in phase2.
+
+
+### Independent-review P2 follow-up: strict raw input and redirect enforcement
+
+Review `818ba50e` correctly identified two missing executable coverage areas;
+neither was a demonstrated product vulnerability. Both are now qualified by
+actual supplied binaries rather than serializer or probe-client behavior:
+
+- `Inspector::raw_mutation` sends bounded authenticated HTTP/1 bytes directly to
+  the real CLI inspector. It does not serialize/normalize attacker JSON or merge
+  duplicate headers. Every rejection case checks the exact HTTP status, a fully
+  framed JSON response, real `Cache-Control: no-store`, and absence of CORS grants.
+- The prepare/confirm rejection table sends malformed JSON, invalid UTF-8,
+  duplicate schema and confirmation fields, unknown fields, target/header/body
+  overrides, unsupported Content-Encoding (including `identity` and duplicated
+  encoding), duplicate Host/Origin/Fetch metadata/Authorization/Content-Type/
+  Content-Length, transfer coding, and false acknowledgement. Expected statuses
+  are 400 for framing/JSON/encoding, 401 for duplicate authorization, and 403 for
+  duplicated browser authority/context. An oversized **otherwise valid JSON**
+  document tests the actual 1024-byte body boundary; no helper refuses it first.
+  This does not claim an HTTP status for oversized heads: the product's head cap
+  closes the socket, and that separate behavior is outside this rejection table.
+- Backend accept counters increment before reading a request head. Each rejected
+  raw request must leave the connection count unchanged and deliver no request.
+  The same original valid ticket then confirms successfully after all rejected
+  confirmations, proving they did not consume it. Exactly one replay connection
+  and duplicate-confirm idempotence remain required.
+- New `packaged_replay_does_not_follow_loopback_redirect` makes the real replay
+  origin return **302** with Location pointing to a second fixture-owned loopback
+  backend. The real CLI replay outcome must preserve status 302 and delivery
+  `response_received`. The destination must receive zero TCP connections and the
+  origin exactly one replay connection, with no follow-up. Probe-client redirect
+  policy is not counted as engine evidence.
+- Nonignored `backend_connection_counter_rejects_headerless_followup` is a
+  counterfactual oracle test: it deliberately opens a real TCP connection but
+  sends no HTTP, then requires the zero-connection assertion to panic. This proves
+  an extra connection cannot escape detection just by omitting a request head;
+  no fake product regression or product-code mutation was introduced.
+
+Final follow-up logs: `target/packaged-qualification/actual-binaries.log`,
+`review-fixes.log`, `clippy.log`, `fmt-check.log`, and `workspace.log`. The supplied
+debug executable digests remain those recorded above. All prior packaging,
+public-TLS, final-schema/review and single-combined-campaign gaps remain open;
+independent parent recheck is required before commit.
