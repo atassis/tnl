@@ -644,6 +644,8 @@ impl Capture {
                 self.request.eof(&mut emit);
                 self.response.eof(&mut emit);
             } else {
+                // Framed completion is provisional, including on cancellation
+                // after both MessageEnd callbacks. Finished alone is not success.
                 self.request.stop("cancelled", &mut emit);
                 self.response.stop("cancelled", &mut emit);
             }

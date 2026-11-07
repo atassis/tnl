@@ -13,5 +13,6 @@ pub mod inspector;
 pub mod invite;
 pub mod peek;
 pub mod reconnect;
+pub mod replay;
 pub mod synth;
 pub mod target;
