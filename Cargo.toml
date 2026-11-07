@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/tnl-protocol", "crates/tnld", "crates/tnl", "crates/tnl-e2e"]
+exclude = ["vendor/yamux"]
 
 [workspace.package]
 version = "0.1.0-beta.4"
@@ -55,4 +56,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = "1"
 async-tungstenite = { version = "0.29", features = ["tokio-runtime", "tokio-rustls-webpki-roots"] }
 ws_stream_tungstenite = { version = "0.15", features = ["tokio_io"] }
-yamux = "0.13"
+yamux = "=0.13.10"
+
+# See vendor/yamux/README.tnl.md for provenance and removal criteria.
+[patch.crates-io]
+yamux = { path = "vendor/yamux" }
