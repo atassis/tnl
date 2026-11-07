@@ -380,6 +380,17 @@ impl ReplayController {
         });
         Ok(outcome)
     }
+    /// Bounded safe metadata only, for the sanitized parent detail view.
+    pub(crate) fn latest_outcome(&self, capture: CaptureId) -> Option<ReplayOutcome> {
+        let mut state = self.inner.state.lock();
+        Self::sweep_locked(&mut state, Instant::now());
+        state
+            .outcomes
+            .iter()
+            .rev()
+            .find(|saved| saved.outcome.parent_capture_id == capture)
+            .map(|saved| saved.outcome.clone())
+    }
     pub fn outcome(&self, replay: ulid::Ulid) -> Option<ReplayOutcome> {
         let mut state = self.inner.state.lock();
         Self::sweep_locked(&mut state, Instant::now());
@@ -619,3 +630,34 @@ fn decode_token(text: &str) -> Option<[u8; 32]> {
 }
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+impl ReplayController {
+    pub(crate) fn allocated_capacity_without_execution(&self) -> usize {
+        let state = self.inner.state.lock();
+        assert!(state.execution.is_none());
+        let mut bytes = std::mem::size_of::<Inner>()
+            + 6 * std::mem::size_of::<usize>()
+            + state.entries.capacity() * std::mem::size_of::<Entry>()
+            + state.tickets.capacity() * std::mem::size_of::<Ticket>()
+            + state.outcomes.capacity() * std::mem::size_of::<SavedOutcome>();
+        for entry in &state.entries {
+            // Bytes::from(Vec) retains its backing allocation. Charge the full
+            // 1-MiB body reservation, NOT body.len(), for a finished entity.
+            let body = if entry.raw.body.is_empty() {
+                0
+            } else {
+                retention::BODY_LIMIT
+            };
+            bytes += std::mem::size_of::<RawRequest>()
+                + 2 * std::mem::size_of::<usize>()
+                + retention::HEAD_LIMIT
+                + entry.raw.building.capacity()
+                + body
+                + entry.raw.charges.capacity() * std::mem::size_of::<Charge>();
+        }
+        drop(state);
+        assert!(bytes <= self.raw_bytes() + 8192);
+        bytes
+    }
+}

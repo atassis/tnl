@@ -64,6 +64,15 @@ async fn observer_never_changes_concurrent_upload_or_binary_response() {
             assert_eq!(records.len(), 1);
             let record = &records[0];
             assert_eq!(record.status, Some(200));
+            let schema = serde_json::to_value(record).unwrap();
+            assert_eq!(schema["bytes_to_backend"], log.bytes_in);
+            assert_eq!(
+                schema["bytes_from_backend"],
+                u64::try_from(response.len()).unwrap()
+            );
+            assert_eq!(schema["response_source"], "backend");
+            assert_eq!(schema["request"]["headers_state"], "complete");
+            assert_eq!(schema["response"]["headers_state"], "complete");
             assert!(!record.observation_incomplete, "{record:?}");
             assert_eq!(record.request.body.observed_payload_bytes, 65536);
             assert!(record

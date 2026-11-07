@@ -80,7 +80,22 @@ pub async fn connect_local(
     target: &Target,
     deadline: Duration,
 ) -> Result<(TcpStream, SocketAddr), ConnectError> {
-    let addrs = resolve_target(target).await?;
+    connect_using(resolve_target(target), deadline, TcpStream::connect).await
+}
+
+// The production resolver and dialer are unchanged; scoped test futures can
+// drive failures/deadlines without hostname support or network blackholes.
+async fn connect_using<R, D, F>(
+    resolve: R,
+    deadline: Duration,
+    dial: D,
+) -> Result<(TcpStream, SocketAddr), ConnectError>
+where
+    R: std::future::Future<Output = Result<Vec<SocketAddr>, ConnectError>>,
+    D: Fn(SocketAddr) -> F,
+    F: std::future::Future<Output = io::Result<TcpStream>>,
+{
+    let addrs = resolve.await?;
     let start = Instant::now();
     let mut last_err: Option<ConnectError> = None;
 
@@ -91,7 +106,7 @@ pub async fn connect_local(
         if remaining.is_zero() {
             return Err(ConnectError::Timeout(deadline));
         }
-        match timeout(remaining, TcpStream::connect(addr)).await {
+        match timeout(remaining, dial(addr)).await {
             Ok(Ok(stream)) => {
                 let _ = stream.set_nodelay(true);
                 return Ok((stream, addr));
@@ -157,5 +172,34 @@ mod tests {
             matches!(err, ConnectError::Refused | ConnectError::Unreachable),
             "got {err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod controlled_failures {
+    use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn resolver_error_never_dials_and_pending_connect_obeys_deadline() {
+        let error = connect_using(
+            async { Err(ConnectError::DnsFailed(io::Error::other("RESOLVER_CANARY"))) },
+            LOCAL_CONNECT_TIMEOUT,
+            |_| async { panic!("resolver failure must not dial") },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_kind(), "dns-failed");
+        let started = Instant::now();
+        let error = connect_using(
+            async { Ok(vec!["127.0.0.1:1".parse().unwrap()]) },
+            LOCAL_CONNECT_TIMEOUT,
+            |_| std::future::pending::<io::Result<TcpStream>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConnectError::Timeout(LOCAL_CONNECT_TIMEOUT)
+        ));
+        assert_eq!(started.elapsed(), LOCAL_CONNECT_TIMEOUT);
     }
 }

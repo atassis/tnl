@@ -373,6 +373,7 @@ struct Preview {
     bytes: Vec<u8>,
     reason: Option<&'static str>,
     count: u64,
+    published: std::time::Instant,
 }
 impl Preview {
     fn new(mode: PreviewMode) -> Self {
@@ -384,6 +385,7 @@ impl Preview {
                 "unsupported-media-type"
             }),
             count: 0,
+            published: std::time::Instant::now(),
         }
     }
     fn head(&mut self, headers: &[httparse::Header<'_>], mode: PreviewMode) {
@@ -407,12 +409,23 @@ impl Preview {
                     s == "application/json"
                         || (s.starts_with("application/") && s.ends_with("+json"))
                 });
+        let streaming = first
+            .and_then(|h| std::str::from_utf8(h.value).ok())
+            .is_some_and(|s| {
+                s.split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .eq_ignore_ascii_case("text/event-stream")
+            });
         let encoded = headers.iter().any(|h| {
             h.name.eq_ignore_ascii_case("content-encoding")
                 && !h.value.eq_ignore_ascii_case(b"identity")
         });
         self.reason = if encoded {
             Some("encoded")
+        } else if streaming {
+            Some("streaming")
         } else if json {
             None
         } else {
@@ -443,8 +456,10 @@ struct Display {
     request: Preview,
     response: Preview,
     upgraded: bool,
+    synth: bool,
 }
 impl Display {
+    #[allow(clippy::too_many_lines)] // Synchronous bounded event-to-display transitions.
     fn event(&mut self, event: &Observation<'_>) {
         let mode = self.inspection.inner.mode;
         match event {
@@ -456,21 +471,68 @@ impl Display {
                 self.request.head(headers, mode);
                 let method = redact::text(method, 32);
                 let target = redact::target(target);
-                let headers = redact::headers(headers);
+                let (headers, capped) = redact::headers(headers);
+                let reason = self.request.reason;
                 self.inspection.update(self.id, |r| {
+                    r.request.body.reason = reason.or(Some("incomplete"));
+                    r.request.body.state = if mode == PreviewMode::Off {
+                        super::BodyState::Disabled
+                    } else if reason.is_some() {
+                        super::BodyState::Omitted
+                    } else {
+                        super::BodyState::Pending
+                    };
+                    if let Some(reason) = reason {
+                        r.omit(reason);
+                    }
                     r.method = method;
                     r.request_target = target;
                     r.request.headers = headers;
+                    r.request.headers_state = if capped {
+                        super::HeadersState::Capped
+                    } else {
+                        super::HeadersState::Complete
+                    };
+                    if capped {
+                        r.omit("capture-limit");
+                    }
                 });
             }
             Observation::ResponseHead { status, headers }
                 if !(100..200).contains(status) || *status == 101 =>
             {
-                self.response.head(headers, mode);
-                let headers = redact::headers(headers);
+                if self.synth {
+                    self.response.reason = Some("client-synth");
+                } else {
+                    self.response.head(headers, mode);
+                }
+                let (headers, capped) = redact::headers(headers);
+                let reason = self.response.reason;
                 self.inspection.update(self.id, |r| {
+                    r.response.body.reason = reason.or(Some("incomplete"));
+                    r.response.body.state = if mode == PreviewMode::Off {
+                        super::BodyState::Disabled
+                    } else if reason.is_some() {
+                        super::BodyState::Omitted
+                    } else {
+                        super::BodyState::Pending
+                    };
+                    if let Some(reason) = reason {
+                        r.omit(reason);
+                    }
                     r.status = Some(*status);
+                    if r.response_source != super::ResponseSource::ClientSynth {
+                        r.response_source = super::ResponseSource::Backend;
+                    }
                     r.response.headers = headers;
+                    r.response.headers_state = if capped {
+                        super::HeadersState::Capped
+                    } else {
+                        super::HeadersState::Complete
+                    };
+                    if capped {
+                        r.omit("capture-limit");
+                    }
                     if *status == 101 {
                         r.state = State::Upgraded;
                     }
@@ -479,6 +541,15 @@ impl Display {
                     self.upgraded = true;
                     self.request.bytes = Vec::new();
                     self.response.bytes = Vec::new();
+                    self.inspection.update(self.id, |r| {
+                        r.omit("upgraded");
+                        for message in [&mut r.request, &mut r.response] {
+                            message.body.text = None;
+                            message.body.retained_bytes = 0;
+                            message.body.state = super::BodyState::Omitted;
+                            message.body.reason = Some("upgraded");
+                        }
+                    });
                 }
             }
             Observation::Body(direction, bytes) => {
@@ -487,7 +558,30 @@ impl Display {
                 } else {
                     &mut self.response
                 };
+                let previous = p.reason;
                 p.body(bytes);
+                if previous != p.reason
+                    || p.published.elapsed() >= std::time::Duration::from_secs(1)
+                {
+                    p.published = std::time::Instant::now();
+                    self.inspection.update(self.id, |r| {
+                        let message = if *direction == Direction::Request {
+                            &mut r.request
+                        } else {
+                            &mut r.response
+                        };
+                        message.body.observed_payload_bytes = p.count;
+                        if let Some(reason) = p.reason {
+                            message.body.reason = Some(reason);
+                            message.body.state = if reason == "disabled" {
+                                super::BodyState::Disabled
+                            } else {
+                                super::BodyState::Omitted
+                            };
+                            r.omit(reason);
+                        }
+                    });
+                }
             }
             Observation::MessageEnd { direction, .. } => {
                 let p = if *direction == Direction::Request {
@@ -495,21 +589,25 @@ impl Display {
                 } else {
                     &mut self.response
                 };
-                let text = if p.reason.is_none() && !self.upgraded {
-                    redact::json(&p.bytes)
-                } else {
-                    None
-                };
-                let reason = if self.upgraded {
-                    Some("upgraded")
-                } else {
-                    p.reason.or_else(|| {
-                        if text.is_none() {
-                            Some("invalid-json")
+                let (text, redacted, reason) = if self.upgraded {
+                    (None, false, Some("upgraded"))
+                } else if p.count == 0 {
+                    (
+                        None,
+                        false,
+                        if mode == PreviewMode::Off {
+                            Some("disabled")
                         } else {
                             None
-                        }
-                    })
+                        },
+                    )
+                } else if let Some(reason) = p.reason {
+                    (None, false, Some(reason))
+                } else {
+                    match redact::json(&p.bytes) {
+                        Ok((text, redacted)) => (Some(text), redacted, None),
+                        Err(reason) => (None, false, Some(reason)),
+                    }
                 };
                 let count = p.count;
                 p.bytes = Vec::new();
@@ -519,9 +617,25 @@ impl Display {
                     } else {
                         &mut r.response
                     };
+                    m.body.retained_bytes = text
+                        .as_ref()
+                        .map_or(0, |text| u32::try_from(text.len()).unwrap_or(u32::MAX));
+                    m.body.state = if text.is_some() {
+                        super::BodyState::Available
+                    } else if mode == PreviewMode::Off && reason == Some("disabled") {
+                        super::BodyState::Disabled
+                    } else if count == 0 && reason.is_none() {
+                        super::BodyState::Empty
+                    } else {
+                        super::BodyState::Omitted
+                    };
+                    m.body.redacted = redacted;
                     m.body.text = text;
                     m.body.reason = reason;
                     m.body.observed_payload_bytes = count;
+                    if let Some(reason) = reason {
+                        r.omit(reason);
+                    }
                 });
             }
             Observation::Stopped(direction, reason) => {
@@ -539,9 +653,21 @@ impl Display {
                     } else {
                         &mut r.response
                     };
+                    if m.headers_state == super::HeadersState::Incomplete {
+                        m.headers_state = match *reason {
+                            "head-limit" => super::HeadersState::Capped,
+                            "malformed-head" | "ambiguous-framing" => {
+                                super::HeadersState::Malformed
+                            }
+                            _ => super::HeadersState::Incomplete,
+                        };
+                    }
+                    m.body.state = super::BodyState::Omitted;
+                    m.body.retained_bytes = 0;
                     m.body.text = None;
                     m.body.reason = Some(reason);
                     m.body.observed_payload_bytes = p.count;
+                    r.omit(reason);
                 });
             }
             _ => {}
@@ -574,6 +700,16 @@ impl Capture {
             .consumer
             .as_ref()
             .and_then(|f| f.admit(context));
+        Self::with_consumer(inspection, context, consumer)
+    }
+    pub(crate) fn display_only(inspection: Inspection, context: CaptureContext) -> Self {
+        Self::with_consumer(inspection, context, None)
+    }
+    fn with_consumer(
+        inspection: Inspection,
+        context: CaptureContext,
+        consumer: Option<Box<dyn ObservationConsumer>>,
+    ) -> Self {
         let mode = inspection.inner.mode;
         Self {
             context,
@@ -585,10 +721,30 @@ impl Capture {
                 request: Preview::new(mode),
                 response: Preview::new(mode),
                 upgraded: false,
+                synth: false,
             },
             consumer,
             finished: false,
         }
+    }
+    pub(crate) fn update_record(&self, update: impl FnOnce(&mut super::InspectionRecord)) {
+        self.display
+            .inspection
+            .update(self.context.capture_id, update);
+    }
+    pub(crate) fn client_synth(&mut self, bytes: &[u8]) {
+        self.update_record(|r| r.response_source = super::ResponseSource::ClientSynth);
+        self.display.synth = true;
+        self.display.response.reason = Some("client-synth");
+        let display = &mut self.display;
+        self.response
+            .feed(bytes, self.request.head_request, &mut |event| {
+                display.event(&event);
+            });
+    }
+    pub(crate) fn fail(&mut self, kind: &'static str) {
+        self.update_record(|r| r.failure_kind = Some(kind));
+        self.terminate(false);
     }
     pub const fn id(&self) -> CaptureId {
         self.context.capture_id
@@ -654,8 +810,15 @@ impl Capture {
             c.observe(&Observation::Finished);
         }
         display.inspection.update(self.context.capture_id, |r| {
+            if !graceful && r.failure_kind.is_none() {
+                r.failure_kind = Some("cancelled");
+            }
+            r.duration_ms = super::model::elapsed_ms(r.started);
+            r.terminal = true;
             if r.state != State::Upgraded {
-                r.state = if r.observation_incomplete {
+                r.state = if r.failure_kind.is_some_and(|kind| kind != "cancelled") {
+                    State::Failed
+                } else if r.observation_incomplete {
                     State::Incomplete
                 } else {
                     State::Complete
@@ -709,5 +872,82 @@ mod tests {
         capture.request(b"x");
         assert_eq!(capture.display.request.reason, Some("too-large"));
         assert_eq!(capture.display.request.bytes.capacity(), 0);
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    #[test]
+    fn client_synth_400_502_503_never_retains_error_body_even_before_terminal() {
+        for status in [400, 502, 503] {
+            let history = Inspection::new(PreviewMode::Json);
+            let mut capture = history
+                .admit_preconnect(TunnelGeneration::new(), None)
+                .unwrap();
+            let body = br#"{"reason":"ERROR_CANARY","token":"SECRET_CANARY"}"#;
+            let response=format!("HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",body.len());
+            capture.client_synth(&[response.as_bytes(), body].concat());
+            let record = history.get(capture.id()).unwrap();
+            assert_eq!(record.status, Some(status));
+            assert_eq!(
+                record.response_source,
+                crate::inspection::ResponseSource::ClientSynth
+            );
+            assert!(
+                record.response.body.text.is_none(),
+                "synthetic error context is not a JSON preview"
+            );
+            assert!(!format!("{record:?}").contains("CANARY"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod progress_schema_tests {
+    use super::*;
+    #[test]
+    fn active_oversized_and_streaming_bodies_publish_omission_without_waiting_for_eof() {
+        for streaming in [false, true] {
+            let history = Inspection::new(PreviewMode::Json);
+            let mut capture = history.admit(TunnelGeneration::new(), None).unwrap();
+            if streaming {
+                capture.request(b"GET / HTTP/1.1\r\nHost: local\r\n\r\n");
+                capture.response(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata:SECRET_CANARY\n\n");
+            } else {
+                capture.request(b"POST / HTTP/1.1\r\nHost: local\r\nContent-Type: application/json\r\nContent-Length: 99999\r\n\r\n");
+                capture.request(&[b'x'; 4097]);
+            }
+            let record = history.get(capture.id()).unwrap();
+            let body = if streaming {
+                &record.response.body
+            } else {
+                &record.request.body
+            };
+            assert_eq!(body.state, crate::inspection::BodyState::Omitted);
+            assert_eq!(
+                body.reason,
+                Some(if streaming { "streaming" } else { "too-large" })
+            );
+            assert!(body.text.is_none());
+            assert!(!format!("{record:?}").contains("CANARY"));
+        }
+    }
+}
+
+#[cfg(test)]
+impl Capture {
+    pub(super) fn allocated_capacity(&self) -> usize {
+        // Includes a conservative Arc/Mutex wrapper and raw-consumer box even
+        // for the direct, stack-owned captures used by the pressure fixture.
+        let bytes = std::mem::size_of::<Self>()
+            + 128
+            + 4 * std::mem::size_of::<usize>()
+            + self.request.head.capacity()
+            + self.response.head.capacity()
+            + self.display.request.bytes.capacity()
+            + self.display.response.bytes.capacity();
+        assert!(bytes <= 32 * 1024);
+        bytes
     }
 }
