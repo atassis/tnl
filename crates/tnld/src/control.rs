@@ -80,7 +80,15 @@ async fn run_session(
     };
     state.session_handles.insert(sess_id.clone(), handle);
 
-    if let Err(e) = control_loop(ctrl_stream, &registry, &sess_id, &token.name).await {
+    if let Err(e) = control_loop(
+        ctrl_stream,
+        &registry,
+        &sess_id,
+        &token.name,
+        data_stream_protocol,
+    )
+    .await
+    {
         warn!(session_id = %sess_id, "control loop ended: {e}");
     }
 
@@ -95,6 +103,7 @@ async fn control_loop(
     registry: &Registry,
     session_id: &str,
     token_name: &str,
+    data_stream_protocol: DataStreamProtocol,
 ) -> anyhow::Result<()> {
     loop {
         let mut lenbuf = [0u8; 4];
@@ -135,7 +144,13 @@ async fn control_loop(
                         message: "could not generate a random subdomain; try again".to_string(),
                     },
                     Some(subdomain) => {
-                        match registry.create_tunnel(&subdomain, session_id, token_name) {
+                        match registry.create_tunnel_bound(
+                            &subdomain,
+                            session_id,
+                            token_name,
+                            data_stream_protocol,
+                            None,
+                        ) {
                             Ok(t) => ControlMsg::TunnelCreated(TunnelCreatedResp {
                                 tunnel_id: t
                                     .id
@@ -169,11 +184,13 @@ async fn control_loop(
                 tunnel_id,
                 subdomain,
             }) => {
-                match registry.try_reattach(
+                match registry.try_reattach_bound(
                     &tunnel_id.to_string(),
                     &subdomain,
                     token_name,
                     session_id,
+                    Some(data_stream_protocol),
+                    None,
                 ) {
                     Ok(t) => ControlMsg::TunnelCreated(TunnelCreatedResp {
                         tunnel_id: t
@@ -190,12 +207,88 @@ async fn control_loop(
                 }
             }
 
-            // Fail closed until immutable registry binding and HTTP/WS admission
-            // are integrated together. Never publish a temporarily public tunnel.
-            ControlMsg::CreateProtectedTunnel(_) | ControlMsg::ReattachProtectedTunnel(_) => {
-                ControlMsg::Error {
-                    code: ErrorCode::AccessUnavailable,
-                    message: "protected tunnels are not available".into(),
+            ControlMsg::CreateProtectedTunnel(req) => {
+                if data_stream_protocol == DataStreamProtocol::Http1MetadataV1 {
+                    let access = crate::access::CompiledAccess::new(Arc::new(req.access));
+                    match access {
+                        Err(_) => ControlMsg::Error {
+                            code: ErrorCode::InvalidAccessPolicy,
+                            message: "invalid access policy".into(),
+                        },
+                        Ok(access) => {
+                            let subdomain = req.subdomain.or_else(|| {
+                                crate::random_subdomain::generate_unique(
+                                    &mut rand::thread_rng(),
+                                    registry,
+                                )
+                            });
+                            match subdomain {
+                                None => ControlMsg::Error {
+                                    code: ErrorCode::Internal,
+                                    message: "could not allocate tunnel name".into(),
+                                },
+                                Some(subdomain) => match registry.create_tunnel_bound(
+                                    &subdomain,
+                                    session_id,
+                                    token_name,
+                                    data_stream_protocol,
+                                    Some(Arc::new(access)),
+                                ) {
+                                    Ok(tunnel) => protected_created(&tunnel)?,
+                                    Err(crate::registry::RegistryError::SubdomainTaken(_)) => {
+                                        ControlMsg::Error {
+                                            code: ErrorCode::SubdomainTaken,
+                                            message: "subdomain already in use".into(),
+                                        }
+                                    }
+                                    Err(crate::registry::RegistryError::InvalidSubdomain(_)) => {
+                                        ControlMsg::Error {
+                                            code: ErrorCode::InvalidSubdomain,
+                                            message: "invalid subdomain".into(),
+                                        }
+                                    }
+                                    Err(_) => ControlMsg::Error {
+                                        code: ErrorCode::Internal,
+                                        message: "registry unavailable".into(),
+                                    },
+                                },
+                            }
+                        }
+                    }
+                } else {
+                    ControlMsg::Error {
+                        code: ErrorCode::UnsupportedProtocol,
+                        message: "protected tunnels require metadata capability".into(),
+                    }
+                }
+            }
+            ControlMsg::ReattachProtectedTunnel(req) => {
+                if data_stream_protocol == DataStreamProtocol::Http1MetadataV1 {
+                    match registry.try_reattach_bound(
+                        &req.tunnel_id.to_string(),
+                        &req.subdomain,
+                        token_name,
+                        session_id,
+                        Some(data_stream_protocol),
+                        Some(&req.policy_fingerprint),
+                    ) {
+                        Ok(tunnel) => protected_created(&tunnel)?,
+                        Err(reason) => ControlMsg::Error {
+                            code: match reason {
+                                "not_found" => ErrorCode::TunnelLost,
+                                "not_owner" => ErrorCode::Unauthorized,
+                                "already_active" => ErrorCode::SubdomainTaken,
+                                "unavailable" => ErrorCode::AccessUnavailable,
+                                _ => ErrorCode::AccessPolicyMismatch,
+                            },
+                            message: "protected reattach rejected".into(),
+                        },
+                    }
+                } else {
+                    ControlMsg::Error {
+                        code: ErrorCode::UnsupportedProtocol,
+                        message: "protected tunnels require metadata capability".into(),
+                    }
                 }
             }
             ControlMsg::Heartbeat => ControlMsg::HeartbeatAck,
@@ -214,6 +307,21 @@ async fn control_loop(
         stream.write_all(&out).await?;
         stream.flush().await?;
     }
+}
+
+fn protected_created(tunnel: &crate::registry::Tunnel) -> anyhow::Result<ControlMsg> {
+    let access = tunnel
+        .access
+        .as_ref()
+        .context("protected tunnel missing admission state")?;
+    Ok(ControlMsg::ProtectedTunnelCreated(
+        tnl_protocol::messages::ProtectedTunnelCreatedResp {
+            tunnel_id: tunnel.id.parse().context("invalid registry tunnel id")?,
+            hostname: tunnel.hostname.clone(),
+            subdomain: tunnel.subdomain.clone(),
+            policy_fingerprint: access.fingerprint().into(),
+        },
+    ))
 }
 
 /// Convert axum's `WebSocket` to an `async_tungstenite::WebSocketStream` that

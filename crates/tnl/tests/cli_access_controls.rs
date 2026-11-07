@@ -206,3 +206,33 @@ fn password_file_exact_byte_limit_with_final_crlf_and_unicode_controls() {
         assert!(!format!("{err:?} {err}").contains("SECRET_SENTINEL"));
     }
 }
+
+#[test]
+fn executable_http_exposes_optional_controls_and_rejects_http_before_password_file() {
+    let binary = env!("CARGO_BIN_EXE_tnl");
+    let help = std::process::Command::new(binary)
+        .args(["http", "3000", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--basic-auth"));
+    let dir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(binary)
+        .args([
+            "http",
+            "3000",
+            "--basic-auth",
+            "user",
+            "--basic-auth-password-file",
+            "/does-not-exist",
+        ])
+        .env("TNL_CONFIG", dir.path().join("config.toml"))
+        .env("TNL_ENDPOINT", "http://127.0.0.1:1")
+        .env("TNL_TOKEN", "tnl_TEST")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("https endpoint"));
+    assert!(!stderr.contains("unable to read password"));
+}

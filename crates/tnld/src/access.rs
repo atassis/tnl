@@ -1,18 +1,16 @@
-//! Bounded visitor-admission primitives. Not yet connected to registry/control
-//! publication: protected creation remains unavailable until integration tests.
+//! Bounded per-tunnel visitor admission and exchange ownership.
 
 use std::{
     net::IpAddr,
-    num::NonZeroU32,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     task::{Context, Poll},
+    time::Instant,
 };
 
 use argon2::{password_hash::PasswordHash, Argon2, PasswordVerifier};
 use axum::http::HeaderMap;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use governor::{clock::Clock as _, DefaultDirectRateLimiter, Quota, RateLimiter};
 use http_body::{Body, Frame, SizeHint};
 use ipnet::IpNet;
 use tnl_protocol::access::{validate_username, PolicyError, VisitorAccessPolicyV1};
@@ -21,6 +19,71 @@ use zeroize::Zeroizing;
 
 const AUTH_WORKERS: usize = 4;
 static GLOBAL_AUTH_WORKERS: OnceLock<AuthWorkers> = OnceLock::new();
+
+const TOKEN_CREDIT: u128 = 1_000_000_000;
+
+#[derive(Debug)]
+struct RateState {
+    credit: u128,
+    last: Instant,
+}
+
+/// Fixed-point credits avoid governor 0.7's extra post-idle GCRA admission.
+/// State is constant-size and all time/credit updates occur under one short lock.
+#[derive(Debug)]
+struct VisitorRateBucket {
+    rate: u32,
+    capacity: u128,
+    state: Mutex<RateState>,
+}
+
+impl VisitorRateBucket {
+    fn new(limit: tnl_protocol::access::VisitorRateLimit) -> Result<Self, PolicyError> {
+        Self::new_at(limit, Instant::now())
+    }
+
+    fn new_at(
+        limit: tnl_protocol::access::VisitorRateLimit,
+        now: Instant,
+    ) -> Result<Self, PolicyError> {
+        tnl_protocol::access::validate_limit(limit.requests_per_second)?;
+        tnl_protocol::access::validate_limit(limit.burst)?;
+        let capacity = u128::from(limit.burst) * TOKEN_CREDIT;
+        Ok(Self {
+            rate: limit.requests_per_second,
+            capacity,
+            state: Mutex::new(RateState {
+                credit: capacity,
+                last: now,
+            }),
+        })
+    }
+
+    fn check(&self) -> Result<(), AccessDenial> {
+        self.check_with_time(Instant::now)
+    }
+
+    fn check_with_time(&self, now: impl FnOnce() -> Instant) -> Result<(), AccessDenial> {
+        let mut state = self.state.lock().map_err(|_| AccessDenial::Unavailable)?;
+        let now = now().max(state.last);
+        let elapsed = now.duration_since(state.last).as_nanos();
+        state.last = now;
+        state.credit = state
+            .credit
+            .saturating_add(elapsed.saturating_mul(u128::from(self.rate)))
+            .min(self.capacity);
+        if state.credit >= TOKEN_CREDIT {
+            state.credit -= TOKEN_CREDIT;
+            return Ok(());
+        }
+        let wait_nanos = (TOKEN_CREDIT - state.credit).div_ceil(u128::from(self.rate));
+        drop(state);
+        let retry_after = u64::try_from(wait_nanos.div_ceil(TOKEN_CREDIT))
+            .map_err(|_| AccessDenial::Unavailable)?
+            .max(1);
+        Err(AccessDenial::Rate { retry_after })
+    }
+}
 
 /// Resolver fallbacks identify the proxy peer for diagnostics, not an available
 /// end visitor. An enabled allowlist must not accidentally admit that proxy.
@@ -62,8 +125,9 @@ pub struct AdmissionLease {
 #[derive(Debug)]
 pub struct CompiledAccess {
     policy: Arc<VisitorAccessPolicyV1>,
+    fingerprint: String,
     networks: Vec<IpNet>,
-    rate: Option<DefaultDirectRateLimiter>,
+    rate: Option<VisitorRateBucket>,
     concurrency: Option<Arc<Semaphore>>,
 }
 
@@ -76,20 +140,15 @@ impl CompiledAccess {
             .collect::<Result<Vec<IpNet>, _>>()?;
         let rate = policy
             .rate_limit()
-            .map(|limit| {
-                let per_second =
-                    NonZeroU32::new(limit.requests_per_second).ok_or(PolicyError::Limit)?;
-                let burst = NonZeroU32::new(limit.burst).ok_or(PolicyError::Limit)?;
-                Ok(RateLimiter::direct(
-                    Quota::per_second(per_second).allow_burst(burst),
-                ))
-            })
+            .map(VisitorRateBucket::new)
             .transpose()?;
         let concurrency = policy
             .max_concurrent()
             .map(|limit| Arc::new(Semaphore::new(limit as usize)));
+        let fingerprint = policy.fingerprint()?;
         Ok(Self {
             policy,
+            fingerprint,
             networks,
             rate,
             concurrency,
@@ -98,6 +157,10 @@ impl CompiledAccess {
 
     pub const fn policy(&self) -> &Arc<VisitorAccessPolicyV1> {
         &self.policy
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
     }
 
     /// Accept only a trusted resolver's canonical identity. The caller passes
@@ -114,14 +177,7 @@ impl CompiledAccess {
             }
         }
         if let Some(rate) = &self.rate {
-            if let Err(wait) = rate.check() {
-                let duration = wait.wait_time_from(rate.clock().now());
-                let retry_after = duration
-                    .as_secs()
-                    .saturating_add(u64::from(duration.subsec_nanos() != 0))
-                    .max(1);
-                return Err(AccessDenial::Rate { retry_after });
-            }
+            rate.check()?;
         }
         if let Some(basic) = self.policy.basic() {
             let credentials = parse_basic(headers)?;
@@ -312,8 +368,11 @@ mod tests {
         ))
     }
 
+    static AUTH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn basic_only_consumes_gate_header_and_checks_password_even_without_limits() {
+        let _test_guard = AUTH_TEST_LOCK.lock().await;
         let access = CompiledAccess::new(policy(true, false, false, &[])).unwrap();
         let mut req_headers = basic_header("user", " secret:pass ");
         let lease = access.admit(None, &mut req_headers).await.unwrap();
@@ -557,5 +616,142 @@ mod tests {
         );
         drop(body);
         access.admit(None, &mut h).await.unwrap();
+    }
+    #[test]
+    #[allow(clippy::needless_collect)] // Spawn every barrier participant before joining any.
+    fn deterministic_rate_refill_and_concurrent_burst_use_the_configured_quota() {
+        let start = Instant::now();
+        let limiter = Arc::new(
+            VisitorRateBucket::new_at(
+                VisitorRateLimit {
+                    requests_per_second: 2,
+                    burst: 3,
+                },
+                start,
+            )
+            .unwrap(),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let workers = (0..16)
+            .map(|_| {
+                let limiter = limiter.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    limiter.check_with_time(|| start).is_ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            workers
+                .into_iter()
+                .map(|worker| usize::from(worker.join().unwrap()))
+                .sum::<usize>(),
+            3
+        );
+        assert!(matches!(
+            limiter.check_with_time(|| start + std::time::Duration::from_millis(499)),
+            Err(AccessDenial::Rate { retry_after: 1 })
+        ));
+        assert!(limiter
+            .check_with_time(|| start + std::time::Duration::from_millis(500))
+            .is_ok());
+        assert!(limiter
+            .check_with_time(|| start + std::time::Duration::from_millis(500))
+            .is_err());
+        let after_idle = start + std::time::Duration::from_secs(10);
+        for _ in 0..3 {
+            assert!(limiter.check_with_time(|| after_idle).is_ok());
+        }
+        assert!(limiter.check_with_time(|| after_idle).is_err());
+        assert!(
+            limiter.check_with_time(|| start).is_err(),
+            "clock must not regress"
+        );
+        let limit = VisitorRateBucket::new_at(
+            VisitorRateLimit {
+                requests_per_second: 10_000,
+                burst: 10_000,
+            },
+            start,
+        )
+        .unwrap();
+        for _ in 0..10_000 {
+            limit.check_with_time(|| start).unwrap();
+        }
+        assert!(limit.check_with_time(|| start).is_err());
+        let much_later = start + std::time::Duration::from_secs(1_000_000);
+        for _ in 0..10_000 {
+            limit.check_with_time(|| much_later).unwrap();
+        }
+        assert!(limit.check_with_time(|| much_later).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn four_global_hash_workers_saturate_without_queueing_or_blocking_non_basic() {
+        let _test_guard = AUTH_TEST_LOCK.lock().await;
+        let access = CompiledAccess::new(policy(true, false, false, &[])).unwrap();
+        let workers = GLOBAL_AUTH_WORKERS.get_or_init(|| AuthWorkers::new(AUTH_WORKERS));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            let workers = workers.clone();
+            let release = release.clone();
+            let started = started_tx.clone();
+            tasks.push(tokio::spawn(async move {
+                workers
+                    .run(move || {
+                        let _ = started.send(());
+                        let (lock, condition) = &*release;
+                        let mut ready = lock.lock().unwrap();
+                        while !*ready {
+                            ready = condition.wait(ready).unwrap();
+                        }
+                        drop(ready);
+                    })
+                    .await
+            }));
+        }
+        for _ in 0..4 {
+            tokio::time::timeout(std::time::Duration::from_secs(2), started_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        tasks[0].abort();
+        assert_eq!(workers.permits.available_permits(), 0);
+        for mut h in [
+            basic_header("user", " secret:pass "),
+            basic_header("other", " secret:pass "),
+        ] {
+            assert!(matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    access.admit(None, &mut h)
+                )
+                .await
+                .unwrap(),
+                Err(AccessDenial::Unavailable)
+            ));
+        }
+        let lightweight = CompiledAccess::new(policy(false, false, true, &[])).unwrap();
+        lightweight
+            .admit(None, &mut headers("Bearer APP_SENTINEL"))
+            .await
+            .unwrap();
+        let (lock, condition) = &*release;
+        *lock.lock().unwrap() = true;
+        condition.notify_all();
+        for task in tasks {
+            let _ = task.await;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while workers.permits.available_permits() != 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }

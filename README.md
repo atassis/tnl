@@ -62,6 +62,36 @@ the tunnel hostname by default. `tnl` detects this and auto-rewrites the
 forwarded `Host` to the address it connected to, so they just work — no config
 edits. Control it with `tnl http … --host-header <preserve|rewrite|VALUE>`.
 
+## Optional per-run visitor controls
+
+Plain `tnl http 3000` remains public and requests a random temporary hostname.
+Named public tunnels also remain unchanged. Each control is independently optional:
+
+```sh
+tnl http 3000 demo --basic-auth demo                 # hidden confirmed password prompt
+tnl http 3000 --allow 192.0.2.0/24 --max-concurrent 4
+tnl http 3000 demo --rate-limit 10 --rate-burst 20
+# A password file must be a regular file; on Unix use mode 0600 or 0400.
+tnl http 3000 demo --basic-auth demo --basic-auth-password-file /trusted/path/password
+```
+
+Protected runs require a verified HTTPS endpoint and a compatible daemon's exact
+policy acknowledgment; they never fall back to public mode. Basic alone does not
+require rate/concurrency flags. Passwords have no argv/environment option and are
+hashed once locally; reconnect/recreation retains the same verifier and policy.
+Only Basic-enabled gates consume Authorization; other tunnels preserve application
+authentication. A gate Basic credential cannot simultaneously be an application
+Bearer credential in the same header. Concurrency includes complete HTTP exchanges
+and WebSocket connections, not just response headers or the 101 handshake.
+
+Rules belong to a live tunnel instance, not permanently to its hostname. Stopping,
+grace expiry or daemon restart can free the name for another public run. Random
+names are not authentication. Browsers may send cached Basic credentials to a new
+occupant of a reused origin: clear cached credentials or use a fresh random name
+for sensitive demos. Strong passwords and optional rate limits remain important:
+bounded authentication workers prevent unbounded hash jobs, not online guessing
+or denial-of-service. The TLS edge-to-daemon hop must be trusted.
+
 ## Configuration
 
 Server config is a TOML file (`tnld init` generates it; an annotated

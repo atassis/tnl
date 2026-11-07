@@ -1,8 +1,5 @@
-//! Phase1 per-run input helpers.
-//!
-//! Not wired into `tnl http` until the daemon's protected lifecycle and
-//! enforcement are available. Call preparation before
-//! starting the runtime (Argon2 is intentionally synchronous and runs once).
+//! Per-run password input and bounded local verifier preparation.
+//! Hash once before the runtime; reconnect retains only the immutable policy.
 
 use std::{
     fmt,
@@ -26,10 +23,12 @@ use zeroize::Zeroizing;
 
 #[derive(Args, Default)]
 pub struct AccessArgs {
+    /// Require visitor Basic authentication (password file or hidden prompt).
     #[arg(long, value_name = "USER")]
     pub basic_auth: Option<String>,
     #[arg(long, value_name = "PATH", requires = "basic_auth")]
     pub basic_auth_password_file: Option<PathBuf>,
+    /// Allow visitor IP networks (repeatable; omitted means unrestricted).
     #[arg(long = "allow", value_name = "IP_OR_CIDR")]
     pub allow_ips: Vec<String>,
     #[arg(long, value_name = "REQUESTS_PER_SECOND", value_parser = clap::value_parser!(u32).range(1..=10_000))]

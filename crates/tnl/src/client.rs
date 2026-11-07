@@ -108,23 +108,35 @@ async fn write_msg(
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error)]
+enum ControlResponseError {
+    #[error("control response exceeds size bound")]
+    Framing,
+    #[error("invalid control response ({category:?}, line {line}, column {column})")]
+    Schema {
+        category: serde_json::error::Category,
+        line: usize,
+        column: usize,
+    },
+}
+
 /// Read a length-prefixed JSON `ControlMsg` from the control stream.
 async fn read_msg(ctrl: &mut Pin<Box<dyn tnl_protocol::Stream>>) -> anyhow::Result<ControlMsg> {
     let mut lenbuf = [0u8; 4];
     ctrl.read_exact(&mut lenbuf).await?;
     let n = u32::from_be_bytes(lenbuf) as usize;
     if n > 1024 * 1024 {
-        anyhow::bail!("control response exceeds size bound");
+        return Err(ControlResponseError::Framing.into());
     }
     let mut respbuf = zeroize::Zeroizing::new(vec![0u8; n]);
     ctrl.read_exact(&mut respbuf).await?;
     serde_json::from_slice(&respbuf).map_err(|error| {
-        anyhow::anyhow!(
-            "invalid control response ({:?}, line {}, column {})",
-            error.classify(),
-            error.line(),
-            error.column()
-        )
+        ControlResponseError::Schema {
+            category: error.classify(),
+            line: error.line(),
+            column: error.column(),
+        }
+        .into()
     })
 }
 
@@ -143,8 +155,30 @@ pub enum ProtectedControlError {
     Capability,
     #[error("daemon did not acknowledge the exact protected tunnel policy/binding")]
     Acknowledgment,
+    #[error("protected control response exceeds size bound")]
+    Framing,
+    #[error("invalid protected control response schema")]
+    Schema,
     #[error("protected tunnel rejected ({0:?})")]
     Server(tnl_protocol::ErrorCode),
+}
+
+// Only protocol/schema failures become terminal protected errors. Keep genuine
+// I/O and TLS transport errors intact for the existing same-mode retry policy.
+fn protected_response_error(error: anyhow::Error) -> anyhow::Error {
+    let protected = match error.downcast_ref::<ControlResponseError>() {
+        Some(ControlResponseError::Framing) => Some(ProtectedControlError::Framing),
+        Some(ControlResponseError::Schema { .. }) => Some(ProtectedControlError::Schema),
+        None => {
+            match error.downcast_ref::<tnl_protocol::request_metadata::RequestMetadataError>() {
+                Some(tnl_protocol::request_metadata::RequestMetadataError::Negotiation) => {
+                    Some(ProtectedControlError::Capability)
+                }
+                _ => None,
+            }
+        }
+    };
+    protected.map_or(error, anyhow::Error::new)
 }
 
 fn require_protected_capability(protocol: DataStreamProtocol) -> Result<(), ProtectedControlError> {
@@ -171,13 +205,24 @@ fn validate_protected_ack(
     }
 }
 
+// Scope test CA roots to one task driving the real shared reconnect loop. This
+// is absent in production and never disables certificate verification.
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_TLS_CONNECTOR: tokio_rustls::TlsConnector;
+}
+
 pub async fn connect_and_create_with_options(
     endpoint: &str,
     token: &str,
     subdomain: Option<&str>,
     options: &TunnelOptions,
 ) -> anyhow::Result<ConnectedSession> {
-    connect_and_create_with_connector(endpoint, token, subdomain, options, None).await
+    #[cfg(not(test))]
+    let connector = None;
+    #[cfg(test)]
+    let connector = TEST_TLS_CONNECTOR.try_with(Clone::clone).ok();
+    connect_and_create_with_connector(endpoint, token, subdomain, options, connector).await
 }
 
 async fn connect_and_create_with_connector(
@@ -193,7 +238,9 @@ async fn connect_and_create_with_connector(
     crate::access::validate_protected_endpoint(endpoint)
         .map_err(|_| ProtectedControlError::Endpoint)?;
     let (session, mut control, data_stream_protocol) =
-        dial_and_open_control_with_connector(endpoint, token, connector).await?;
+        dial_and_open_control_with_connector(endpoint, token, connector)
+            .await
+            .map_err(protected_response_error)?;
     require_protected_capability(data_stream_protocol)?;
     let fingerprint = policy.fingerprint()?;
     write_msg(
@@ -204,7 +251,13 @@ async fn connect_and_create_with_connector(
         }),
     )
     .await?;
-    let ack = validate_protected_ack(read_msg(&mut control).await?, &fingerprint, None)?;
+    let ack = validate_protected_ack(
+        read_msg(&mut control)
+            .await
+            .map_err(protected_response_error)?,
+        &fingerprint,
+        None,
+    )?;
     if subdomain.is_some_and(|sub| sub != ack.subdomain) {
         return Err(ProtectedControlError::Acknowledgment.into());
     }
@@ -225,13 +278,31 @@ pub async fn connect_and_reattach_with_options(
     subdomain: &str,
     options: &TunnelOptions,
 ) -> anyhow::Result<ConnectedSession> {
+    #[cfg(not(test))]
+    let connector = None;
+    #[cfg(test)]
+    let connector = TEST_TLS_CONNECTOR.try_with(Clone::clone).ok();
+    connect_and_reattach_with_connector(endpoint, token, tunnel_id, subdomain, options, connector)
+        .await
+}
+
+async fn connect_and_reattach_with_connector(
+    endpoint: &str,
+    token: &str,
+    tunnel_id: ulid::Ulid,
+    subdomain: &str,
+    options: &TunnelOptions,
+    connector: Option<tokio_rustls::TlsConnector>,
+) -> anyhow::Result<ConnectedSession> {
     let Some(policy) = &options.access else {
         return connect_and_reattach(endpoint, token, tunnel_id, subdomain).await;
     };
     crate::access::validate_protected_endpoint(endpoint)
         .map_err(|_| ProtectedControlError::Endpoint)?;
     let (session, mut control, data_stream_protocol) =
-        dial_and_open_control(endpoint, token).await?;
+        dial_and_open_control_with_connector(endpoint, token, connector)
+            .await
+            .map_err(protected_response_error)?;
     require_protected_capability(data_stream_protocol)?;
     let fingerprint = policy.fingerprint()?;
     write_msg(
@@ -244,7 +315,9 @@ pub async fn connect_and_reattach_with_options(
     )
     .await?;
     let ack = validate_protected_ack(
-        read_msg(&mut control).await?,
+        read_msg(&mut control)
+            .await
+            .map_err(protected_response_error)?,
         &fingerprint,
         Some((tunnel_id, subdomain)),
     )?;
@@ -416,6 +489,24 @@ mod protected_tests {
         .is_err());
     }
 
+    #[test]
+    fn protected_protocol_conversion_preserves_io_and_tls_transport_types() {
+        let io = protected_response_error(
+            std::io::Error::from(std::io::ErrorKind::ConnectionReset).into(),
+        );
+        assert!(io.is::<std::io::Error>());
+        assert!(!io.is::<ProtectedControlError>());
+        let tls = protected_response_error(
+            async_tungstenite::tungstenite::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "TLS transport failure",
+            ))
+            .into(),
+        );
+        assert!(tls.is::<async_tungstenite::tungstenite::Error>());
+        assert!(!tls.is::<ProtectedControlError>());
+    }
+
     #[tokio::test]
     async fn protected_endpoint_rejected_before_dial_and_capability_has_no_raw_fallback() {
         let policy = std::sync::Arc::new(
@@ -447,9 +538,13 @@ mod trusted_wss_tests {
         Legacy,
         NoEcho,
         Oversized,
+        Malformed,
+        InvalidEcho,
+        UntrustedCa,
     }
 
     #[allow(clippy::result_large_err)] // tungstenite fixes the callback error type.
+    #[allow(clippy::too_many_lines)] // One trusted-WSS fixture covers protocol and transport failures.
     async fn peer(
         reply: PeerReply,
     ) -> (
@@ -473,7 +568,9 @@ mod trusted_wss_tests {
             .with_single_cert(vec![leaf.der().clone()], key)
             .unwrap();
         let mut roots = rustls::RootCertStore::empty();
-        roots.add(ca.der().clone()).unwrap();
+        if !matches!(reply, PeerReply::UntrustedCa) {
+            roots.add(ca.der().clone()).unwrap();
+        }
         let client = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
@@ -486,16 +583,21 @@ mod trusted_wss_tests {
         );
         let task = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
-            let tls = acceptor.accept(tcp).await.unwrap();
+            let tls = acceptor.accept(tcp).await;
+            if matches!(reply, PeerReply::UntrustedCa) {
+                assert!(tls.is_err());
+                return;
+            }
+            let tls = tls.unwrap();
             let ws = async_tungstenite::tokio::accept_hdr_async(tls, move |request: &async_tungstenite::tungstenite::handshake::server::Request, mut response: async_tungstenite::tungstenite::handshake::server::Response| {
                 assert_eq!(request.headers()["authorization"], "Bearer tnl_TEST");
                 assert_eq!(request.headers()[DATA_STREAM_PROTOCOL_HEADER], HTTP1_METADATA_V1);
-                if !matches!(reply, PeerReply::NoEcho) { response.headers_mut().insert(DATA_STREAM_PROTOCOL_HEADER, http::HeaderValue::from_static(HTTP1_METADATA_V1)); }
+                if !matches!(reply, PeerReply::NoEcho) { response.headers_mut().insert(DATA_STREAM_PROTOCOL_HEADER, http::HeaderValue::from_static(if matches!(reply, PeerReply::InvalidEcho) { "INVALID_ECHO_SENTINEL" } else { HTTP1_METADATA_V1 })); }
                 Ok(response)
             }).await.unwrap();
             let mut session = tnl_protocol::server_session_from_ws_generic(ws);
             let Some(mut control) = session.accept_stream().await.unwrap() else {
-                assert!(matches!(reply, PeerReply::NoEcho));
+                assert!(matches!(reply, PeerReply::NoEcho | PeerReply::InvalidEcho));
                 return;
             };
             let length = control.read_u32().await;
@@ -513,6 +615,13 @@ mod trusted_wss_tests {
             };
             if matches!(reply, PeerReply::Oversized) {
                 control.write_u32(u32::MAX).await.unwrap();
+            } else if matches!(reply, PeerReply::Malformed) {
+                let malformed = b"{\"SCHEMA_SECRET_SENTINEL\": not-json}";
+                control
+                    .write_u32(u32::try_from(malformed.len()).unwrap())
+                    .await
+                    .unwrap();
+                control.write_all(malformed).await.unwrap();
             } else {
                 let fingerprint = if matches!(reply, PeerReply::ChangedPolicy) {
                     "b".repeat(64)
@@ -550,44 +659,111 @@ mod trusted_wss_tests {
         (endpoint, connector, task)
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn verified_test_ca_wss_requires_capability_and_exact_policy_ack_without_public_fallback()
-    {
+    async fn assert_peer_reply(reply: PeerReply) {
         let options = TunnelOptions {
             access: Some(Arc::new(
                 tnl_protocol::access::VisitorAccessPolicyV1::new(None, &[], None, Some(1)).unwrap(),
             )),
         };
+        let (endpoint, connector, server) = peer(reply).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_and_create_with_connector(
+                &endpoint,
+                "tnl_TEST",
+                Some("demo"),
+                &options,
+                Some(connector),
+            ),
+        )
+        .await
+        .unwrap();
+        if matches!(reply, PeerReply::Exact) {
+            assert!(result.is_ok());
+        } else {
+            let error = result.as_ref().unwrap_err();
+            assert_eq!(
+                crate::exit::classify(error),
+                crate::exit::EX_SERVER_ERROR,
+                "{reply:?} must be a typed server/protocol failure"
+            );
+            assert!(error.is::<ProtectedControlError>());
+            let diagnostic = format!("{error:#?}");
+            assert!(!diagnostic.contains("SCHEMA_SECRET_SENTINEL"));
+            assert!(!diagnostic.contains("INVALID_ECHO_SENTINEL"));
+        }
+        drop(result);
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verified_test_ca_wss_requires_capability_and_exact_policy_ack_without_public_fallback()
+    {
         for reply in [
             PeerReply::Exact,
             PeerReply::ChangedPolicy,
             PeerReply::Legacy,
             PeerReply::NoEcho,
-            PeerReply::Oversized,
         ] {
-            let (endpoint, connector, server) = peer(reply).await;
-            let result = tokio::time::timeout(
-                Duration::from_secs(5),
-                connect_and_create_with_connector(
-                    &endpoint,
-                    "tnl_TEST",
-                    Some("demo"),
-                    &options,
-                    Some(connector),
-                ),
-            )
-            .await
-            .unwrap();
-            if matches!(reply, PeerReply::Exact) {
-                assert!(result.is_ok());
-            } else {
-                assert!(result.is_err());
-            }
-            drop(result);
-            tokio::time::timeout(Duration::from_secs(5), server)
-                .await
-                .unwrap()
-                .unwrap();
+            assert_peer_reply(reply).await;
         }
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn protected_untrusted_certificate_remains_a_verified_tls_transport_failure() {
+        let options = TunnelOptions {
+            access: Some(Arc::new(
+                tnl_protocol::access::VisitorAccessPolicyV1::new(None, &[], None, Some(1)).unwrap(),
+            )),
+        };
+        let (endpoint, connector, server) = peer(PeerReply::UntrustedCa).await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_and_create_with_connector(
+                &endpoint,
+                "tnl_TEST",
+                None,
+                &options,
+                Some(connector),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(!error.is::<ProtectedControlError>());
+        assert!(matches!(
+            error.downcast_ref::<async_tungstenite::tungstenite::Error>(),
+            Some(async_tungstenite::tungstenite::Error::Io(_))
+        ));
+        assert_eq!(
+            crate::exit::classify(&error),
+            crate::exit::EX_SERVER_UNREACHABLE
+        );
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn protected_oversized_response_exits_70_without_public_fallback() {
+        assert_peer_reply(PeerReply::Oversized).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn protected_malformed_response_exits_70_without_public_fallback() {
+        assert_peer_reply(PeerReply::Malformed).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn protected_invalid_echo_exits_70_without_public_fallback() {
+        assert_peer_reply(PeerReply::InvalidEcho).await;
+    }
 }
+
+#[cfg(test)]
+#[path = "client/access_e2e_tests.rs"]
+mod access_e2e_tests;

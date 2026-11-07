@@ -10,6 +10,8 @@ use ulid::Ulid;
 /// Origin of a failure that the response attributes blame to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Component {
+    /// Per-tunnel visitor access admission.
+    Access,
     /// No tunnel registered for the requested host.
     Registry,
     /// Tunnel exists in registry but no live session right now.
@@ -29,6 +31,7 @@ impl Component {
     /// Lower-case identifier emitted in the `X-Tnl-Component` header.
     pub const fn as_header(self) -> &'static str {
         match self {
+            Self::Access => "access",
             Self::Registry => "registry",
             Self::Daemon => "daemon",
             Self::Transport => "transport",
@@ -142,6 +145,7 @@ fn html_escape(s: &str) -> String {
 
 fn render_html(c: &ErrorContext<'_>) -> String {
     let title = match c.component {
+        Component::Access => "tnl: access denied",
         Component::Registry => "tnl: no tunnel for host",
         Component::Daemon => "tnl: tunnel disconnected",
         Component::Transport => "tnl: tunnel transport error",
@@ -184,6 +188,7 @@ code{{background:#f4f4f4;padding:.1em .3em;border-radius:.2em}}\
 fn render_json(c: &ErrorContext<'_>) -> String {
     let v = serde_json::json!({
         "error": match c.component {
+            Component::Access => "access_denied",
             Component::Client => "local_backend_failure",
             Component::Registry => "no_such_tunnel",
             Component::Daemon => "tunnel_disconnected",
