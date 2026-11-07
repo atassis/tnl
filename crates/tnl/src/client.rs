@@ -41,6 +41,18 @@ async fn dial_and_open_control(
     Pin<Box<dyn tnl_protocol::Stream>>,
     DataStreamProtocol,
 )> {
+    dial_and_open_control_with_connector(endpoint, token, None).await
+}
+
+async fn dial_and_open_control_with_connector(
+    endpoint: &str,
+    token: &str,
+    connector: Option<tokio_rustls::TlsConnector>,
+) -> anyhow::Result<(
+    Box<dyn tnl_protocol::Session>,
+    Pin<Box<dyn tnl_protocol::Stream>>,
+    DataStreamProtocol,
+)> {
     let ws_url = endpoint
         .replace("http://", "ws://")
         .replace("https://", "wss://");
@@ -63,7 +75,7 @@ async fn dial_and_open_control(
         .header("Sec-WebSocket-Version", "13")
         .body(())
         .context("build ws upgrade request")?;
-    let (ws, resp) = async_tungstenite::tokio::connect_async(req)
+    let (ws, resp) = async_tungstenite::tokio::connect_async_with_tls_connector(req, connector)
         .await
         .with_context(|| format!("connect to {url}"))?;
     let data_stream_protocol = DataStreamProtocol::from_echo(resp.headers())?;
@@ -86,7 +98,7 @@ async fn write_msg(
     ctrl: &mut Pin<Box<dyn tnl_protocol::Stream>>,
     msg: &ControlMsg,
 ) -> anyhow::Result<()> {
-    let payload = serde_json::to_vec(msg)?;
+    let payload = zeroize::Zeroizing::new(serde_json::to_vec(msg)?);
     let len = u32::try_from(payload.len())
         .context("payload too large")?
         .to_be_bytes();
@@ -101,9 +113,149 @@ async fn read_msg(ctrl: &mut Pin<Box<dyn tnl_protocol::Stream>>) -> anyhow::Resu
     let mut lenbuf = [0u8; 4];
     ctrl.read_exact(&mut lenbuf).await?;
     let n = u32::from_be_bytes(lenbuf) as usize;
-    let mut respbuf = vec![0u8; n];
+    if n > 1024 * 1024 {
+        anyhow::bail!("control response exceeds size bound");
+    }
+    let mut respbuf = zeroize::Zeroizing::new(vec![0u8; n]);
     ctrl.read_exact(&mut respbuf).await?;
-    Ok(serde_json::from_slice(&respbuf)?)
+    serde_json::from_slice(&respbuf).map_err(|error| {
+        anyhow::anyhow!(
+            "invalid control response ({:?}, line {}, column {})",
+            error.classify(),
+            error.line(),
+            error.column()
+        )
+    })
+}
+
+/// Run-owned immutable policy. Prepared once before the async runtime and
+/// reused for protected reattach/recreation; no password or file is retained.
+#[derive(Debug, Clone, Default)]
+pub struct TunnelOptions {
+    pub access: Option<std::sync::Arc<tnl_protocol::access::VisitorAccessPolicyV1>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProtectedControlError {
+    #[error("protected endpoint must use verified HTTPS")]
+    Endpoint,
+    #[error("daemon did not acknowledge the required metadata capability")]
+    Capability,
+    #[error("daemon did not acknowledge the exact protected tunnel policy/binding")]
+    Acknowledgment,
+    #[error("protected tunnel rejected ({0:?})")]
+    Server(tnl_protocol::ErrorCode),
+}
+
+fn require_protected_capability(protocol: DataStreamProtocol) -> Result<(), ProtectedControlError> {
+    if protocol != DataStreamProtocol::Http1MetadataV1 {
+        return Err(ProtectedControlError::Capability);
+    }
+    Ok(())
+}
+
+fn validate_protected_ack(
+    response: ControlMsg,
+    expected: &str,
+    binding: Option<(ulid::Ulid, &str)>,
+) -> Result<tnl_protocol::messages::ProtectedTunnelCreatedResp, ProtectedControlError> {
+    match response {
+        ControlMsg::ProtectedTunnelCreated(ack)
+            if ack.policy_fingerprint == expected
+                && binding.is_none_or(|(id, sub)| ack.tunnel_id == id && ack.subdomain == sub) =>
+        {
+            Ok(ack)
+        }
+        ControlMsg::Error { code, .. } => Err(ProtectedControlError::Server(code)),
+        _ => Err(ProtectedControlError::Acknowledgment),
+    }
+}
+
+pub async fn connect_and_create_with_options(
+    endpoint: &str,
+    token: &str,
+    subdomain: Option<&str>,
+    options: &TunnelOptions,
+) -> anyhow::Result<ConnectedSession> {
+    connect_and_create_with_connector(endpoint, token, subdomain, options, None).await
+}
+
+async fn connect_and_create_with_connector(
+    endpoint: &str,
+    token: &str,
+    subdomain: Option<&str>,
+    options: &TunnelOptions,
+    connector: Option<tokio_rustls::TlsConnector>,
+) -> anyhow::Result<ConnectedSession> {
+    let Some(policy) = &options.access else {
+        return connect_and_create_inner(endpoint, token, subdomain).await;
+    };
+    crate::access::validate_protected_endpoint(endpoint)
+        .map_err(|_| ProtectedControlError::Endpoint)?;
+    let (session, mut control, data_stream_protocol) =
+        dial_and_open_control_with_connector(endpoint, token, connector).await?;
+    require_protected_capability(data_stream_protocol)?;
+    let fingerprint = policy.fingerprint()?;
+    write_msg(
+        &mut control,
+        &ControlMsg::CreateProtectedTunnel(tnl_protocol::messages::CreateProtectedTunnelReq {
+            subdomain: subdomain.map(str::to_owned),
+            access: policy.as_ref().clone(),
+        }),
+    )
+    .await?;
+    let ack = validate_protected_ack(read_msg(&mut control).await?, &fingerprint, None)?;
+    if subdomain.is_some_and(|sub| sub != ack.subdomain) {
+        return Err(ProtectedControlError::Acknowledgment.into());
+    }
+    Ok(ConnectedSession {
+        session,
+        control,
+        data_stream_protocol,
+        tunnel_id: ack.tunnel_id,
+        hostname: ack.hostname,
+        subdomain: ack.subdomain,
+    })
+}
+
+pub async fn connect_and_reattach_with_options(
+    endpoint: &str,
+    token: &str,
+    tunnel_id: ulid::Ulid,
+    subdomain: &str,
+    options: &TunnelOptions,
+) -> anyhow::Result<ConnectedSession> {
+    let Some(policy) = &options.access else {
+        return connect_and_reattach(endpoint, token, tunnel_id, subdomain).await;
+    };
+    crate::access::validate_protected_endpoint(endpoint)
+        .map_err(|_| ProtectedControlError::Endpoint)?;
+    let (session, mut control, data_stream_protocol) =
+        dial_and_open_control(endpoint, token).await?;
+    require_protected_capability(data_stream_protocol)?;
+    let fingerprint = policy.fingerprint()?;
+    write_msg(
+        &mut control,
+        &ControlMsg::ReattachProtectedTunnel(tnl_protocol::messages::ReattachProtectedTunnelReq {
+            tunnel_id,
+            subdomain: subdomain.into(),
+            policy_fingerprint: fingerprint.clone(),
+        }),
+    )
+    .await?;
+    let ack = validate_protected_ack(
+        read_msg(&mut control).await?,
+        &fingerprint,
+        Some((tunnel_id, subdomain)),
+    )?;
+    Ok(ConnectedSession {
+        session,
+        control,
+        data_stream_protocol,
+        tunnel_id: ack.tunnel_id,
+        hostname: ack.hostname,
+        subdomain: ack.subdomain,
+    })
 }
 
 pub async fn connect_and_create(
@@ -216,6 +368,226 @@ pub async fn run_accept_loop(
                 warn!(?e, "accept_stream error");
                 return Err(e);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod protected_tests {
+    use super::*;
+    use tnl_protocol::messages::ProtectedTunnelCreatedResp;
+
+    fn ack(fingerprint: &str) -> ControlMsg {
+        ControlMsg::ProtectedTunnelCreated(ProtectedTunnelCreatedResp {
+            tunnel_id: ulid::Ulid::nil(),
+            hostname: "demo.t.x".into(),
+            subdomain: "demo".into(),
+            policy_fingerprint: fingerprint.into(),
+        })
+    }
+
+    #[test]
+    fn protected_ack_never_accepts_public_or_different_policy_or_binding() {
+        let expected = "a".repeat(64);
+        assert!(validate_protected_ack(
+            ack(&expected),
+            &expected,
+            Some((ulid::Ulid::nil(), "demo"))
+        )
+        .is_ok());
+        let public = ControlMsg::TunnelCreated(TunnelCreatedResp {
+            tunnel_id: ulid::Ulid::nil(),
+            hostname: "demo.t.x".into(),
+            subdomain: "demo".into(),
+        });
+        assert!(validate_protected_ack(public, &expected, None).is_err());
+        assert!(validate_protected_ack(ack(&"b".repeat(64)), &expected, None).is_err());
+        assert!(validate_protected_ack(
+            ack(&expected),
+            &expected,
+            Some((ulid::Ulid::new(), "demo"))
+        )
+        .is_err());
+        assert!(validate_protected_ack(
+            ack(&expected),
+            &expected,
+            Some((ulid::Ulid::nil(), "other"))
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn protected_endpoint_rejected_before_dial_and_capability_has_no_raw_fallback() {
+        let policy = std::sync::Arc::new(
+            tnl_protocol::access::VisitorAccessPolicyV1::new(None, &[], None, Some(1)).unwrap(),
+        );
+        let options = TunnelOptions {
+            access: Some(policy),
+        };
+        assert!(
+            connect_and_create_with_options("http://127.0.0.1:1", "token", None, &options)
+                .await
+                .unwrap_err()
+                .is::<ProtectedControlError>()
+        );
+        assert!(require_protected_capability(DataStreamProtocol::RawHttp1).is_err());
+        assert!(require_protected_capability(DataStreamProtocol::Http1MetadataV1).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod trusted_wss_tests {
+    use super::*;
+    use std::{sync::Arc, time::Duration};
+
+    #[derive(Clone, Copy, Debug)]
+    enum PeerReply {
+        Exact,
+        ChangedPolicy,
+        Legacy,
+        NoEcho,
+        Oversized,
+    }
+
+    #[allow(clippy::result_large_err)] // tungstenite fixes the callback error type.
+    async fn peer(
+        reply: PeerReply,
+    ) -> (
+        String,
+        tokio_rustls::TlsConnector,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut ca_params = rcgen::CertificateParams::new(vec!["tnl-test-ca".into()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .signed_by(&leaf_key, &ca, &ca_key)
+            .unwrap();
+        let key = rustls::pki_types::PrivateKeyDer::try_from(leaf_key.serialize_der()).unwrap();
+        let server = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![leaf.der().clone()], key)
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.der().clone()).unwrap();
+        let client = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "https://localhost:{}",
+            listener.local_addr().unwrap().port()
+        );
+        let task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let tls = acceptor.accept(tcp).await.unwrap();
+            let ws = async_tungstenite::tokio::accept_hdr_async(tls, move |request: &async_tungstenite::tungstenite::handshake::server::Request, mut response: async_tungstenite::tungstenite::handshake::server::Response| {
+                assert_eq!(request.headers()["authorization"], "Bearer tnl_TEST");
+                assert_eq!(request.headers()[DATA_STREAM_PROTOCOL_HEADER], HTTP1_METADATA_V1);
+                if !matches!(reply, PeerReply::NoEcho) { response.headers_mut().insert(DATA_STREAM_PROTOCOL_HEADER, http::HeaderValue::from_static(HTTP1_METADATA_V1)); }
+                Ok(response)
+            }).await.unwrap();
+            let mut session = tnl_protocol::server_session_from_ws_generic(ws);
+            let Some(mut control) = session.accept_stream().await.unwrap() else {
+                assert!(matches!(reply, PeerReply::NoEcho));
+                return;
+            };
+            let length = control.read_u32().await;
+            if matches!(reply, PeerReply::NoEcho) {
+                assert!(length.is_err());
+                return;
+            }
+            let length = length.unwrap();
+            assert!(length < 16 * 1024);
+            let mut bytes = vec![0; length as usize];
+            control.read_exact(&mut bytes).await.unwrap();
+            let request: ControlMsg = serde_json::from_slice(&bytes).unwrap();
+            let ControlMsg::CreateProtectedTunnel(request) = request else {
+                panic!("client sent a public/downgraded request");
+            };
+            if matches!(reply, PeerReply::Oversized) {
+                control.write_u32(u32::MAX).await.unwrap();
+            } else {
+                let fingerprint = if matches!(reply, PeerReply::ChangedPolicy) {
+                    "b".repeat(64)
+                } else {
+                    request.access.fingerprint().unwrap()
+                };
+                let response = if matches!(reply, PeerReply::Legacy) {
+                    ControlMsg::TunnelCreated(TunnelCreatedResp {
+                        tunnel_id: ulid::Ulid::nil(),
+                        hostname: "demo.t.x".into(),
+                        subdomain: "demo".into(),
+                    })
+                } else {
+                    ControlMsg::ProtectedTunnelCreated(
+                        tnl_protocol::messages::ProtectedTunnelCreatedResp {
+                            tunnel_id: ulid::Ulid::nil(),
+                            hostname: "demo.t.x".into(),
+                            subdomain: "demo".into(),
+                            policy_fingerprint: fingerprint,
+                        },
+                    )
+                };
+                let bytes = serde_json::to_vec(&response).unwrap();
+                control
+                    .write_u32(u32::try_from(bytes.len()).unwrap())
+                    .await
+                    .unwrap();
+                control.write_all(&bytes).await.unwrap();
+            }
+            control.flush().await.unwrap();
+            // The tested operation must finish/drop rather than issue a legacy
+            // create on this connection after any unsupported or wrong ACK.
+            assert!(control.read_u32().await.is_err());
+        });
+        (endpoint, connector, task)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verified_test_ca_wss_requires_capability_and_exact_policy_ack_without_public_fallback()
+    {
+        let options = TunnelOptions {
+            access: Some(Arc::new(
+                tnl_protocol::access::VisitorAccessPolicyV1::new(None, &[], None, Some(1)).unwrap(),
+            )),
+        };
+        for reply in [
+            PeerReply::Exact,
+            PeerReply::ChangedPolicy,
+            PeerReply::Legacy,
+            PeerReply::NoEcho,
+            PeerReply::Oversized,
+        ] {
+            let (endpoint, connector, server) = peer(reply).await;
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                connect_and_create_with_connector(
+                    &endpoint,
+                    "tnl_TEST",
+                    Some("demo"),
+                    &options,
+                    Some(connector),
+                ),
+            )
+            .await
+            .unwrap();
+            if matches!(reply, PeerReply::Exact) {
+                assert!(result.is_ok());
+            } else {
+                assert!(result.is_err());
+            }
+            drop(result);
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
         }
     }
 }

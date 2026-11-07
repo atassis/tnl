@@ -1,9 +1,9 @@
 # Per-run visitor access controls — replacement reconciliation specification
 
-**Status:** Phase1 policy/input helpers only at `a9997be`; executable protection is not implemented. Section 6 is the corrected phase2 lifecycle proposal, not authorization to implement phase2.
+**Status:** Phase1 committed in `4a451fc`; phase2 is an incomplete, fail-closed wire/client/admission-primitives checkpoint over the reviewed WS merge. Executable protection is not implemented. See §13 for the exact current boundary.
 **Supersedes:** The daemon-profile proposal in `plans/access-controls.md` and its repository copy. Those files are historical, not implementation direction.
 **Inspected worktree / branch / baseline:** `/home/atassis/.config/superpowers/worktrees/tnl/access-controls` / `feat/roadmap-access-controls` / `43f2bc0ed29e00821e1ede624b8fe190eb0d5c57`.
-**Current checkpoint:** Shared policy/input helpers and tests only. The reviewed password-file overflow correction and this roadmap reconciliation do not add protected control messages or enforcement. No commits, children, or deployment changes.
+**Current checkpoint:** Phase2 adds protected control message shapes, exact-ACK client helpers, shared-loop protected retry decisions and bounded daemon admission primitives. The daemon rejects protected creation/reattachment with `AccessUnavailable`; no protected descriptor can be published yet. No worker staging, commits, children or deployment changes.
 
 ## 1. Settled direction and changes from the previous design
 
@@ -111,7 +111,7 @@ The server's accepted fingerprint identifies the whole policy including verifier
 
 ## 6. Proposed protected wire lifecycle using existing WS metadata negotiation
 
-**Phase2 proposal only; no protected lifecycle variants or enforcement exist in phase1.** Metadata already negotiates on the client-Bearer-authenticated WebSocket upgrade: the client offers `x-tnl-data-stream-protocol: http1-metadata-v1`, and the daemon echoes that exact capability. Reuse `DataStreamProtocol::from_echo` and the existing `Http1MetadataV1` data-substream envelope. There is no JSON `data_protocol` selector, additional metadata handshake, new stream prefix, or numeric control-protocol negotiation here.
+**Lifecycle contract:** Protected message shapes and client helpers now exist, but daemon publication/enforcement are not integrated; protected create/reattach return `AccessUnavailable` at this checkpoint. Metadata already negotiates on the client-Bearer-authenticated WebSocket upgrade: the client offers `x-tnl-data-stream-protocol: http1-metadata-v1`, and the daemon echoes that exact capability. Reuse `DataStreamProtocol::from_echo` and the existing `Http1MetadataV1` data-substream envelope. There is no JSON `data_protocol` selector, additional metadata handshake, new stream prefix, or numeric control-protocol negotiation here.
 
 Proposed concrete new internally tagged `ControlMsg` variants and named payloads:
 
@@ -281,3 +281,34 @@ Key risks: PHC leaking through Debug/serde errors; client file/input or verifier
 **Required independent review gate:** inspect source and tests for exact ACK/non-downgrade, bounded/cancellation-safe hashing, public optionality/Authorization preservation, immutable per-ID state, trusted identity, downstream credential removal, HTTP/WS complete lease lifetime and direct-local replay boundary. Missing cross-lane coverage remains an integration blocker. Release-validation owns the later single combined test/deploy shot; this lane performs none.
 
 **Evidence from this reconciliation:** branch/HEAD verified; relevant source and prior artifact read; only this replacement external artifact written. Existing untracked repository plan was present before work and left unchanged. Product tests/builds/deployment: **none run**. Read-only artifact and git/staging checks are reported in the final handoff; no implementation correctness is claimed from document inspection.
+
+
+## 13. Phase2 fail-closed implementation checkpoint
+
+This checkpoint is intentionally **not the complete access-controls feature**. It builds on phase1 `4a451fc` and the parent-started reviewed WS/S0 merge. The Cargo.toml working-tree conflict resolution retains the access dependencies, exact yamux 0.13.10 patch and vendor workspace exclusion; the inherited staged merge/index resolution remains parent-owned.
+
+Implemented:
+
+* The §6 `CreateProtectedTunnel`, `ReattachProtectedTunnel` and `ProtectedTunnelCreated` variants with strict access-specific payloads and required lowercase SHA-256 fingerprints. No metadata JSON selector or second negotiation exists.
+* `client::TunnelOptions`, `connect_and_create_with_options`, `connect_and_reattach_with_options` and `reconnect::run_with_options`. Protected helpers require HTTPS and the existing exact WS capability echo before sending policy; exact fingerprint/reattach identity validation precedes returning a connected session. The shared loop only recreates a protected tunnel for typed `TunnelLost`, always with the same retained options. Legacy public wrappers remain intact.
+* Client response reads reject frames above the existing 1-MiB bound before allocation. Client/server control decode diagnostics omit raw serde text, and control logs no longer Debug-render entire messages. Sensitive serialized/received control buffers use zeroizing storage.
+* `tnld::access::CompiledAccess` independently compiles optional IP, direct aggregate rate, Basic and concurrency state. Its admission order is IP → rate → Basic → concurrency; Basic success alone consumes all gate Authorization values. Non-Basic admission preserves application Authorization.
+* `visitor_ip_for_admission` consumes existing typed resolver results. Resolver fallback provenance (missing/invalid forwarding or all-trusted chains) is unavailable for an enabled visitor allowlist, rather than permission to admit the trusted proxy's address. No forwarding-header parser or duplicate request-ID generation was added.
+* A four-worker process-wide visitor hash capacity, fixed-cost verification in `spawn_blocking`, no worker queue without a permit, and permit ownership inside the blocking closure so waiter cancellation cannot free active hash capacity.
+* Cloneable `AdmissionLease` and trailer-preserving `LeasedBody`, tested for final-owner release, body EOF/error/drop and independent driver-owner lifetime.
+* Fail-closed daemon control handling: valid protected create/reattach are explicitly rejected with `AccessUnavailable`, and a real control-session test asserts no registry descriptor or hostname publication.
+
+Evidence boundary:
+
+* A real certificate-verified WSS **mock control peer** uses a generated test CA and the TLS library's supported custom connector, never disabled certificate verification. It checks exact/wrong/public ACK, missing capability and oversized response behavior. This is protected client wire evidence, **not** a protected daemon/backend end-to-end test.
+* Admission and lease unit tests do not prove complete HTTP upload/response or real WS relay ownership. The actual WS relay remains unchanged in this checkpoint.
+
+Required next slice before enabling protection:
+
+1. Bind immutable compiled access/fingerprint and already-negotiated mode into atomic registry publication; add owner/mode/policy/active-binding reattach checks with no mutation on mismatch and no quota reset.
+2. Integrate admission before stream open/visitor 101, negotiated access denial responses (`Component::Access`, challenge/Retry-After/HEAD/no-store), conditional credential consumption and safe denial events. Preserve the request-ID lane's authoritative context when integrated.
+3. Retain separate HTTP driver/body lease owners and transfer a lease into the WS rendezvous/relay before returning 101. Test actual streaming upload, trailers, cancellation, backend failure and full WS lifetime, including zero stream opens on denial.
+4. Wire the executable's optional flags only after those server paths are complete and tested; preparation stays pre-runtime and creates one immutable Arc policy per run.
+5. Extend the trusted-WSS fixture through the real daemon/enforcement path and exercise actual reconnect/recreation with retained verifier/options. Add deterministic refill/concurrent-burst and complete worker-saturation isolation tests.
+
+Until these gates pass, do not replace the `AccessUnavailable` branch, advertise a protected tunnel, or treat this checkpoint as release-ready security enforcement.

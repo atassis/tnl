@@ -2128,7 +2128,9 @@ dependencies = [
  "libc",
  "nu-ansi-term",
  "parking_lot",
+ "rcgen",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
@@ -2136,6 +2138,7 @@ dependencies = [
  "tnl-protocol",
  "tnld",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "toml",
  "tracing",
@@ -2154,6 +2157,7 @@ dependencies = [
  "anyhow",
  "async-tungstenite",
  "axum",
+ "futures",
  "http",
  "rcgen",
  "reqwest",
@@ -2204,6 +2208,7 @@ dependencies = [
  "async-trait",
  "async-tungstenite",
  "axum",
+ "base64",
  "bytes",
  "clap",
  "clap_complete",
@@ -2212,6 +2217,7 @@ dependencies = [
  "futures",
  "governor",
  "http",
+ "http-body",
  "httparse",
  "hyper",
  "hyper-util",
@@ -2235,6 +2241,7 @@ dependencies = [
  "ulid",
  "ws_stream_tungstenite",
  "yamux",
+ "zeroize",
 ]
 
 [[package]]
@@ -2975,8 +2982,6 @@ dependencies = [
 [[package]]
 name = "yamux"
 version = "0.13.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1991f6690292030e31b0144d73f5e8368936c58e45e7068254f7138b23b00672"
 dependencies = [
  "futures",
  "log",

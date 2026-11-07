@@ -21,6 +21,47 @@ fn parser_returns_none_on_partial_request() {
 }
 
 #[test]
+fn parses_response_status_without_line_terminator_or_reason() {
+    assert_eq!(parse_response_status(b"HTTP/1.1 200 OK"), Some(200));
+    assert_eq!(parse_response_status(b"HTTP/1.1 204"), Some(204));
+    assert_eq!(
+        parse_response_status(b"HTTP/1.0\t404 Not Found\n"),
+        Some(404)
+    );
+}
+
+#[test]
+fn response_status_still_reports_leading_informational_status() {
+    // Final-status selection is outside this first-line parser's scope.
+    let bytes = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n\r\n";
+    assert_eq!(parse_response_status(bytes), Some(100));
+}
+
+#[test]
+fn parser_returns_none_on_empty_status_line() {
+    for bytes in [
+        b"".as_slice(),
+        b"\r\n",
+        b"\nHTTP/1.1 200 OK\r\n",
+        b" \t\r\n",
+    ] {
+        assert_eq!(parse_response_status(bytes), None);
+    }
+}
+
+#[test]
+fn parser_returns_none_on_invalid_status_line() {
+    for bytes in [
+        b"HTTP/1.1 200\xff OK\r\n".as_slice(),
+        b"HTTP/1.1 200 \xff\r\n",
+        b"HTTP/1.1 65536 Overflow\r\n",
+        b"HTTP/1.1 -200 Negative\r\n",
+    ] {
+        assert_eq!(parse_response_status(bytes), None);
+    }
+}
+
+#[test]
 fn parser_returns_none_on_partial_status() {
     // No status token at all
     assert_eq!(parse_response_status(b"HTTP/1.1"), None);

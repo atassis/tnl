@@ -1,11 +1,12 @@
 //! Client reconnect loop with exponential backoff + reattach.
 //!
 //! Strategy:
-//! - First connect: `CreateTunnel` (or random if subdomain is `None`).
-//! - Subsequent connects (after a disconnect): `ReattachTunnel` with the
+//! - First connect: public or protected create according to immutable run options.
+//!   Omitting the subdomain still requests a random name.
+//! - Subsequent connects: reattach in the same public/protected mode with the
 //!   `tunnel_id` from the previous successful connect.
-//! - If reattach returns `TunnelLost`, fall back to `CreateTunnel` with the
-//!   same subdomain — the grace window has elapsed and we need a fresh tunnel.
+//! - On `TunnelLost`, recreate with the same subdomain and policy. Protected
+//!   recreation uses a typed code and can never select a public request.
 //! - Backoff: 1s → 2s → 4s → 8s → 16s → 30s (capped). Reset on success.
 //! - Auth failures (`Unauthorized` / "token rejected") are NOT recoverable.
 
@@ -48,10 +49,35 @@ pub async fn run(
     subdomain: Option<&str>,
     target: crate::target::Target,
     host_header: crate::host_header::HostHeader,
+    hooks: Hooks,
+) -> anyhow::Result<()> {
+    run_with_options(
+        endpoint,
+        token,
+        subdomain,
+        target,
+        host_header,
+        &crate::client::TunnelOptions::default(),
+        hooks,
+    )
+    .await
+}
+
+/// The same reconnect loop retains one immutable policy through every retry,
+/// reattach and typed-TunnelLost recreation. It never retries in public mode.
+#[allow(clippy::too_many_lines)]
+pub async fn run_with_options(
+    endpoint: &str,
+    token: &str,
+    subdomain: Option<&str>,
+    target: crate::target::Target,
+    host_header: crate::host_header::HostHeader,
+    options: &crate::client::TunnelOptions,
     mut hooks: Hooks,
 ) -> anyhow::Result<()> {
     let mut backoff_ms: u64 = 1_000;
     let mut last_tunnel: Option<(ulid::Ulid, String)> = None;
+    let mut create_subdomain = subdomain.map(str::to_owned);
     let mut printed_banner = false;
     let mut warned_raw_metadata = false;
     // Per-tunnel host-rewrite state, persisted across reconnects so a learned
@@ -66,25 +92,40 @@ pub async fn run(
             let tid = *tid;
             let sub = sub.clone();
             // Try to reattach within the grace window.
-            match crate::client::connect_and_reattach(endpoint, token, tid, &sub).await {
+            match crate::client::connect_and_reattach_with_options(
+                endpoint, token, tid, &sub, options,
+            )
+            .await
+            {
                 Ok(s) => Ok(s),
                 Err(e) => {
                     // On TunnelLost the grace window has elapsed; fall back to
-                    // a fresh CreateTunnel with the same subdomain so the URL
+                    // a fresh create in the SAME selected mode so the URL
                     // stays stable.
-                    if format!("{e:#}").contains("TunnelLost") {
+                    if is_tunnel_lost(&e, options.access.is_some()) {
                         eprintln!("info: grace window elapsed; recreating tunnel");
                         last_tunnel = None;
-                        crate::client::connect_and_create(endpoint, token, &sub).await
+                        retain_protected_recreation_name(
+                            &mut create_subdomain,
+                            &sub,
+                            options.access.is_some(),
+                        );
+                        crate::client::connect_and_create_with_options(
+                            endpoint,
+                            token,
+                            Some(&sub),
+                            options,
+                        )
+                        .await
                     } else {
                         Err(e)
                     }
                 }
             }
-        } else if let Some(s) = subdomain {
-            crate::client::connect_and_create(endpoint, token, s).await
+        } else if let Some(s) = create_subdomain.as_deref() {
+            crate::client::connect_and_create_with_options(endpoint, token, Some(s), options).await
         } else {
-            crate::client::connect_and_create_random(endpoint, token).await
+            crate::client::connect_and_create_with_options(endpoint, token, None, options).await
         };
 
         let session = match result {
@@ -97,7 +138,7 @@ pub async fn run(
                 s
             }
             Err(e) => {
-                if !is_recoverable(&e) {
+                if !is_recoverable(&e, options.access.is_some()) {
                     return Err(e);
                 }
                 warn!(%e, "connection failed; reconnecting in {}s", backoff_ms / 1000);
@@ -174,7 +215,102 @@ pub async fn run(
 }
 
 /// Returns `false` for errors that cannot be fixed by retrying (bad token, etc.).
-fn is_recoverable(e: &anyhow::Error) -> bool {
+fn retain_protected_recreation_name(
+    requested: &mut Option<String>,
+    assigned: &str,
+    protected: bool,
+) {
+    // A failed recreation after an originally random protected create must not
+    // turn the next retry into another random-hostname request.
+    if protected {
+        *requested = Some(assigned.to_owned());
+    }
+}
+
+fn is_tunnel_lost(e: &anyhow::Error, protected: bool) -> bool {
+    if protected {
+        matches!(
+            e.downcast_ref::<crate::client::ProtectedControlError>(),
+            Some(crate::client::ProtectedControlError::Server(
+                tnl_protocol::ErrorCode::TunnelLost
+            ))
+        )
+    } else {
+        format!("{e:#}").contains("TunnelLost")
+    }
+}
+
+fn is_recoverable(e: &anyhow::Error, protected: bool) -> bool {
+    if protected {
+        if e.downcast_ref::<crate::client::ProtectedControlError>()
+            .is_some()
+        {
+            return false;
+        }
+        if e.downcast_ref::<std::io::Error>().is_some() {
+            return true;
+        }
+        return matches!(
+            e.downcast_ref::<async_tungstenite::tungstenite::Error>(),
+            Some(
+                async_tungstenite::tungstenite::Error::Io(_)
+                    | async_tungstenite::tungstenite::Error::ConnectionClosed
+                    | async_tungstenite::tungstenite::Error::AlreadyClosed
+            )
+        );
+    }
     let s = format!("{e:#}").to_lowercase();
     !(s.contains("unauthor") || s.contains("token rejected"))
+}
+
+#[cfg(test)]
+mod protected_tests {
+    use super::*;
+    use crate::client::ProtectedControlError;
+    use tnl_protocol::ErrorCode;
+
+    #[test]
+    fn protected_recreation_is_selected_by_typed_tunnel_lost_only() {
+        let typed = anyhow::Error::new(ProtectedControlError::Server(ErrorCode::TunnelLost));
+        assert!(is_tunnel_lost(&typed, true));
+        assert!(!is_tunnel_lost(
+            &anyhow::anyhow!("server message says TunnelLost"),
+            true
+        ));
+        assert!(!is_tunnel_lost(
+            &anyhow::Error::new(ProtectedControlError::Server(
+                ErrorCode::AccessPolicyMismatch
+            )),
+            true
+        ));
+    }
+
+    #[test]
+    fn invalid_protected_acks_and_policy_errors_are_terminal_but_io_can_retry() {
+        for failure in [
+            ProtectedControlError::Capability,
+            ProtectedControlError::Acknowledgment,
+            ProtectedControlError::Server(ErrorCode::AccessUnavailable),
+            ProtectedControlError::Server(ErrorCode::AccessPolicyMismatch),
+        ] {
+            assert!(!is_recoverable(&anyhow::Error::new(failure), true));
+        }
+        assert!(is_recoverable(
+            &anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+            true
+        ));
+        assert!(!is_recoverable(
+            &anyhow::anyhow!("malformed peer response"),
+            true
+        ));
+    }
+    #[test]
+    fn protected_random_run_recreation_retry_retains_assigned_hostname() {
+        let mut requested = None;
+        retain_protected_recreation_name(&mut requested, "assigned-random", true);
+        assert_eq!(requested.as_deref(), Some("assigned-random"));
+        let mut public = None;
+        retain_protected_recreation_name(&mut public, "assigned-random", false);
+        assert!(public.is_none());
+    }
 }

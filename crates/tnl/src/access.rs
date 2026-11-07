@@ -137,7 +137,7 @@ impl AccessArgs {
     }
 }
 
-fn validate_protected_endpoint(endpoint: &str) -> Result<(), AccessInputError> {
+pub(crate) fn validate_protected_endpoint(endpoint: &str) -> Result<(), AccessInputError> {
     let url = url::Url::parse(endpoint).map_err(|_| AccessInputError::Endpoint)?;
     if url.scheme() != "https"
         || url.host_str().is_none()
