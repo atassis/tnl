@@ -89,3 +89,21 @@ Intentional release also propagates registry lock failure rather than silently
 acknowledging removal. A poisoned-lifecycle regression and negative mutation
 verify that false-success handling is rejected. Unexpected-disconnect cleanup
 retains its preexisting public interface and grace semantics.
+
+
+Release validation incident: the first frozen-artifact campaign was cancelled,
+not passed. Its long TMPDIR made Chromium abort with `Socket path too long`;
+cleanup then waited for an already-delivered exit because signal termination
+sets signalCode while exitCode remains null. A standalone RED reproduces that
+wait. Cleanup now checks both fields, bounds escalation, and has three Node
+regressions. The Rust wrapper enforces an independent 60-second process-group
+watchdog (including a deliberately hung Node regression) and tests a long parent
+TMPDIR while the browser uses a short private runtime directory.
+
+Recovery against the unchanged cb340cb release artifacts passes fmt/clippy,
+447 workspace tests including all ignored cases, and six actual extracted-image
+daemon acceptance tests. The image separately passes 11 runtime checks. Two
+obsolete beta.1 image tests internally skip and are not counted as image proof.
+Only qualification tests/docs change after the cb340cb artifact build; manifest
+provenance must distinguish the artifact revision from the repaired test revision.
+Original cancelled campaign evidence remains beside the recovery campaign.
