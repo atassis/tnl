@@ -71,6 +71,10 @@ async fn wss_dial_does_not_report_tls_feature_missing() {
             "Sec-WebSocket-Key",
             async_tungstenite::tungstenite::handshake::client::generate_key(),
         )
+        .header(
+            tnl_protocol::control::CONTROL_PROTOCOL_HEADER,
+            tnl_protocol::control::CONTROL_PROTOCOL_VERSION,
+        )
         .header("Sec-WebSocket-Version", "13")
         .body(())
         .unwrap();

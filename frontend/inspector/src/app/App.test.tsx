@@ -1,0 +1,20 @@
+import {afterEach,expect,it,vi} from 'vitest';
+import {cleanup,fireEvent,render,screen,waitFor} from '@testing-library/react';
+import {App} from './App';
+import type {InspectorApi} from './App';
+import {detailFixture,listFixture,statsFixture} from '../fixtures/contracts';
+afterEach(()=>{cleanup();vi.unstubAllGlobals();history.replaceState(null,'','/');});
+it('theme changes preserve selected capture and detail tab and never cause a mutation',async()=>{
+  vi.stubGlobal('matchMedia',()=>({matches:false,addEventListener:()=>{},removeEventListener:()=>{}}));
+  const api:InspectorApi={stats:vi.fn().mockResolvedValue(statsFixture()),list:vi.fn().mockResolvedValue(listFixture()),detail:vi.fn().mockResolvedValue(detailFixture()),availability:vi.fn(),prepare:vi.fn(),confirm:vi.fn(),outcome:vi.fn()};
+  const row=listFixture().items[0];if(!row)throw Error('fixture');
+  render(<App api={api}/>);
+  const select=await screen.findByRole('button',{name:`Inspect ${row.method} ${row.request_target}`});fireEvent.click(select);
+  await waitFor(()=>expect(screen.getByTestId('capture-id').textContent).toBe(row.capture_id));
+  fireEvent.click(screen.getByRole('tab',{name:'Response'}));
+  fireEvent.change(screen.getByLabelText('Theme'),{target:{value:'dark'}});
+  expect(document.documentElement.dataset.theme).toBe('dark');
+  expect(screen.getByTestId('capture-id').textContent).toBe(row.capture_id);
+  expect(screen.getByRole('tab',{name:'Response'}).getAttribute('aria-selected')).toBe('true');
+  expect(api.prepare).not.toHaveBeenCalled();expect(api.confirm).not.toHaveBeenCalled();
+});

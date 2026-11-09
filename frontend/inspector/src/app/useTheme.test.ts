@@ -1,0 +1,25 @@
+import {afterEach,expect,it,vi} from 'vitest';
+import {act,cleanup,renderHook} from '@testing-library/react';
+import {useTheme} from './useTheme';
+afterEach(()=>{cleanup();vi.unstubAllGlobals();vi.restoreAllMocks();history.replaceState(null,'','/');document.documentElement.removeAttribute('data-theme');});
+it('Auto follows system changes while explicit themes survive remount without storage',()=>{
+  const listeners=new Set<()=>void>();
+  const media={matches:true,addEventListener:(_name:string,listener:()=>void)=>listeners.add(listener),removeEventListener:(_name:string,listener:()=>void)=>listeners.delete(listener)};
+  vi.stubGlobal('matchMedia',()=>media);
+  history.replaceState(null,'','/#token=private-capability&other=keep');
+  const storage=vi.spyOn(Storage.prototype,'setItem');
+  const hook=renderHook(()=>useTheme());
+  expect(hook.result.current.resolved).toBe('dark');expect(document.documentElement.dataset.theme).toBe('dark');
+  act(()=>{media.matches=false;listeners.forEach(listener=>listener());});
+  expect(hook.result.current.resolved).toBe('light');
+  act(()=>hook.result.current.setMode('dark'));
+  expect(hook.result.current.resolved).toBe('dark');
+  act(()=>{media.matches=false;listeners.forEach(listener=>listener());});
+  expect(hook.result.current.resolved).toBe('dark');
+  const params=new URLSearchParams(location.hash.slice(1));
+  expect(params.get('token')).toBe('private-capability');expect(params.get('other')).toBe('keep');expect(params.get('theme')).toBe('dark');
+  hook.unmount();expect(listeners.size).toBe(0);
+  const fresh=renderHook(()=>useTheme());expect(fresh.result.current.mode).toBe('dark');expect(fresh.result.current.resolved).toBe('dark');
+  act(()=>fresh.result.current.setMode('auto'));expect(new URLSearchParams(location.hash.slice(1)).has('theme')).toBe(false);
+  expect(storage).not.toHaveBeenCalled();expect(document.documentElement.hasAttribute('style')).toBe(false);
+});

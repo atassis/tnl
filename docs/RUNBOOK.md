@@ -7,9 +7,17 @@ Run everything below from the repository root.
 
 ## 1. Build
 
+Use Node 24.14.x and pnpm 12.18.0 for the embedded inspector build:
+
 ```bash
-cargo build --release --workspace
+corepack pnpm install --frozen-lockfile
+corepack pnpm build
 ```
+
+The supported build generates and validates the embedded assets before compiling
+both release binaries. See [`frontend-inspector.md`](frontend-inspector.md) for
+the asset contract and source-build checks. A bare Cargo build needs already
+prepared assets; it is not the clean-source build entry point.
 
 Rust 1.94 is pinned via `rust-toolchain.toml`; rustup installs it on first run.
 You'll get `./target/release/tnld` (daemon) and `./target/release/tnl` (client).
@@ -162,3 +170,60 @@ that is separately exposed, and local replay/inspector owners must never restore
 consumed gate credential. Combined release qualification still owns public Caddy,
 packaged binaries and browser behavior; local trusted-CA tests are not deployment
 acceptance.
+
+## Connection recovery qualification
+
+Client and daemon require an exact `heartbeat-v1` control-version echo before
+registration. Upgrade them together; there is no mixed-version fallback.
+Control heartbeat is every 15 seconds with a 5-second exchange budget. Initial
+connection/registration has one 20-second budget, and the daemon's control-silence
+lease is 45 seconds. Request opening has a separate 5-second budget shared by
+session-mutex acquisition and transport opening, not the subsequent upload,
+response, SSE or WebSocket lifetime. These timers require a running runtime;
+they do not prove backend health or progress while the OS is suspended.
+
+After a failed connection, the old server owner can remain active until its
+lease expires. The client retries without taking over that binding, then can
+reattach during the configured `session_grace_sec` (default 30 seconds). After
+grace expiry or daemon restart, a typed missing-tunnel response permits same-name,
+exact-policy recreation. The name may already belong to another owner; finite
+grace is not permanent reservation. Protected reattach retains quota state;
+recreation establishes a new tunnel under the retained policy, not durable state.
+
+A stop delivered on the current valid control session ends that run and its
+active forwards. An offline client may miss the notification and race to recreate
+once the name is free. There is no persisted stop ban. Do not treat local history
+as recovery of active requests: HTTP and WebSockets are not automatically replayed
+or migrated. If a POST response is lost, execution is uncertain; confirm backend
+state before retrying. Inspector history stays local to the run and old replay
+authority is revoked on disconnect/generation change.
+
+Run the local recovery matrix after preparing assets:
+
+```bash
+cargo test --locked -p tnl-e2e --test connection_recovery
+cargo test --locked -p tnl --lib recovery_qualification_tests
+```
+
+Process cases are intentionally ignored by default and do not count as qualified
+until explicitly run with an identified candidate. To test the release daemon
+built above (the test harness still runs the current Rust client library):
+
+```bash
+sha256sum target/release/tnld
+TNL_R6_TNLD="$PWD/target/release/tnld" \
+  cargo test --locked -p tnl-e2e --test connection_recovery \
+  actual_daemon_process_restart -- --ignored
+TNL_R6_TNLD="$PWD/target/release/tnld" \
+  cargo test --locked -p tnl --lib protected_actual_process_restart -- --ignored
+```
+
+These fixtures kill and wait for their owned daemon, then restart it on the same
+port/config. They use loopback, verified fixture TLS and byte-dropping relays that
+retain peers without propagating FIN. Server-to-client-only loss can carry logical
+Close in the healthy reverse direction, so it is not old-owner lease-expiry proof.
+Resource checks observe actual task/generation lifetimes; queue bounds have
+separate transport tests, not inferred outer queue counts. Actual OS suspend,
+external routing/NAT changes, public TLS/Caddy and packaged-client behavior still
+need separate environment qualification. The historical intermittent stop failure
+is not causally explained by these passes.

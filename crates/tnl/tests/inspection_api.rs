@@ -147,22 +147,6 @@ async fn authority_auth_browser_context_and_query_validation_are_fail_closed() {
     }
     assert!(!root.contains(token));
     assert!(!root.contains("Access-Control-Allow"));
-    let script = request(&service, "", "/inspector.js").await;
-    assert!(script.contains("location.hash"));
-    assert!(
-        !script.contains("history.replaceState"),
-        "private fragment must survive refresh"
-    );
-    assert!(script.contains("textContent"));
-    for forbidden in [
-        "innerHTML",
-        "localStorage",
-        "sessionStorage",
-        "eval(",
-        "console.",
-    ] {
-        assert!(!script.contains(forbidden));
-    }
     assert!(!format!("{service:?}").contains(token));
     service.shutdown().await;
 }
@@ -303,7 +287,7 @@ async fn cross_site_user_navigation_bootstraps_only_the_nonsensitive_root_docume
         let response = request(&service, &format!("{USER_NAVIGATION}{origin}"), "/").await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(response.contains("Content-Type: text/html"));
-        assert!(response.contains("src=\"/inspector.js\""));
+        assert!(response.contains("<script type=\"module\""));
         assert!(!response.contains(token));
         assert!(!response.contains("PRIVATE_PATH_CANARY"));
         assert!(!response.contains("Access-Control-Allow"));
@@ -370,7 +354,6 @@ async fn cross_site_navigation_never_relaxes_api_script_authority_origin_or_fram
     let token = url.split("#token=").nth(1).unwrap();
     let headers = format!("{USER_NAVIGATION}Authorization: Bearer {token}\r\n");
     for target in [
-        "/inspector.js",
         "/api/v1/stats",
         "/api/v1/requests",
         "/api/v1/requests/unknown",
@@ -441,5 +424,129 @@ async fn cross_site_navigation_never_relaxes_api_script_authority_origin_or_fram
     )
     .await
     .starts_with("HTTP/1.1 200"));
+    service.shutdown().await;
+}
+
+// Inspect actual compiled bytes and manifest-linked paths, not implementation
+// strings in a minified React bundle. UI authority behavior lives in semantic
+// frontend tests; native CSP enforcement is qualified separately in the browser.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One finite manifest matrix checks compiled bytes and every asset guard.
+async fn compiled_manifest_assets_are_exact_borrowed_routes_with_browser_guards() {
+    let manifest: serde_json::Value =
+        serde_json::from_str(include_str!("../src/inspection/assets/manifest.json")).unwrap();
+    let assets = manifest["assets"].as_array().unwrap();
+    let service = InspectorService::start(Inspection::new(PreviewMode::Off), 0)
+        .await
+        .unwrap();
+    let url = service.bootstrap_url();
+    let token = url.split("#token=").nth(1).unwrap();
+    let root = request(&service, "", "/").await;
+    let (_, html) = root.split_once("\r\n\r\n").unwrap();
+    let mut js = 0;
+    let mut css = 0;
+    let mut total = 0;
+    for asset in assets {
+        let file = asset["path"].as_str().unwrap();
+        let path = if file == "index.html" {
+            "/".to_owned()
+        } else {
+            format!("/{file}")
+        };
+        let extension = std::path::Path::new(file)
+            .extension()
+            .and_then(|value| value.to_str());
+        if extension == Some("js") {
+            js += asset["size"].as_u64().unwrap();
+            assert!(html.contains(&format!("src=\"{path}\"")));
+        }
+        if extension == Some("css") {
+            css += asset["size"].as_u64().unwrap();
+            assert!(html.contains(&format!("href=\"{path}\"")));
+        }
+        total += asset["size"].as_u64().unwrap();
+        // Assets are intentionally public static data; only API routes require
+        // the capability. Neither missing nor invalid bearer grants API access.
+        for headers in [
+            String::new(),
+            "Authorization: Bearer invalid\r\n".to_owned(),
+            format!(
+                "Origin: http://{}\r\nSec-Fetch-Site: same-origin\r\n",
+                service.addr()
+            ),
+        ] {
+            let response = request(&service, &headers, &path).await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{path}: {response}");
+            let (head, body) = response.split_once("\r\n\r\n").unwrap();
+            let expected = std::fs::read(format!(
+                "{}/src/inspection/assets/{file}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap();
+            assert_eq!(body.as_bytes(), expected, "{path}");
+            assert_eq!(body.len() as u64, asset["size"].as_u64().unwrap());
+            assert!(head.contains(&format!(
+                "Content-Type: {}\r\n",
+                asset["mime"].as_str().unwrap()
+            )));
+            for header in ["Cache-Control: no-store", "X-Content-Type-Options: nosniff", "Referrer-Policy: no-referrer", "X-Frame-Options: DENY", "Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"] { assert!(head.contains(header), "{path}: {head}"); }
+            assert!(!body.contains(token));
+            assert!(!head.contains("Access-Control-Allow"));
+        }
+        for headers in [
+            "Origin: http://evil.invalid\r\n",
+            "Origin: null\r\n",
+            "Sec-Fetch-Site: same-site\r\n",
+        ] {
+            assert!(
+                request(&service, headers, &path)
+                    .await
+                    .starts_with("HTTP/1.1 403"),
+                "{path}"
+            );
+        }
+        if path != "/" {
+            assert!(
+                request(&service, USER_NAVIGATION, &path)
+                    .await
+                    .starts_with("HTTP/1.1 403"),
+                "{path}"
+            );
+        }
+        for host in [
+            "evil.invalid".to_owned(),
+            format!("localhost:{}", service.addr().port()),
+            format!("{}\r\nHost: {}", service.addr(), service.addr()),
+        ] {
+            assert!(raw(
+                &service,
+                &format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n")
+            )
+            .await
+            .starts_with("HTTP/1.1 403"));
+        }
+    }
+    assert!(js > 0 && js <= 512 * 1024);
+    assert!(css > 0 && css <= 128 * 1024);
+    assert!(total <= 1024 * 1024);
+    for path in [
+        "/inspector.js",
+        "/index.html",
+        "/assets/unknown.js",
+        "/assets/../index.html",
+        "/assets/%2e%2e/index.html",
+        "/../Cargo.toml",
+        "/?theme=dark",
+        "/api/unknown",
+    ] {
+        let response = request(
+            &service,
+            &format!("Authorization: Bearer {token}\r\n"),
+            path,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 404"), "{path}: {response}");
+        assert!(!response.contains("<html"));
+    }
     service.shutdown().await;
 }

@@ -161,47 +161,52 @@ impl Inspection {
             backend,
         };
         let record = InspectionRecord {
-            schema_version: 1,
-            tunnel: String::new(),
-            tunnel_id: None,
-            origin: super::Origin::External,
-            started_at_ms: super::model::wall_ms(),
-            duration_ms: 0,
             started: Instant::now(),
             terminal: false,
             counters: None,
-            failure_kind: None,
-            display_target: String::new(),
-            resolved_addr: None,
-            response_source: super::ResponseSource::Unavailable,
-            request_boundary: if raw_consumer {
-                super::RequestBoundary::EffectiveBackend
-            } else {
-                super::RequestBoundary::PreconnectUnavailable
+            view: tnl_inspector_api::inspection::InspectionRecord {
+                schema_version: 1,
+                tunnel: String::new(),
+                tunnel_id: None,
+                origin: super::Origin::External,
+                started_at_ms: super::model::wall_ms(),
+                duration_ms: 0,
+                failure_kind: None,
+                display_target: String::new(),
+                resolved_addr: None,
+                response_source: super::ResponseSource::Unavailable,
+                request_boundary: if raw_consumer {
+                    super::RequestBoundary::EffectiveBackend
+                } else {
+                    super::RequestBoundary::PreconnectUnavailable
+                },
+                bytes_to_backend: 0,
+                bytes_from_backend: 0,
+                bytes_to_client: 0,
+                byte_count_semantics: "successful_local_writes_not_delivery",
+                omission_reasons: Vec::new(),
+                visitor: super::Visitor {
+                    available: metadata.is_some(),
+                    source: metadata.map(|m| m.visitor.source.as_str()),
+                    display_ip: metadata.map(|_| "[REDACTED]"),
+                },
+                capture_id: context.capture_id,
+                generation,
+                request_id: context.request_id,
+                visitor_source: metadata.map(|m| m.visitor.source.as_str()),
+                sequence: 0,
+                method: String::new(),
+                request_target: String::new(),
+                status: None,
+                state: State::Active,
+                connection: GenerationState::Untracked,
+                request: Message::new(self.inner.mode),
+                response: Message::new(self.inner.mode),
+                observation_incomplete: false,
+                timing: tnl_inspector_api::timing::Timing::unavailable(
+                    tnl_inspector_api::timing::Reason::NotObserved,
+                ),
             },
-            bytes_to_backend: 0,
-            bytes_from_backend: 0,
-            bytes_to_client: 0,
-            byte_count_semantics: "successful_local_writes_not_delivery",
-            omission_reasons: Vec::new(),
-            visitor: super::Visitor {
-                available: metadata.is_some(),
-                source: metadata.map(|m| m.visitor.source.as_str()),
-                display_ip: metadata.map(|_| "[REDACTED]"),
-            },
-            capture_id: context.capture_id,
-            generation,
-            request_id: context.request_id,
-            visitor_source: metadata.map(|m| m.visitor.source.as_str()),
-            sequence: 0,
-            method: String::new(),
-            request_target: String::new(),
-            status: None,
-            state: State::Active,
-            connection: GenerationState::Untracked,
-            request: Message::new(self.inner.mode),
-            response: Message::new(self.inner.mode),
-            observation_incomplete: false,
         };
         let mut history = self.inner.history.lock();
         if self.inner.closed.load(Ordering::Acquire) {
@@ -462,6 +467,7 @@ impl Inspection {
                 break;
             }
             budget -= cost;
+            let r = r.view;
             summaries.push(Summary {
                 started_at_ms: r.started_at_ms,
                 duration_ms: r.duration_ms,

@@ -125,3 +125,39 @@ fn inspector_refresh_preserves_auth_but_never_replay_confirmation() {
     );
     println!("{}", String::from_utf8_lossy(&output.stdout));
 }
+
+fn run_browser_scenario(name: &str) {
+    for variable in [
+        "TNL_TEST_CLIENT_BIN",
+        "TNL_TEST_DAEMON_BIN",
+        "TNL_TEST_BROWSER_BIN",
+    ] {
+        assert!(
+            std::env::var_os(variable).is_some(),
+            "explicit {variable} required"
+        );
+    }
+    let scenario = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    let (output, expired) = run_node(&[scenario.to_str().unwrap()], Duration::from_secs(60));
+    assert!(
+        !expired && output.status.success(),
+        "{name} failed (deadline exceeded: {expired}):\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+}
+
+#[test]
+#[ignore = "requires explicit candidate CLI/daemon, Brave and node"]
+fn inspector_production_theme_layout_keyboard_and_native_csp() {
+    run_browser_scenario("inspector_appearance.mjs");
+}
+
+#[test]
+#[ignore = "requires explicit candidate CLI/daemon, Brave and node"]
+fn inspector_same_port_restart_revokes_old_browser_authority() {
+    run_browser_scenario("inspector_restart.mjs");
+}

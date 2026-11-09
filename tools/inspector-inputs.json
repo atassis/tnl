@@ -1,0 +1,5 @@
+{
+  "files": ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", ".node-version", ".npmrc"],
+  "directories": ["frontend/inspector", "crates/tnl-inspector-api", "tools"],
+  "exclude": ["frontend/inspector/node_modules", "frontend/inspector/dist", "frontend/inspector/src/api/generated"]
+}

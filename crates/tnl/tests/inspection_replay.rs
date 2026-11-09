@@ -446,35 +446,6 @@ async fn display_eviction_and_lifecycle_revoke_tickets_before_execution() {
     assert_eq!(replay.raw_bytes(), 0);
 }
 
-#[test]
-fn replay_ui_has_explicit_review_confirmation_and_private_tickets_not_fake_controls() {
-    let html = include_str!("../src/inspection/ui.html");
-    let script = include_str!("../src/inspection/ui.js");
-    for id in [
-        "replay-warning",
-        "replay-review",
-        "replay-preview",
-        "replay-ack",
-        "replay-confirm",
-        "replay-outcome",
-    ] {
-        assert!(html.contains(id), "missing {id}");
-    }
-    assert!(script.contains("confirm_side_effects: true"));
-    assert!(script.contains("let pendingTicket = null"));
-    assert!(script.contains("Delivery unknown"));
-    for forbidden in [
-        "innerHTML",
-        "localStorage",
-        "sessionStorage",
-        "console.",
-        "JSON.stringify(preview)",
-        "JSON.stringify(pendingTicket)",
-    ] {
-        assert!(!script.contains(forbidden));
-    }
-}
-
 #[tokio::test]
 async fn preview_consent_is_not_raw_consent_and_unsafe_backends_never_become_replayable() {
     for retain in [false, true] {

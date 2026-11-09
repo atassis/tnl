@@ -1,212 +1,33 @@
 use serde::Serialize;
+pub use tnl_inspector_api::inspection::{
+    BodyPreview, BodyState, CaptureId, GenerationState, Header, HeadersState, Message, Origin,
+    PreviewMode, RequestBoundary, ResponseSource, State, Summary, TunnelGeneration, TunnelStatus,
+    Visitor,
+};
+pub(super) use tnl_inspector_api::ReplayDisplay;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub struct CaptureId(pub(crate) ulid::Ulid);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub struct TunnelGeneration(ulid::Ulid);
-impl TunnelGeneration {
-    pub fn new() -> Self {
-        Self(ulid::Ulid::new())
-    }
-}
-impl Default for TunnelGeneration {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, clap::ValueEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum PreviewMode {
-    Off,
-    Json,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum State {
-    Active,
-    Complete,
-    Failed,
-    Incomplete,
-    Upgraded,
-}
-#[derive(Clone, Debug, Serialize)]
-pub struct Header {
-    pub name: String,
-    pub value: String,
-    pub redacted: bool,
-}
-#[derive(Clone, Debug, Serialize)]
-pub struct BodyPreview {
-    pub mode: PreviewMode,
-    pub state: BodyState,
-    pub retained_bytes: u32,
-    pub redacted: bool,
-    pub text: Option<String>,
-    pub reason: Option<&'static str>,
-    pub observed_payload_bytes: u64,
-}
-#[derive(Clone, Debug, Serialize)]
-pub struct Message {
-    pub headers_state: HeadersState,
-    pub headers: Vec<Header>,
-    pub body: BodyPreview,
-}
-impl Message {
-    pub(crate) fn new(mode: PreviewMode) -> Self {
-        Self {
-            headers: Vec::new(),
-            headers_state: HeadersState::Incomplete,
-            body: BodyPreview {
-                mode,
-                state: if mode == PreviewMode::Off {
-                    BodyState::Disabled
-                } else {
-                    BodyState::Pending
-                },
-                retained_bytes: 0,
-                redacted: false,
-                text: None,
-                reason: Some(if mode == PreviewMode::Off {
-                    "disabled"
-                } else {
-                    "incomplete"
-                }),
-                observed_payload_bytes: 0,
-            },
-        }
-    }
-}
-/// Sanitized display data only. Never an executable request or raw snapshot.
+/// Sanitized wire data with runtime-only capture ownership kept outside its DTO.
 #[derive(Clone, Debug, Serialize)]
 pub struct InspectionRecord {
-    pub schema_version: u8,
-    pub tunnel: String,
-    pub tunnel_id: Option<ulid::Ulid>,
-    pub origin: Origin,
-    pub started_at_ms: u64,
-    pub duration_ms: u64,
-    pub failure_kind: Option<&'static str>,
-    pub display_target: String,
-    pub resolved_addr: Option<std::net::SocketAddr>,
-    pub response_source: ResponseSource,
-    pub request_boundary: RequestBoundary,
-    /// Counts bytes accepted by successful local `poll_write` calls, including
-    /// HTTP framing. These are not backend-application/browser delivery claims.
-    pub bytes_to_backend: u64,
-    pub bytes_from_backend: u64,
-    pub bytes_to_client: u64,
-    pub byte_count_semantics: &'static str,
-    pub omission_reasons: Vec<&'static str>,
-    pub visitor: Visitor,
+    #[serde(flatten)]
+    pub(crate) view: tnl_inspector_api::inspection::InspectionRecord,
     #[serde(skip)]
     pub(crate) started: std::time::Instant,
     #[serde(skip)]
     pub(crate) terminal: bool,
     #[serde(skip)]
     pub(crate) counters: Option<TransportCounters>,
-    pub capture_id: CaptureId,
-    pub generation: TunnelGeneration,
-    pub request_id: Option<ulid::Ulid>,
-    pub visitor_source: Option<&'static str>,
-    pub sequence: u64,
-    pub method: String,
-    pub request_target: String,
-    pub status: Option<u16>,
-    pub state: State,
-    pub connection: GenerationState,
-    pub request: Message,
-    pub response: Message,
-    pub observation_incomplete: bool,
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GenerationState {
-    Untracked,
-    Connected,
-    Disconnected,
-    Superseded,
-}
-#[derive(Clone, Copy, Debug, Serialize)]
-pub struct TunnelStatus {
-    pub generation: Option<TunnelGeneration>,
-    pub connected: bool,
-}
-#[derive(Clone, Debug, Serialize)]
-pub struct Summary {
-    pub started_at_ms: u64,
-    pub duration_ms: u64,
-    pub response_source: ResponseSource,
-    pub request_boundary: RequestBoundary,
-    pub failure_kind: Option<&'static str>,
-    pub bytes_to_backend: u64,
-    pub bytes_from_backend: u64,
-    pub capture_id: CaptureId,
-    pub generation: TunnelGeneration,
-    pub request_id: Option<ulid::Ulid>,
-    pub sequence: u64,
-    pub method: String,
-    pub request_target: String,
-    pub status: Option<u16>,
-    pub state: State,
-    pub connection: GenerationState,
-}
-
-impl State {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Complete => "complete",
-            Self::Failed => "failed",
-            Self::Incomplete => "incomplete",
-            Self::Upgraded => "upgraded",
-        }
+impl std::ops::Deref for InspectionRecord {
+    type Target = tnl_inspector_api::inspection::InspectionRecord;
+    fn deref(&self) -> &Self::Target {
+        &self.view
     }
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Origin {
-    External,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ResponseSource {
-    Backend,
-    ClientSynth,
-    Unavailable,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RequestBoundary {
-    EffectiveBackend,
-    PreconnectUnavailable,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HeadersState {
-    Complete,
-    Capped,
-    Malformed,
-    Incomplete,
-    Unavailable,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BodyState {
-    Disabled,
-    Pending,
-    Available,
-    Empty,
-    Omitted,
-}
-#[derive(Clone, Copy, Debug, Serialize)]
-pub struct Visitor {
-    pub available: bool,
-    pub source: Option<&'static str>,
-    pub display_ip: Option<&'static str>,
+impl std::ops::DerefMut for InspectionRecord {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.view
+    }
 }
 impl InspectionRecord {
     pub(crate) fn snapshot(&self) -> Self {
@@ -216,8 +37,14 @@ impl InspectionRecord {
         }
         if let Some(counters) = &record.counters {
             use std::sync::atomic::Ordering;
-            record.bytes_to_backend = counters.to_backend.load(Ordering::Relaxed);
-            record.bytes_to_client = counters.to_client.load(Ordering::Relaxed);
+            {
+                let timing = counters.timing.lock();
+                record.view.timing = timing.snapshot_at(super::timing::offset_us(record.started));
+            }
+            let to_backend = counters.to_backend.load(Ordering::Relaxed);
+            let to_client = counters.to_client.load(Ordering::Relaxed);
+            record.bytes_to_backend = to_backend;
+            record.bytes_to_client = to_client;
             record.bytes_from_backend = if record.response_source == ResponseSource::Backend {
                 record.bytes_to_client
             } else {
@@ -252,30 +79,24 @@ pub fn wall_ms() -> u64 {
 
 #[derive(Clone, Debug)]
 pub struct TransportCounters {
+    pub timing: std::sync::Arc<parking_lot::Mutex<super::timing::TimingState>>,
     pub to_backend: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub to_client: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
-#[derive(Serialize)]
 pub(super) struct Detail {
-    #[serde(flatten)]
     pub record: InspectionRecord,
     pub replay: ReplayDisplay,
     pub last_replay_outcome: Option<crate::replay::ReplayOutcome>,
 }
-
-#[derive(Serialize)]
-pub(super) struct ReplayDisplay {
-    pub eligible: bool,
-    #[serde(flatten)]
-    pub availability: crate::replay::ReplayAvailability,
-}
-impl From<crate::replay::ReplayAvailability> for ReplayDisplay {
-    fn from(availability: crate::replay::ReplayAvailability) -> Self {
-        Self {
-            eligible: availability.state == crate::replay::AvailabilityState::Eligible,
-            availability,
+impl Serialize for Detail {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        tnl_inspector_api::DetailReply {
+            record: &self.record.view,
+            replay: &self.replay,
+            last_replay_outcome: &self.last_replay_outcome,
         }
+        .serialize(serializer)
     }
 }
 
@@ -298,6 +119,8 @@ impl InspectionRecord {
             bytes += message.body.text.as_ref().map_or(0, String::capacity);
         }
         if self.counters.is_some() {
+            bytes += std::mem::size_of::<parking_lot::Mutex<super::timing::TimingState>>()
+                + 2 * std::mem::size_of::<usize>();
             bytes += 2
                 * (std::mem::size_of::<std::sync::atomic::AtomicU64>()
                     + 2 * std::mem::size_of::<usize>());

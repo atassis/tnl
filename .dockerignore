@@ -7,3 +7,7 @@ RUNBOOK.md
 CLAUDE.md
 *.md
 **/*.tmp
+frontend/
+node_modules/
+**/node_modules/
+crates/tnl/src/inspection/assets/

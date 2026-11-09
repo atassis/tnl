@@ -670,7 +670,7 @@ fn invalid_encoded_or_ambiguous_json_is_omitted_without_raw_fallback() {
         capture.finish();
         let record = history.get(capture.id()).unwrap();
         assert_eq!(record.request.body.text.is_some(), sanitized_size == 4096);
-        if let Some(text) = record.request.body.text {
+        if let Some(text) = &record.request.body.text {
             assert_eq!(text.len(), 4096);
         }
     }

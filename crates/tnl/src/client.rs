@@ -1,13 +1,20 @@
+pub(crate) mod control;
+pub(crate) use control::close_control;
+pub use control::ControlError;
+use control::{read_msg, write_msg};
 use std::pin::Pin;
 
-use anyhow::{bail, Context};
+use anyhow::Context;
 use async_tungstenite::tungstenite::handshake::client::generate_key;
 use tnl_protocol::request_metadata::{
     DataStreamProtocol, DATA_STREAM_PROTOCOL_HEADER, HTTP1_METADATA_V1,
 };
+#[cfg(test)]
+use tnl_protocol::ErrorCode;
 use tnl_protocol::{
     messages::ReattachReq, ControlMsg, CreateTunnelReq, Session as _, TunnelCreatedResp,
 };
+#[cfg(test)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
@@ -36,18 +43,20 @@ impl std::fmt::Debug for ConnectedSession {
 async fn dial_and_open_control(
     endpoint: &str,
     token: &str,
+    attempt: &ConnectionAttempt,
 ) -> anyhow::Result<(
     Box<dyn tnl_protocol::Session>,
     Pin<Box<dyn tnl_protocol::Stream>>,
     DataStreamProtocol,
 )> {
-    dial_and_open_control_with_connector(endpoint, token, None).await
+    dial_and_open_control_with_connector(endpoint, token, None, attempt).await
 }
 
 async fn dial_and_open_control_with_connector(
     endpoint: &str,
     token: &str,
     connector: Option<tokio_rustls::TlsConnector>,
+    attempt: &ConnectionAttempt,
 ) -> anyhow::Result<(
     Box<dyn tnl_protocol::Session>,
     Pin<Box<dyn tnl_protocol::Stream>>,
@@ -67,6 +76,10 @@ async fn dial_and_open_control_with_connector(
     let req = http::Request::builder()
         .uri(&url)
         .header("Authorization", format!("Bearer {token}"))
+        .header(
+            tnl_protocol::control::CONTROL_PROTOCOL_HEADER,
+            tnl_protocol::control::CONTROL_PROTOCOL_VERSION,
+        )
         .header(DATA_STREAM_PROTOCOL_HEADER, HTTP1_METADATA_V1)
         .header("Host", authority)
         .header("Upgrade", "websocket")
@@ -75,79 +88,37 @@ async fn dial_and_open_control_with_connector(
         .header("Sec-WebSocket-Version", "13")
         .body(())
         .context("build ws upgrade request")?;
-    let (ws, resp) = async_tungstenite::tokio::connect_async_with_tls_connector(req, connector)
-        .await
-        .with_context(|| format!("connect to {url}"))?;
+    let dial = async_tungstenite::tokio::connect_async_with_tls_connector(req, connector);
+    #[cfg(test)]
+    let dial = test_connect_boundary(ConnectBoundary::Dial, dial);
+    let (ws, resp) = Box::pin(dial).await
+        .map_err(|error| {
+            if matches!(&error, async_tungstenite::tungstenite::Error::Http(response) if response.status() == http::StatusCode::UPGRADE_REQUIRED) {
+                anyhow::Error::new(tnl_protocol::control::ControlProtocolIncompatible)
+            } else {
+                anyhow::Error::new(error).context("connect to control endpoint")
+            }
+        })?;
+    if !tnl_protocol::control::has_control_protocol(resp.headers()) {
+        return Err(tnl_protocol::control::ControlProtocolIncompatible.into());
+    }
     let data_stream_protocol = DataStreamProtocol::from_echo(resp.headers())?;
     info!(%url, "connected via WSS");
 
+    #[cfg(not(test))]
     let mut session = tnl_protocol::transport::client_session_from_ws_generic(ws);
-    let ctrl: Pin<Box<dyn tnl_protocol::Stream>> = session
-        .open_stream()
-        .await
-        .context("open control substream")?;
+    #[cfg(test)]
+    let mut session = close_gate_tests::session_from_ws(ws);
+    attempt.track(session.termination());
+    let open = session.open_stream();
+    #[cfg(test)]
+    let open = test_connect_boundary(ConnectBoundary::Open, open);
+    let ctrl: Pin<Box<dyn tnl_protocol::Stream>> = open.await.context("open control substream")?;
     Ok((
         Box::new(session) as Box<dyn tnl_protocol::Session>,
         ctrl,
         data_stream_protocol,
     ))
-}
-
-/// Write a length-prefixed JSON `ControlMsg` to the control stream.
-async fn write_msg(
-    ctrl: &mut Pin<Box<dyn tnl_protocol::Stream>>,
-    msg: &ControlMsg,
-) -> anyhow::Result<()> {
-    let payload = zeroize::Zeroizing::new(serde_json::to_vec(msg)?);
-    let len = u32::try_from(payload.len())
-        .context("payload too large")?
-        .to_be_bytes();
-    ctrl.write_all(&len).await?;
-    ctrl.write_all(&payload).await?;
-    ctrl.flush().await?;
-    Ok(())
-}
-
-#[derive(Debug, thiserror::Error)]
-enum ControlResponseError {
-    #[error("control response exceeds size bound")]
-    Framing,
-    #[error("invalid control response ({category:?}, line {line}, column {column})")]
-    Schema {
-        category: serde_json::error::Category,
-        line: usize,
-        column: usize,
-    },
-}
-
-/// Read a length-prefixed JSON `ControlMsg` from the control stream.
-async fn read_msg(ctrl: &mut Pin<Box<dyn tnl_protocol::Stream>>) -> anyhow::Result<ControlMsg> {
-    let mut lenbuf = [0u8; 4];
-    ctrl.read_exact(&mut lenbuf).await?;
-    let n = u32::from_be_bytes(lenbuf) as usize;
-    if n > 1024 * 1024 {
-        return Err(ControlResponseError::Framing.into());
-    }
-    let mut respbuf = zeroize::Zeroizing::new(vec![0u8; n]);
-    ctrl.read_exact(&mut respbuf).await?;
-    serde_json::from_slice(&respbuf).map_err(|error| {
-        ControlResponseError::Schema {
-            category: error.classify(),
-            line: error.line(),
-            column: error.column(),
-        }
-        .into()
-    })
-}
-
-pub(crate) async fn close_control(
-    control: &mut Pin<Box<dyn tnl_protocol::Stream>>,
-) -> anyhow::Result<()> {
-    write_msg(control, &ControlMsg::Close).await?;
-    match read_msg(control).await? {
-        ControlMsg::Closing { reason } if reason == "client_shutdown" => Ok(()),
-        _ => bail!("daemon did not acknowledge intentional shutdown"),
-    }
 }
 
 /// Run-owned immutable policy. Prepared once before the async runtime and
@@ -176,17 +147,15 @@ pub enum ProtectedControlError {
 // Only protocol/schema failures become terminal protected errors. Keep genuine
 // I/O and TLS transport errors intact for the existing same-mode retry policy.
 fn protected_response_error(error: anyhow::Error) -> anyhow::Error {
-    let protected = match error.downcast_ref::<ControlResponseError>() {
-        Some(ControlResponseError::Framing) => Some(ProtectedControlError::Framing),
-        Some(ControlResponseError::Schema { .. }) => Some(ProtectedControlError::Schema),
-        None => {
-            match error.downcast_ref::<tnl_protocol::request_metadata::RequestMetadataError>() {
-                Some(tnl_protocol::request_metadata::RequestMetadataError::Negotiation) => {
-                    Some(ProtectedControlError::Capability)
-                }
-                _ => None,
+    let protected = match error.downcast_ref::<ControlError>() {
+        Some(ControlError::Framing) => Some(ProtectedControlError::Framing),
+        Some(ControlError::Schema) => Some(ProtectedControlError::Schema),
+        _ => match error.downcast_ref::<tnl_protocol::request_metadata::RequestMetadataError>() {
+            Some(tnl_protocol::request_metadata::RequestMetadataError::Negotiation) => {
+                Some(ProtectedControlError::Capability)
             }
-        }
+            _ => None,
+        },
     };
     protected.map_or(error, anyhow::Error::new)
 }
@@ -196,6 +165,14 @@ fn require_protected_capability(protocol: DataStreamProtocol) -> Result<(), Prot
         return Err(ProtectedControlError::Capability);
     }
     Ok(())
+}
+
+fn validate_public_ack(response: ControlMsg) -> Result<TunnelCreatedResp, ControlError> {
+    match response {
+        ControlMsg::TunnelCreated(ack) => Ok(ack),
+        ControlMsg::Error { code, .. } => Err(ControlError::Server(code)),
+        _ => Err(ControlError::Acknowledgment),
+    }
 }
 
 fn validate_protected_ack(
@@ -228,13 +205,40 @@ pub async fn connect_and_create_with_options(
     subdomain: Option<&str>,
     options: &TunnelOptions,
 ) -> anyhow::Result<ConnectedSession> {
+    let attempt = ConnectionAttempt::new();
+    attempt
+        .finish(connect_and_create_in_attempt(
+            endpoint, token, subdomain, options, &attempt,
+        ))
+        .await
+}
+
+pub(crate) async fn connect_and_create_in_attempt(
+    endpoint: &str,
+    token: &str,
+    subdomain: Option<&str>,
+    options: &TunnelOptions,
+    attempt: &ConnectionAttempt,
+) -> anyhow::Result<ConnectedSession> {
     #[cfg(not(test))]
     let connector = None;
     #[cfg(test)]
     let connector = TEST_TLS_CONNECTOR.try_with(Clone::clone).ok();
-    connect_and_create_with_connector(endpoint, token, subdomain, options, connector).await
+    let result = Box::pin(connect_and_create_with_connector_inner(
+        endpoint, token, subdomain, options, connector, attempt,
+    ))
+    .await;
+    attempt
+        .registration_finished(
+            result
+                .as_ref()
+                .is_err_and(super::reconnect::is_physical_session_failure),
+        )
+        .await;
+    result
 }
 
+#[cfg(test)]
 async fn connect_and_create_with_connector(
     endpoint: &str,
     token: &str,
@@ -242,13 +246,37 @@ async fn connect_and_create_with_connector(
     options: &TunnelOptions,
     connector: Option<tokio_rustls::TlsConnector>,
 ) -> anyhow::Result<ConnectedSession> {
+    let attempt = ConnectionAttempt::new();
+    let result = attempt
+        .finish(Box::pin(connect_and_create_with_connector_inner(
+            endpoint, token, subdomain, options, connector, &attempt,
+        )))
+        .await;
+    attempt
+        .registration_finished(
+            result
+                .as_ref()
+                .is_err_and(super::reconnect::is_physical_session_failure),
+        )
+        .await;
+    result
+}
+
+async fn connect_and_create_with_connector_inner(
+    endpoint: &str,
+    token: &str,
+    subdomain: Option<&str>,
+    options: &TunnelOptions,
+    connector: Option<tokio_rustls::TlsConnector>,
+    attempt: &ConnectionAttempt,
+) -> anyhow::Result<ConnectedSession> {
     let Some(policy) = &options.access else {
-        return connect_and_create_inner(endpoint, token, subdomain).await;
+        return connect_and_create_inner(endpoint, token, subdomain, attempt).await;
     };
     crate::access::validate_protected_endpoint(endpoint)
         .map_err(|_| ProtectedControlError::Endpoint)?;
     let (session, mut control, data_stream_protocol) =
-        dial_and_open_control_with_connector(endpoint, token, connector)
+        dial_and_open_control_with_connector(endpoint, token, connector, attempt)
             .await
             .map_err(protected_response_error)?;
     require_protected_capability(data_stream_protocol)?;
@@ -288,14 +316,41 @@ pub async fn connect_and_reattach_with_options(
     subdomain: &str,
     options: &TunnelOptions,
 ) -> anyhow::Result<ConnectedSession> {
+    let attempt = ConnectionAttempt::new();
+    attempt
+        .finish(connect_and_reattach_in_attempt(
+            endpoint, token, tunnel_id, subdomain, options, &attempt,
+        ))
+        .await
+}
+
+pub(crate) async fn connect_and_reattach_in_attempt(
+    endpoint: &str,
+    token: &str,
+    tunnel_id: ulid::Ulid,
+    subdomain: &str,
+    options: &TunnelOptions,
+    attempt: &ConnectionAttempt,
+) -> anyhow::Result<ConnectedSession> {
     #[cfg(not(test))]
     let connector = None;
     #[cfg(test)]
     let connector = TEST_TLS_CONNECTOR.try_with(Clone::clone).ok();
-    connect_and_reattach_with_connector(endpoint, token, tunnel_id, subdomain, options, connector)
-        .await
+    let result = Box::pin(connect_and_reattach_with_connector_inner(
+        endpoint, token, tunnel_id, subdomain, options, connector, attempt,
+    ))
+    .await;
+    attempt
+        .registration_finished(
+            result
+                .as_ref()
+                .is_err_and(super::reconnect::is_physical_session_failure),
+        )
+        .await;
+    result
 }
 
+#[cfg(test)]
 async fn connect_and_reattach_with_connector(
     endpoint: &str,
     token: &str,
@@ -304,13 +359,38 @@ async fn connect_and_reattach_with_connector(
     options: &TunnelOptions,
     connector: Option<tokio_rustls::TlsConnector>,
 ) -> anyhow::Result<ConnectedSession> {
+    let attempt = ConnectionAttempt::new();
+    let result = attempt
+        .finish(Box::pin(connect_and_reattach_with_connector_inner(
+            endpoint, token, tunnel_id, subdomain, options, connector, &attempt,
+        )))
+        .await;
+    attempt
+        .registration_finished(
+            result
+                .as_ref()
+                .is_err_and(super::reconnect::is_physical_session_failure),
+        )
+        .await;
+    result
+}
+
+async fn connect_and_reattach_with_connector_inner(
+    endpoint: &str,
+    token: &str,
+    tunnel_id: ulid::Ulid,
+    subdomain: &str,
+    options: &TunnelOptions,
+    connector: Option<tokio_rustls::TlsConnector>,
+    attempt: &ConnectionAttempt,
+) -> anyhow::Result<ConnectedSession> {
     let Some(policy) = &options.access else {
-        return connect_and_reattach(endpoint, token, tunnel_id, subdomain).await;
+        return connect_and_reattach_inner(endpoint, token, tunnel_id, subdomain, attempt).await;
     };
     crate::access::validate_protected_endpoint(endpoint)
         .map_err(|_| ProtectedControlError::Endpoint)?;
     let (session, mut control, data_stream_protocol) =
-        dial_and_open_control_with_connector(endpoint, token, connector)
+        dial_and_open_control_with_connector(endpoint, token, connector, attempt)
             .await
             .map_err(protected_response_error)?;
     require_protected_capability(data_stream_protocol)?;
@@ -346,22 +426,25 @@ pub async fn connect_and_create(
     token: &str,
     subdomain: &str,
 ) -> anyhow::Result<ConnectedSession> {
-    connect_and_create_inner(endpoint, token, Some(subdomain)).await
+    connect_and_create_with_options(endpoint, token, Some(subdomain), &TunnelOptions::default())
+        .await
 }
 
 pub async fn connect_and_create_random(
     endpoint: &str,
     token: &str,
 ) -> anyhow::Result<ConnectedSession> {
-    connect_and_create_inner(endpoint, token, None).await
+    connect_and_create_with_options(endpoint, token, None, &TunnelOptions::default()).await
 }
 
 async fn connect_and_create_inner(
     endpoint: &str,
     token: &str,
     subdomain: Option<&str>,
+    attempt: &ConnectionAttempt,
 ) -> anyhow::Result<ConnectedSession> {
-    let (session, mut ctrl, data_stream_protocol) = dial_and_open_control(endpoint, token).await?;
+    let (session, mut ctrl, data_stream_protocol) =
+        dial_and_open_control(endpoint, token, attempt).await?;
 
     let req = ControlMsg::CreateTunnel(CreateTunnelReq {
         subdomain: subdomain.map(ToString::to_string),
@@ -369,23 +452,18 @@ async fn connect_and_create_inner(
     write_msg(&mut ctrl, &req).await?;
     let resp = read_msg(&mut ctrl).await?;
 
-    let (hostname, subdomain, tunnel_id) = match resp {
-        ControlMsg::TunnelCreated(TunnelCreatedResp {
-            hostname,
-            subdomain,
-            tunnel_id,
-        }) => (hostname, subdomain, tunnel_id),
-        ControlMsg::Error { code, message } => bail!("server error ({code:?}): {message}"),
-        other => bail!("unexpected control response: {other:?}"),
-    };
+    let ack = validate_public_ack(resp)?;
+    if subdomain.is_some_and(|requested| requested != ack.subdomain) {
+        return Err(ControlError::Acknowledgment.into());
+    }
 
     Ok(ConnectedSession {
         data_stream_protocol,
         session,
         control: ctrl,
-        hostname,
-        subdomain,
-        tunnel_id,
+        hostname: ack.hostname,
+        subdomain: ack.subdomain,
+        tunnel_id: ack.tunnel_id,
     })
 }
 
@@ -398,7 +476,25 @@ pub async fn connect_and_reattach(
     tunnel_id: ulid::Ulid,
     subdomain: &str,
 ) -> anyhow::Result<ConnectedSession> {
-    let (session, mut ctrl, data_stream_protocol) = dial_and_open_control(endpoint, token).await?;
+    connect_and_reattach_with_options(
+        endpoint,
+        token,
+        tunnel_id,
+        subdomain,
+        &TunnelOptions::default(),
+    )
+    .await
+}
+
+async fn connect_and_reattach_inner(
+    endpoint: &str,
+    token: &str,
+    tunnel_id: ulid::Ulid,
+    subdomain: &str,
+    attempt: &ConnectionAttempt,
+) -> anyhow::Result<ConnectedSession> {
+    let (session, mut ctrl, data_stream_protocol) =
+        dial_and_open_control(endpoint, token, attempt).await?;
 
     let req = ControlMsg::ReattachTunnel(ReattachReq {
         tunnel_id,
@@ -407,23 +503,18 @@ pub async fn connect_and_reattach(
     write_msg(&mut ctrl, &req).await?;
     let resp = read_msg(&mut ctrl).await?;
 
-    let (hostname, subdomain, tunnel_id) = match resp {
-        ControlMsg::TunnelCreated(TunnelCreatedResp {
-            hostname,
-            subdomain,
-            tunnel_id,
-        }) => (hostname, subdomain, tunnel_id),
-        ControlMsg::Error { code, message } => bail!("server error ({code:?}): {message}"),
-        other => bail!("unexpected control response: {other:?}"),
-    };
+    let ack = validate_public_ack(resp)?;
+    if ack.tunnel_id != tunnel_id || ack.subdomain != subdomain {
+        return Err(ControlError::Acknowledgment.into());
+    }
 
     Ok(ConnectedSession {
         data_stream_protocol,
         session,
         control: ctrl,
-        hostname,
-        subdomain,
-        tunnel_id,
+        hostname: ack.hostname,
+        subdomain: ack.subdomain,
+        tunnel_id: ack.tunnel_id,
     })
 }
 
@@ -435,15 +526,93 @@ pub(crate) struct ForwardTasks {
     stop_accepting: tokio_util::sync::CancellationToken,
 }
 
+/// One accept owner per physical connection. Accepted forwards belong to the
+/// run tracker, not this handle. Only explicit physical failure cancels them.
+pub(crate) struct AcceptGeneration {
+    #[cfg(test)]
+    observed_handle: Option<resource_observation_tests::Guard>,
+    join: tokio::task::JoinHandle<anyhow::Result<()>>,
+    joined: bool,
+    stop_accepting: tokio_util::sync::CancellationToken,
+    stop_forwarding: tokio_util::sync::CancellationToken,
+    termination: tnl_protocol::transport::SessionTermination,
+}
+
+impl AcceptGeneration {
+    pub(crate) async fn result(&mut self) -> Result<anyhow::Result<()>, tokio::task::JoinError> {
+        let result = (&mut self.join).await;
+        self.joined = true;
+        result
+    }
+
+    pub(crate) async fn stop_and_join(&mut self) {
+        self.stop_accepting.cancel();
+        if !self.joined {
+            let _ = self.result().await;
+        }
+    }
+
+    pub(crate) async fn close_and_observe_cause(&self) -> tnl_protocol::OpenStreamError {
+        self.termination.close_and_observe_cause().await
+    }
+
+    pub(crate) async fn terminate_failed(&self) {
+        self.stop_forwarding.cancel();
+        self.termination.terminate_failed().await;
+        #[cfg(test)]
+        if let Some(observed) = &self.observed_handle {
+            observed.physical_completed();
+        }
+    }
+}
+
+impl Drop for AcceptGeneration {
+    fn drop(&mut self) {
+        self.stop_accepting.cancel();
+    }
+}
+
 impl ForwardTasks {
+    #[cfg(test)]
+    pub(crate) fn observe_resources(&self) {
+        resource_observation_tests::run(&self.tracker);
+    }
     pub(crate) fn accept(
         &self,
         session: Box<dyn tnl_protocol::Session>,
         target: crate::target::Target,
         ctx: crate::forwarder::ForwardCtx,
-    ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-        self.tracker
-            .spawn(run_accept_loop_owned(session, target, ctx, self.clone()))
+    ) -> AcceptGeneration {
+        let termination = session.termination();
+        let stop_accepting = self.stop_accepting.child_token();
+        let stop_forwarding = self.stop_forwarding.child_token();
+        let acceptance = run_accept_loop_owned(
+            session,
+            target,
+            ctx,
+            self.clone(),
+            stop_accepting.clone(),
+            stop_forwarding.clone(),
+        );
+        #[cfg(test)]
+        let acceptance = accept_gate_tests::scope(acceptance, termination.clone());
+        #[cfg(test)]
+        let (observed_handle, observed_accept) = resource_observation_tests::generation();
+        #[cfg(test)]
+        let acceptance = async move {
+            let _lifetime = observed_accept;
+            acceptance.await
+        };
+        let join = self.tracker.spawn(acceptance);
+        AcceptGeneration {
+            #[cfg(test)]
+            observed_handle,
+            join,
+            joined: false,
+            stop_accepting,
+            stop_forwarding,
+            termination,
+        }
     }
 
     pub(crate) fn stop_forwarding(&self) {
@@ -467,7 +636,16 @@ pub async fn run_accept_loop(
     target: crate::target::Target,
     ctx: crate::forwarder::ForwardCtx,
 ) -> anyhow::Result<()> {
-    run_accept_loop_owned(session, target, ctx, ForwardTasks::default()).await
+    let tasks = ForwardTasks::default();
+    run_accept_loop_owned(
+        session,
+        target,
+        ctx,
+        tasks.clone(),
+        tasks.stop_accepting.clone(),
+        tasks.stop_forwarding.clone(),
+    )
+    .await
 }
 
 async fn run_accept_loop_owned(
@@ -475,18 +653,24 @@ async fn run_accept_loop_owned(
     target: crate::target::Target,
     ctx: crate::forwarder::ForwardCtx,
     tasks: ForwardTasks,
+    stop_accepting: tokio_util::sync::CancellationToken,
+    stop_forwarding: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     loop {
         let stream = tokio::select! {
             biased;
-            () = tasks.stop_accepting.cancelled() => return Ok(()),
-            stream = session.accept_stream() => stream,
+            () = stop_accepting.cancelled() => return Ok(()),
+            stream = async {
+                #[cfg(test)]
+                accept_gate_tests::before_accept().await;
+                session.accept_stream().await
+            } => stream,
         };
         match stream {
             Ok(Some(stream)) => {
                 let t = target.clone();
                 let ctx2 = ctx.clone();
-                let cancel = tasks.stop_forwarding.clone();
+                let cancel = stop_forwarding.clone();
                 tasks.tracker.spawn(async move {
                     tokio::select! {
                         biased;
@@ -523,6 +707,24 @@ mod protected_tests {
             subdomain: "demo".into(),
             policy_fingerprint: fingerprint.into(),
         })
+    }
+
+    #[test]
+    fn public_ack_errors_are_typed_and_redact_server_diagnostics() {
+        let error = validate_public_ack(ControlMsg::Error {
+            code: ErrorCode::TunnelAlreadyActive,
+            message: "CONTROL_DIAGNOSTIC_SECRET".into(),
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ControlError::Server(ErrorCode::TunnelAlreadyActive)
+        ));
+        assert!(!error.to_string().contains("CONTROL_DIAGNOSTIC_SECRET"));
+        assert!(matches!(
+            validate_public_ack(ControlMsg::Close),
+            Err(ControlError::Acknowledgment)
+        ));
     }
 
     #[test]
@@ -657,21 +859,23 @@ mod trusted_wss_tests {
             }
             let tls = tls.unwrap();
             let ws = async_tungstenite::tokio::accept_hdr_async(tls, move |request: &async_tungstenite::tungstenite::handshake::server::Request, mut response: async_tungstenite::tungstenite::handshake::server::Response| {
+                response.headers_mut().insert(tnl_protocol::control::CONTROL_PROTOCOL_HEADER, http::HeaderValue::from_static(tnl_protocol::control::CONTROL_PROTOCOL_VERSION));
                 assert_eq!(request.headers()["authorization"], "Bearer tnl_TEST");
                 assert_eq!(request.headers()[DATA_STREAM_PROTOCOL_HEADER], HTTP1_METADATA_V1);
                 if !matches!(reply, PeerReply::NoEcho) { response.headers_mut().insert(DATA_STREAM_PROTOCOL_HEADER, http::HeaderValue::from_static(if matches!(reply, PeerReply::InvalidEcho) { "INVALID_ECHO_SENTINEL" } else { HTTP1_METADATA_V1 })); }
                 Ok(response)
             }).await.unwrap();
-            let mut session = tnl_protocol::server_session_from_ws_generic(ws);
-            let Some(mut control) = session.accept_stream().await.unwrap() else {
-                assert!(matches!(reply, PeerReply::NoEcho | PeerReply::InvalidEcho));
-                return;
-            };
-            let length = control.read_u32().await;
-            if matches!(reply, PeerReply::NoEcho) {
-                assert!(length.is_err());
+            if matches!(reply, PeerReply::NoEcho | PeerReply::InvalidEcho) {
+                super::metadata_rejection_tests::observe(
+                    ws,
+                    matches!(reply, PeerReply::InvalidEcho),
+                )
+                .await;
                 return;
             }
+            let mut session = tnl_protocol::server_session_from_ws_generic(ws);
+            let mut control = session.accept_stream().await.unwrap().unwrap();
+            let length = control.read_u32().await;
             let length = length.unwrap();
             assert!(length < 16 * 1024);
             let mut bytes = vec![0; length as usize];
@@ -885,3 +1089,133 @@ mod trusted_wss_tests {
 #[cfg(test)]
 #[path = "client/access_e2e_tests.rs"]
 mod access_e2e_tests;
+
+#[cfg(test)]
+mod ownership_tests;
+
+#[cfg(test)]
+pub(crate) mod accept_gate_tests;
+
+/// One budget and cleanup owner for dial (including DNS/TLS), open, register,
+/// and the typed `TunnelLost` fallback. No timer is reset between these phases.
+pub(crate) struct ConnectionAttempt {
+    deadline: tokio::time::Instant,
+    pending: std::sync::Mutex<Vec<tnl_protocol::SessionTermination>>,
+}
+
+impl ConnectionAttempt {
+    pub(crate) fn new() -> Self {
+        Self {
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(20),
+            pending: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn track(&self, termination: tnl_protocol::SessionTermination) {
+        #[cfg(test)]
+        let _ = TEST_CONNECT_BOUNDARY.try_with(|(_, probe)| {
+            *probe.termination.lock().unwrap() = Some(termination.clone());
+        });
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(termination);
+    }
+
+    pub(crate) async fn finish<T>(
+        &self,
+        future: impl std::future::Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        if let Ok(result) = tokio::time::timeout_at(self.deadline, future).await {
+            result
+        } else {
+            self.terminate_pending().await;
+            Err(control::LifecycleDeadline::Attempt.into())
+        }
+    }
+
+    async fn registration_finished(&self, unhealthy: bool) {
+        if unhealthy {
+            self.terminate_pending().await;
+        } else {
+            // Typed business/policy errors are NOT evidence of unhealthy IO.
+            self.pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+    }
+
+    pub(crate) async fn terminate_pending(&self) {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for termination in pending {
+            termination.terminate_failed().await;
+        }
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConnectBoundary {
+    Dial,
+    Open,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ConnectBoundaryProbe {
+    entered: tokio_util::sync::CancellationToken,
+    release: tokio_util::sync::CancellationToken,
+    dropped: tokio_util::sync::CancellationToken,
+    continued: std::sync::atomic::AtomicBool,
+    termination: std::sync::Mutex<Option<tnl_protocol::SessionTermination>>,
+}
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_CONNECT_BOUNDARY: (ConnectBoundary, std::sync::Arc<ConnectBoundaryProbe>);
+}
+#[cfg(test)]
+async fn test_connect_boundary<T>(
+    boundary: ConnectBoundary,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    let probe = TEST_CONNECT_BOUNDARY
+        .try_with(|(stage, probe)| (*stage == boundary).then(|| probe.clone()))
+        .ok()
+        .flatten();
+    if let Some(probe) = probe {
+        struct ObserveDrop(std::sync::Arc<ConnectBoundaryProbe>);
+        impl Drop for ObserveDrop {
+            fn drop(&mut self) {
+                self.0.dropped.cancel();
+            }
+        }
+        let _drop = ObserveDrop(probe.clone());
+        probe.entered.cancel();
+        probe.release.cancelled().await;
+        probe
+            .continued
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    future.await
+}
+
+#[cfg(test)]
+mod connection_attempt_tests;
+
+#[cfg(test)]
+mod metadata_rejection_tests;
+
+#[cfg(test)]
+pub(crate) mod close_gate_tests;
+
+#[cfg(test)]
+pub(crate) mod resource_observation_tests;

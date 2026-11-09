@@ -56,10 +56,11 @@ async fn fixture() -> (ServerHandle, AppState, YamuxSession) {
     let (a, b) = tokio::io::duplex(1024);
     state.session_handles.insert(
         session.id.clone(),
-        SessionHandle {
-            session: Arc::new(Mutex::new(Box::new(YamuxSession::new_client(a)))),
-            data_stream_protocol: DataStreamProtocol::Http1MetadataV1,
-        },
+        SessionHandle::new(
+            &session,
+            Arc::new(Mutex::new(Box::new(YamuxSession::new_client(a)))),
+            DataStreamProtocol::Http1MetadataV1,
+        ),
     );
     (server, state, YamuxSession::new_server(b))
 }

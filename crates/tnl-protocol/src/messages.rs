@@ -9,6 +9,7 @@ use std::time::SystemTime;
 /// — `serde_json` cannot flatten them and will panic at serialize time.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "type")]
+#[serde(deny_unknown_fields)]
 pub enum ControlMsg {
     CreateTunnel(CreateTunnelReq),
     ReattachTunnel(ReattachReq),
@@ -16,11 +17,29 @@ pub enum ControlMsg {
     CreateProtectedTunnel(CreateProtectedTunnelReq),
     ReattachProtectedTunnel(ReattachProtectedTunnelReq),
     ProtectedTunnelCreated(ProtectedTunnelCreatedResp),
-    Heartbeat,
-    HeartbeatAck,
+    Heartbeat {
+        tunnel_id: ulid::Ulid,
+        sequence: u64,
+    },
+    HeartbeatAck {
+        tunnel_id: ulid::Ulid,
+        sequence: u64,
+    },
     Close,
-    Closing { reason: String },
-    Error { code: ErrorCode, message: String },
+    Closing {
+        reason: ClosingReason,
+    },
+    Error {
+        code: ErrorCode,
+        message: String,
+    },
+}
+
+/// Typed reason for a daemon-directed control shutdown.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum ClosingReason {
+    ClientShutdown,
+    RemoteStop,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -82,18 +101,31 @@ fn deserialize_fingerprint<'de, D: serde::Deserializer<'de>>(
     Ok(value)
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorCode {
     InvalidSubdomain,
     SubdomainTaken,
     TunnelNotFound,
     TunnelLost,
+    TunnelAlreadyActive,
     Unauthorized,
     InvalidAccessPolicy,
     AccessPolicyMismatch,
     UnsupportedProtocol,
     AccessUnavailable,
     Internal,
+}
+
+impl ErrorCode {
+    /// Classifies a typed error from an attempted reattach without inspecting
+    /// server diagnostic text.
+    pub const fn reattach_disposition(self) -> crate::control::ReattachErrorDisposition {
+        match self {
+            Self::TunnelLost => crate::control::ReattachErrorDisposition::Recreate,
+            Self::TunnelAlreadyActive => crate::control::ReattachErrorDisposition::Retry,
+            _ => crate::control::ReattachErrorDisposition::Terminal,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -210,8 +242,14 @@ mod tests {
     #[test]
     fn control_msg_roundtrip_simple_variants() {
         for msg in [
-            ControlMsg::Heartbeat,
-            ControlMsg::HeartbeatAck,
+            ControlMsg::Heartbeat {
+                tunnel_id: ulid::Ulid::nil(),
+                sequence: 0,
+            },
+            ControlMsg::HeartbeatAck {
+                tunnel_id: ulid::Ulid::nil(),
+                sequence: 0,
+            },
             ControlMsg::Close,
         ] {
             let s = serde_json::to_string(&msg).unwrap();
@@ -240,7 +278,7 @@ mod tests {
     #[test]
     fn control_msg_roundtrip_closing() {
         let msg = ControlMsg::Closing {
-            reason: "server restart".into(),
+            reason: ClosingReason::ClientShutdown,
         };
         let back: ControlMsg = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
         assert_eq!(msg, back);
@@ -250,8 +288,15 @@ mod tests {
     fn control_msg_wire_format_pinned() {
         // Pin the on-wire tag so an accidental switch to `untagged` or
         // `rename_all = "snake_case"` is caught by tests.
-        let s = serde_json::to_string(&ControlMsg::Heartbeat).unwrap();
-        assert_eq!(s, r#"{"type":"Heartbeat"}"#);
+        let s = serde_json::to_string(&ControlMsg::Heartbeat {
+            tunnel_id: ulid::Ulid::nil(),
+            sequence: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            s,
+            r#"{"type":"Heartbeat","tunnel_id":"00000000000000000000000000","sequence":0}"#
+        );
     }
 
     #[test]

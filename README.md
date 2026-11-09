@@ -35,12 +35,31 @@ the remaining roadmap.
 
 ## Build
 
+Rust 1.94 is pinned in `rust-toolchain.toml`. Building the inspector-bearing
+`tnl` client from this checkout also requires Node 24.14.1 and Corepack with
+pnpm 12.18.0. Install the locked frontend dependencies explicitly, then prepare
+its generated embedded assets before any Cargo command that builds `tnl`:
+
 ```bash
-cargo build --release --workspace   # → target/release/{tnld, tnl}
-cargo test --workspace
+corepack pnpm install --frozen-lockfile
+cargo fmt --all -- --check                 # does not need generated assets
+corepack pnpm ui:prepare
+cargo build --locked --release --workspace # → target/release/{tnld, tnl}
+cargo test --locked --workspace
 ```
 
-Rust 1.94 is pinned via `rust-toolchain.toml`; rustup installs it on first build.
+`corepack pnpm build` is the equivalent release entry point (`build:dev` is the
+debug variant); neither installs dependencies. `cargo clippy --workspace` and
+Cargo tests that build `tnl` have the same preparation prerequisite. A
+server-only build remains independent of Node and generated client assets:
+`cargo build --locked -p tnld`.
+
+The released `tnl` binary embeds the finite frontend asset set, so users running
+a qualified binary need neither Node nor companion files. A fresh repository
+checkout is **not** supported by `cargo install --git` or a partial crate archive:
+it must retain the frontend/tooling inputs and run the explicit preparation
+command. See [`docs/frontend-inspector.md`](docs/frontend-inspector.md) for the
+contract, development mode, checks and qualification boundary.
 
 ## Quickstart
 
@@ -72,12 +91,28 @@ edits. Control it with `tnl http … --host-header <preserve|rewrite|VALUE>`.
 Ctrl+C and SIGTERM close active HTTP/WebSocket connections immediately and
 attempt a bounded, acknowledged release of the current session's tunnel. Once
 the server confirms release, the same name can be used by a new CLI invocation
-without waiting for reconnect grace. Older or unreachable daemons may not
-confirm release; the CLI warns that the name may remain reserved.
+without waiting for reconnect grace. An unreachable daemon may not confirm
+release; the CLI warns that the name may remain reserved. Client and daemon must
+support the same control protocol (`heartbeat-v1`); mixed versions are rejected
+before registration, so upgrade them together.
 
-Unexpected network loss still uses grace, reattach and same-policy recreation;
-intentional shutdown does not reconnect. This does not change `tnl stop` or the
-retry classification of a separately occupied name.
+The client checks control liveness every 15 seconds, with a 5-second exchange
+budget. Connection attempts have a shared 20-second budget; the daemon expires
+an otherwise silent control session after 45 seconds. These checks do not measure
+backend health. Recovery can wait for the old owner's lease to expire before
+reattaching within `session_grace_sec`. After grace expiry or daemon restart,
+only a typed missing-tunnel response permits recreation with the original name
+and exact policy. Another owner's name is never taken over; retries use bounded
+jittered backoff rather than promising immediate recovery.
+
+A delivered `tnl stop` ends the current run and its active connections. A
+disconnected client may miss that notification and race to recreate after the
+name becomes free: stop is not a durable ban. Intentional local shutdown does
+not reconnect. Interrupted HTTP requests and WebSockets never migrate or replay
+automatically; a lost response can mean the backend already executed the request.
+Local inspection history survives reconnect, but old replay authority is revoked.
+Actual OS suspend and external-network recovery still require environment-specific
+qualification; the automated recovery checks use controlled local fixtures.
 
 ## Local browser inspection (opt-in)
 
@@ -87,8 +122,11 @@ Open the private URL printed to stderr; do not share that link or its token.
 The bearer token stays in the URL fragment so refresh retains access, without
 cookies or browser storage. Fragments are not sent in HTTP requests or Referer,
 but the link can appear in browser history/session restore or copied URLs.
-It authorizes only this CLI run; restarting the CLI generates a new token.
-Refreshing never preserves replay confirmation or automatically resends a request.
+It authorizes only this CLI run; restarting the CLI generates a new token. The
+inspector's Auto/Light/Dark choice is an allowlisted `theme` fragment parameter
+that preserves the capability; Auto removes the override. There is no
+localStorage, sessionStorage or cross-run theme preference. Refreshing never
+preserves replay confirmation or automatically resends a request.
 Body previews are off by default. `--inspect-bodies json` enables only complete,
 small sanitized JSON previews; it does **not** retain raw replay requests.
 `--inspect-port PORT` optionally selects the loopback port (default: ephemeral).
@@ -98,11 +136,13 @@ values can still be sensitive. The existing CLI request rows remain available.
 Replay requires separate explicit `--replay-retain-secrets` consent (also requiring
 `--inspect`). **This retains original query, credentials, cookies and body secrets
 in memory:** at most20 requests/10minutes/16MiB total/1MiB body per request. JSON
-previews do not enable it. Eligible complete original requests can be reviewed
-and explicitly confirmed in the inspector for one fixed-original-loopback-backend
-attempt; every method can cause side effects. No request editing, raw export,
-redirect following or automatic retry is provided. Missing outcomes mean unknown
-delivery, not that nothing was sent. Never expose/share this private inspector.
+previews do not enable it. Eligible complete original requests can be reviewed, acknowledged for that
+review, and explicitly confirmed in the inspector for one
+fixed-original-loopback-backend attempt; every method can cause side effects.
+The confirmation authority is one-use and is consumed before the request is
+sent. No request editing, raw export, redirect following, automatic execution or
+automatic retry is provided. Missing outcomes mean unknown delivery, not that
+nothing was sent. Never expose/share this private inspector.
 
 ## Optional per-run visitor controls
 

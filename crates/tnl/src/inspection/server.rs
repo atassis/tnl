@@ -1,11 +1,16 @@
 //! One bounded authenticated HTTP/1 loopback listener. No raw-content endpoints.
 use super::{CaptureId, Inspection, InspectionRecord};
 use anyhow::Context;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use std::borrow::Cow;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
+use tnl_inspector_api::{
+    AvailabilityReply, ConfirmRequest, ListReply, OutcomeReply, PrepareRequest, PreviewReply,
+    ReplayErrorReply, StatsReply,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Semaphore};
@@ -16,8 +21,6 @@ const RESPONSE_LIMIT: usize = 65536;
 const JSON_LIMIT: usize = 1024;
 const HEX: &[u8; 16] = b"0123456789abcdef";
 const DEADLINE: Duration = Duration::from_secs(3);
-const UI: &str = include_str!("ui.html");
-const SCRIPT: &str = include_str!("ui.js");
 
 /// Owns listener shutdown; Debug deliberately excludes the capability.
 pub struct InspectorService {
@@ -203,7 +206,7 @@ async fn connection(mut socket: TcpStream, state: &ServerState) -> std::io::Resu
         _ => return Ok(()),
     };
     let body = reply.body;
-    let headers=format!("HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nPragma: no-cache\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'none'; script-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n\r\n",reply.status,reason(reply.status),reply.mime,body.len());
+    let headers=format!("HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nPragma: no-cache\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n\r\n",reply.status,reason(reply.status),reply.mime,body.len());
     let _ = tokio::time::timeout(DEADLINE, async {
         socket.write_all(headers.as_bytes()).await?;
         socket.write_all(&body).await?;
@@ -245,13 +248,15 @@ fn post_body_length(head: &[u8]) -> Result<usize, ()> {
 struct Reply {
     status: u16,
     mime: &'static str,
-    body: Vec<u8>,
+    body: Cow<'static, [u8]>,
 }
 fn error(status: u16) -> Reply {
     Reply {
         status,
         mime: "application/json",
-        body: format!("{{\"error\":{{\"code\":\"{}\"}}}}", reason(status)).into_bytes(),
+        body: format!("{{\"error\":{{\"code\":\"{}\"}}}}", reason(status))
+            .into_bytes()
+            .into(),
     }
 }
 const fn reason(status: u16) -> &'static str {
@@ -287,22 +292,9 @@ fn json(value: &impl Serialize) -> Reply {
     Reply {
         status: 200,
         mime: "application/json",
-        body: output.0,
+        body: Cow::Owned(output.0),
     }
 }
-#[derive(Serialize)]
-struct StatsReply {
-    schema_version: u8,
-    records: usize,
-    tunnel: super::TunnelStatus,
-}
-#[derive(Serialize)]
-struct ListReply<'a> {
-    schema_version: u8,
-    items: &'a [super::Summary],
-    next_before: Option<u64>,
-}
-
 fn one<'a>(headers: &'a [httparse::Header<'a>], name: &str) -> Result<Option<&'a [u8]>, ()> {
     let mut values = headers.iter().filter(|h| h.name.eq_ignore_ascii_case(name));
     let value = values.next().map(|h| h.value);
@@ -393,17 +385,14 @@ fn route(head: &[u8], body: &[u8], state: &ServerState) -> Reply {
         }
         return error(405);
     }
+    if let Some(asset) = super::assets::get(path) {
+        return Reply {
+            status: 200,
+            mime: asset.mime,
+            body: Cow::Borrowed(asset.bytes),
+        };
+    }
     match path {
-        "/" => Reply {
-            status: 200,
-            mime: "text/html; charset=utf-8",
-            body: UI.as_bytes().to_vec(),
-        },
-        "/inspector.js" => Reply {
-            status: 200,
-            mime: "text/javascript; charset=utf-8",
-            body: SCRIPT.as_bytes().to_vec(),
-        },
         "/api/v1/stats" => match state.history.api_status() {
             Ok((records, tunnel)) => json(&StatsReply {
                 schema_version: 1,
@@ -483,7 +472,10 @@ fn detail_json(mut detail: super::model::Detail) -> Reply {
         return reply;
     }
     drop(reply);
-    for message in [&mut detail.record.request, &mut detail.record.response] {
+    for message in [
+        &mut detail.record.view.request,
+        &mut detail.record.view.response,
+    ] {
         if message.body.text.take().is_some() {
             message.body.retained_bytes = 0;
             message.body.state = super::BodyState::Omitted;
@@ -496,43 +488,16 @@ fn detail_json(mut detail: super::model::Detail) -> Reply {
         return reply;
     }
     drop(reply);
-    for message in [&mut detail.record.request, &mut detail.record.response] {
+    for message in [
+        &mut detail.record.view.request,
+        &mut detail.record.view.response,
+    ] {
         if !message.headers.is_empty() {
             message.headers.clear();
             message.headers_state = super::HeadersState::Capped;
         }
     }
     json(&detail)
-}
-#[derive(Serialize)]
-struct AvailabilityReply {
-    schema_version: u8,
-    availability: crate::replay::ReplayAvailability,
-}
-#[derive(Serialize)]
-struct PreviewReply {
-    schema_version: u8,
-    method: String,
-    request_target: String,
-    preview: crate::replay::ReplayPreview,
-}
-#[derive(Serialize)]
-struct OutcomeReply {
-    schema_version: u8,
-    outcome: Option<crate::replay::ReplayOutcome>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PrepareRequest {
-    schema_version: u8,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ConfirmRequest {
-    schema_version: u8,
-    replay_id: ulid::Ulid,
-    confirmation_token: String,
-    confirm_side_effects: bool,
 }
 fn replay_capture(path: &str, suffix: &str) -> Option<CaptureId> {
     path.strip_prefix("/api/v1/requests/")?
@@ -543,12 +508,7 @@ fn replay_capture(path: &str, suffix: &str) -> Option<CaptureId> {
 }
 fn replay_error(reason: crate::replay::ReplayError) -> Reply {
     use crate::replay::ReplayError;
-    #[derive(Serialize)]
-    struct Failure {
-        schema_version: u8,
-        error: crate::replay::ReplayError,
-    }
-    let mut reply = json(&Failure {
+    let mut reply = json(&ReplayErrorReply {
         schema_version: 1,
         error: reason,
     });

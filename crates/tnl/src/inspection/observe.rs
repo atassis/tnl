@@ -459,8 +459,60 @@ struct Display {
     synth: bool,
 }
 impl Display {
+    fn timing_event(&self, event: &Observation<'_>) {
+        use super::timing::{offset_us, Milestone};
+        if !matches!(
+            event,
+            Observation::ResponseHead { .. }
+                | Observation::MessageEnd { .. }
+                | Observation::Stopped(..)
+        ) {
+            return;
+        }
+        self.inspection.update(self.id, |record| {
+            if let Some(counters) = &record.counters {
+                let mut timing = counters.timing.lock();
+                let at = offset_us(record.started);
+                match event {
+                    Observation::ResponseHead { status, .. }
+                        if !self.synth && (!(100..200).contains(status) || *status == 101) =>
+                    {
+                        timing.milestone_at(Milestone::BackendFinalHeaders, at);
+                    }
+                    Observation::MessageEnd {
+                        direction: Direction::Request,
+                        ..
+                    } => timing.milestone_at(Milestone::RequestFramingEnd, at),
+                    Observation::MessageEnd {
+                        direction: Direction::Response,
+                        ..
+                    } if !self.synth => timing.milestone_at(Milestone::ResponseFramingEnd, at),
+                    Observation::Stopped(Direction::Response, _) if self.synth => {}
+                    Observation::Stopped(direction, "cancelled") => {
+                        timing.cancel_framing(*direction);
+                    }
+                    Observation::Stopped(direction, _) => timing.revoke_framing(*direction),
+                    _ => {}
+                }
+            }
+        });
+    }
+    fn write_boundary(&self, direction: Direction, bytes: u64, upgraded: bool) {
+        self.inspection.update(self.id, |record| {
+            if let Some(counters) = &record.counters {
+                let mut timing = counters.timing.lock();
+                let at = super::timing::offset_us(record.started);
+                if upgraded {
+                    timing.upgrade_at(bytes, at);
+                } else {
+                    timing.expect_write_end_at(direction, bytes, at);
+                }
+            }
+        });
+    }
     #[allow(clippy::too_many_lines)] // Synchronous bounded event-to-display transitions.
     fn event(&mut self, event: &Observation<'_>) {
+        self.timing_event(event);
         let mode = self.inspection.inner.mode;
         match event {
             Observation::RequestHead {
@@ -543,7 +595,7 @@ impl Display {
                     self.response.bytes = Vec::new();
                     self.inspection.update(self.id, |r| {
                         r.omit("upgraded");
-                        for message in [&mut r.request, &mut r.response] {
+                        for message in [&mut r.view.request, &mut r.view.response] {
                             message.body.text = None;
                             message.body.retained_bytes = 0;
                             message.body.state = super::BodyState::Omitted;
@@ -685,6 +737,7 @@ pub struct Capture {
     display: Display,
     consumer: Option<Box<dyn ObservationConsumer>>,
     finished: bool,
+    wire_fed: [u64; 2],
 }
 impl std::fmt::Debug for Capture {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -725,6 +778,7 @@ impl Capture {
             },
             consumer,
             finished: false,
+            wire_fed: [0; 2],
         }
     }
     pub(crate) fn update_record(&self, update: impl FnOnce(&mut super::InspectionRecord)) {
@@ -756,6 +810,8 @@ impl Capture {
         if self.finished || self.display.upgraded {
             return;
         }
+        self.wire_fed[0] =
+            self.wire_fed[0].saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
         let display = &mut self.display;
         let consumer = &mut self.consumer;
         self.request.feed(bytes, false, &mut |event| {
@@ -764,11 +820,17 @@ impl Capture {
                 c.observe(&event);
             }
         });
+        if self.request.complete {
+            self.display
+                .write_boundary(Direction::Request, self.wire_fed[0], false);
+        }
     }
     pub fn response(&mut self, bytes: &[u8]) {
         if self.finished || self.display.upgraded {
             return;
         }
+        self.wire_fed[1] =
+            self.wire_fed[1].saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
         let display = &mut self.display;
         let consumer = &mut self.consumer;
         self.response
@@ -778,6 +840,15 @@ impl Capture {
                     c.observe(&event);
                 }
             });
+        if self.response.complete {
+            let end = if self.display.upgraded {
+                u64::try_from(self.response.head_total).unwrap_or(u64::MAX)
+            } else {
+                self.wire_fed[1]
+            };
+            self.display
+                .write_boundary(Direction::Response, end, self.display.upgraded);
+        }
     }
     pub fn finish(&mut self) {
         self.terminate(true);
@@ -799,6 +870,12 @@ impl Capture {
             if graceful {
                 self.request.eof(&mut emit);
                 self.response.eof(&mut emit);
+                if self.request.complete {
+                    display.write_boundary(Direction::Request, self.wire_fed[0], false);
+                }
+                if self.response.complete && !display.synth {
+                    display.write_boundary(Direction::Response, self.wire_fed[1], false);
+                }
             } else {
                 // Framed completion is provisional, including on cancellation
                 // after both MessageEnd callbacks. Finished alone is not success.

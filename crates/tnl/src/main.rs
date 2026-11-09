@@ -28,6 +28,20 @@ impl CompletionShell {
     }
 }
 
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum InspectBodies {
+    Off,
+    Json,
+}
+impl From<InspectBodies> for tnl::inspection::PreviewMode {
+    fn from(mode: InspectBodies) -> Self {
+        match mode {
+            InspectBodies::Off => Self::Off,
+            InspectBodies::Json => Self::Json,
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "tnl", version, about = "tnl tunneling client")]
 struct Cli {
@@ -81,7 +95,7 @@ enum Cmd {
         inspect_port: Option<u16>,
         /// Sanitized body preview policy; off by default. Never raw replay consent.
         #[arg(long, value_enum, requires = "inspect")]
-        inspect_bodies: Option<tnl::inspection::PreviewMode>,
+        inspect_bodies: Option<InspectBodies>,
         /// Retain original request secrets in bounded memory for explicit replay.
         #[arg(long, requires = "inspect")]
         replay_retain_secrets: bool,
@@ -247,7 +261,7 @@ fn real_main() -> anyhow::Result<()> {
                 inspect.then_some(tnl::commands::http::InspectionOptions {
                     port: inspect_port.unwrap_or(0),
                     replay_retain_secrets,
-                    bodies: inspect_bodies.unwrap_or(tnl::inspection::PreviewMode::Off),
+                    bodies: inspect_bodies.map_or(tnl::inspection::PreviewMode::Off, Into::into),
                 }),
             ))
         }

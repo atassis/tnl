@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use tnl_protocol::ControlMsg;
+use tnl_protocol::{ClosingReason, ControlMsg};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 async fn fixture() -> (
@@ -10,10 +10,16 @@ async fn fixture() -> (
 ) {
     let tokens = tempfile::NamedTempFile::new().unwrap();
     let tf = tnld::auth::TokensFile {
-        tokens: vec![tnld::auth::TokenEntry {
-            name: "fixture".into(),
-            hash: tnld::auth::hash_plaintext("tnl_U").unwrap(),
-        }],
+        tokens: vec![
+            tnld::auth::TokenEntry {
+                name: "fixture".into(),
+                hash: tnld::auth::hash_plaintext("tnl_U").unwrap(),
+            },
+            tnld::auth::TokenEntry {
+                name: "other".into(),
+                hash: tnld::auth::hash_plaintext("tnl_OTHER").unwrap(),
+            },
+        ],
     };
     std::fs::write(tokens.path(), toml::to_string(&tf).unwrap()).unwrap();
     let (server, state) = tnld::serve::spawn_server_with_state(tnld::config::Config {
@@ -50,7 +56,7 @@ async fn close(session: &mut tnl::client::ConnectedSession) {
         assert_eq!(
             serde_json::from_slice::<ControlMsg>(&payload).unwrap(),
             ControlMsg::Closing {
-                reason: "client_shutdown".into()
+                reason: ClosingReason::ClientShutdown
             }
         );
     })
@@ -103,4 +109,29 @@ async fn stale_session_close_does_not_remove_a_new_reattached_binding() {
         id.to_string()
     );
     close(&mut current).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_old_owner_close_cannot_remove_other_owners_reused_name() {
+    let (_tokens, server, state) = fixture().await;
+    let endpoint = format!("http://{}", server.local_addr);
+    let mut old = tnl::client::connect_and_create(&endpoint, "tnl_U", "demo")
+        .await
+        .unwrap();
+    state
+        .registry
+        .close_by_subdomain("demo", "fixture")
+        .unwrap();
+    let mut newer = tnl::client::connect_and_create(&endpoint, "tnl_OTHER", "demo")
+        .await
+        .unwrap();
+    let id = newer.tunnel_id.to_string();
+    let binding = state.registry.current_session_id(&id).unwrap();
+    assert_ne!(old.tunnel_id, newer.tunnel_id);
+    close(&mut old).await;
+    assert_eq!(state.registry.current_session_id(&id), Some(binding));
+    let tunnel = state.registry.find_by_subdomain("demo").unwrap();
+    assert_eq!(tunnel.id, id);
+    assert_eq!(tunnel.created_by, "other");
+    close(&mut newer).await;
 }

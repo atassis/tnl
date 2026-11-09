@@ -40,6 +40,10 @@ async fn cli_creates_tunnel_via_control_channel() {
             "Sec-WebSocket-Key",
             async_tungstenite::tungstenite::handshake::client::generate_key(),
         )
+        .header(
+            tnl_protocol::control::CONTROL_PROTOCOL_HEADER,
+            tnl_protocol::control::CONTROL_PROTOCOL_VERSION,
+        )
         .header("Sec-WebSocket-Version", "13")
         .body(())
         .unwrap();
@@ -72,10 +76,37 @@ async fn cli_creates_tunnel_via_control_channel() {
     let mut respbuf = vec![0u8; n];
     ctrl.read_exact(&mut respbuf).await.unwrap();
     let resp: ControlMsg = serde_json::from_slice(&respbuf).unwrap();
-    match resp {
-        ControlMsg::TunnelCreated(TunnelCreatedResp { hostname, .. }) => {
+    let tunnel_id = match resp {
+        ControlMsg::TunnelCreated(TunnelCreatedResp {
+            hostname,
+            tunnel_id,
+            ..
+        }) => {
             assert_eq!(hostname, "foo.t.example.com");
+            tunnel_id
         }
         other => panic!("expected TunnelCreated, got {other:?}"),
-    }
+    };
+
+    // The registered owner gets the exact original tunnel/sequence echo.
+    let heartbeat = ControlMsg::Heartbeat {
+        tunnel_id,
+        sequence: 7,
+    };
+    let payload = serde_json::to_vec(&heartbeat).unwrap();
+    ctrl.write_all(&u32::try_from(payload.len()).unwrap().to_be_bytes())
+        .await
+        .unwrap();
+    ctrl.write_all(&payload).await.unwrap();
+    ctrl.flush().await.unwrap();
+    let n = ctrl.read_u32().await.unwrap();
+    let mut payload = vec![0; n as usize];
+    ctrl.read_exact(&mut payload).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<ControlMsg>(&payload).unwrap(),
+        ControlMsg::HeartbeatAck {
+            tunnel_id,
+            sequence: 7,
+        }
+    );
 }

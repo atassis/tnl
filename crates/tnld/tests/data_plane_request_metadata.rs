@@ -10,6 +10,9 @@ use tokio::io::DuplexStream;
 struct OneStreamSession<T = DuplexStream>(Option<T>);
 #[async_trait::async_trait]
 impl<T: Stream + Sync + 'static> Session for OneStreamSession<T> {
+    fn termination(&self) -> tnl_protocol::transport::SessionTermination {
+        panic!("open-only data-plane fixture does not run a physical session owner")
+    }
     async fn open_stream(&mut self) -> anyhow::Result<Pin<Box<dyn Stream>>> {
         Ok(Box::pin(
             self.0
@@ -52,12 +55,13 @@ async fn data_plane_request_metadata_write_failure_and_timeout_are_transport_502
         let _peer = stalled.then_some(peer);
         state.session_handles.insert(
             session.id.clone(),
-            tnld::serve::SessionHandle {
-                session: Arc::new(tokio::sync::Mutex::new(Box::new(OneStreamSession(Some(
+            tnld::serve::SessionHandle::new(
+                &session,
+                Arc::new(tokio::sync::Mutex::new(Box::new(OneStreamSession(Some(
                     writer,
                 ))))),
-                data_stream_protocol: DataStreamProtocol::Http1MetadataV1,
-            },
+                DataStreamProtocol::Http1MetadataV1,
+            ),
         );
         let req = axum::http::Request::builder()
             .uri("/failure")
@@ -188,12 +192,13 @@ async fn data_plane_connection_error_diagnostic_keeps_request_identity_span() {
     let (writer, mut peer) = tokio::io::duplex(1024);
     state.session_handles.insert(
         session.id.clone(),
-        tnld::serve::SessionHandle {
-            session: Arc::new(tokio::sync::Mutex::new(Box::new(OneStreamSession(Some(
+        tnld::serve::SessionHandle::new(
+            &session,
+            Arc::new(tokio::sync::Mutex::new(Box::new(OneStreamSession(Some(
                 ShutdownErrorStream(writer),
             ))))),
-            data_stream_protocol: DataStreamProtocol::RawHttp1,
-        },
+            DataStreamProtocol::RawHttp1,
+        ),
     );
     let valid_response = tokio::spawn(async move {
         let mut head = Vec::new();
@@ -265,7 +270,7 @@ async fn state_with_tunnel() -> (
     tempfile::NamedTempFile,
     tnld::serve::ServerHandle,
     tnld::serve::AppState,
-    String,
+    Arc<tnld::registry::SessionState>,
 ) {
     let file = tempfile::NamedTempFile::new().unwrap();
     let (server, state) = tnld::serve::spawn_server_with_state(tnld::config::Config {
@@ -283,7 +288,7 @@ async fn state_with_tunnel() -> (
         .registry
         .create_tunnel("demo", &session.id, "test")
         .unwrap();
-    (file, server, state, session.id.clone())
+    (file, server, state, session)
 }
 
 #[tokio::test]
@@ -295,16 +300,18 @@ async fn data_plane_request_ids_replace_all_values_after_hop_filtering_in_both_m
         DataStreamProtocol::Http1MetadataV1,
     ] {
         for nominate in [false, true] {
-            let (_file, server, state, session_id) = state_with_tunnel().await;
+            let (_file, server, state, session) = state_with_tunnel().await;
+            let session_id = session.id.clone();
             let (writer, mut peer) = tokio::io::duplex(4096);
             state.session_handles.insert(
                 session_id.clone(),
-                tnld::serve::SessionHandle {
-                    session: Arc::new(tokio::sync::Mutex::new(Box::new(OneStreamSession(Some(
+                tnld::serve::SessionHandle::new(
+                    &session,
+                    Arc::new(tokio::sync::Mutex::new(Box::new(OneStreamSession(Some(
                         writer,
                     ))))),
-                    data_stream_protocol: mode,
-                },
+                    mode,
+                ),
             );
             let backend = tokio::spawn(async move {
                 let metadata_id = if mode == DataStreamProtocol::Http1MetadataV1 {
@@ -388,7 +395,8 @@ async fn data_plane_request_ids_replace_all_values_after_hop_filtering_in_both_m
 
 #[tokio::test]
 async fn data_plane_local_error_headers_and_bodies_share_the_handler_id() {
-    let (_file, server, state, session_id) = state_with_tunnel().await;
+    let (_file, server, state, session) = state_with_tunnel().await;
+    let session_id = session.id.clone();
     let mut ids = std::collections::HashSet::new();
     for (step, status, component) in [
         (0, 400, "registry"),
@@ -400,19 +408,20 @@ async fn data_plane_local_error_headers_and_bodies_share_the_handler_id() {
         if step == 3 {
             state.session_handles.insert(
                 session_id.clone(),
-                tnld::serve::SessionHandle {
-                    session: Arc::new(tokio::sync::Mutex::new(Box::new(OneStreamSession::<
+                tnld::serve::SessionHandle::new(
+                    &session,
+                    Arc::new(tokio::sync::Mutex::new(Box::new(OneStreamSession::<
                         DuplexStream,
                     >(
                         None
                     )))),
-                    data_stream_protocol: DataStreamProtocol::Http1MetadataV1,
-                },
+                    DataStreamProtocol::Http1MetadataV1,
+                ),
             );
         } else if step == 4 {
             // Match control-session cleanup: retire the routing handle too.
-            state.session_handles.remove(&session_id);
             state.registry.drop_session(&session_id, 30);
+            state.session_handles.remove(&session_id);
         }
         let mut req = axum::http::Request::builder()
             .uri("/error")

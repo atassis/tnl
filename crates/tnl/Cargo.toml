@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-argon2.workspace = true
+argon2 = { workspace = true, features = ["std"] }
 async-trait.workspace = true
 dialoguer.workspace = true
 http = "1"
@@ -47,6 +47,7 @@ yamux.workspace = true
 zeroize.workspace = true
 
 tnl-protocol = { path = "../tnl-protocol" }
+tnl-inspector-api = { path = "../tnl-inspector-api" }
 nu-ansi-term = "0.50"
 parking_lot = "0.12"
 url = "2"
@@ -57,3 +58,9 @@ rustls.workspace = true
 tempfile = "3"
 tnld = { path = "../tnld" }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+
+[build-dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true

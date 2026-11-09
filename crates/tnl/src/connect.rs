@@ -80,7 +80,33 @@ pub async fn connect_local(
     target: &Target,
     deadline: Duration,
 ) -> Result<(TcpStream, SocketAddr), ConnectError> {
-    connect_using(resolve_target(target), deadline, TcpStream::connect).await
+    connect_local_observed(target, deadline, |_| {}).await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConnectEvent {
+    ResolveStarted,
+    ResolveSkipped,
+    ResolveCompleted,
+    ResolveFailed,
+    ConnectStarted,
+    ConnectCompleted,
+    ConnectFailed,
+}
+
+pub(crate) async fn connect_local_observed(
+    target: &Target,
+    deadline: Duration,
+    observe: impl FnMut(ConnectEvent) + Send,
+) -> Result<(TcpStream, SocketAddr), ConnectError> {
+    connect_using(
+        resolve_target(target),
+        deadline,
+        TcpStream::connect,
+        matches!(target, Target::LocalhostPort(_)),
+        observe,
+    )
+    .await
 }
 
 // The production resolver and dialer are unchanged; scoped test futures can
@@ -89,37 +115,59 @@ async fn connect_using<R, D, F>(
     resolve: R,
     deadline: Duration,
     dial: D,
+    resolve_required: bool,
+    mut observe: impl FnMut(ConnectEvent) + Send,
 ) -> Result<(TcpStream, SocketAddr), ConnectError>
 where
-    R: std::future::Future<Output = Result<Vec<SocketAddr>, ConnectError>>,
-    D: Fn(SocketAddr) -> F,
-    F: std::future::Future<Output = io::Result<TcpStream>>,
+    R: std::future::Future<Output = Result<Vec<SocketAddr>, ConnectError>> + Send,
+    D: Fn(SocketAddr) -> F + Send,
+    F: std::future::Future<Output = io::Result<TcpStream>> + Send,
 {
-    let addrs = resolve.await?;
-    let start = Instant::now();
-    let mut last_err: Option<ConnectError> = None;
-
-    for addr in addrs {
-        let remaining = deadline
-            .checked_sub(start.elapsed())
-            .unwrap_or_else(|| Duration::from_millis(0));
-        if remaining.is_zero() {
-            return Err(ConnectError::Timeout(deadline));
-        }
-        match timeout(remaining, dial(addr)).await {
-            Ok(Ok(stream)) => {
-                let _ = stream.set_nodelay(true);
-                return Ok((stream, addr));
-            }
-            Ok(Err(e)) => {
-                last_err = Some(classify_io(&e, deadline));
-            }
-            Err(_elapsed) => {
-                last_err = Some(ConnectError::Timeout(deadline));
-            }
-        }
+    observe(if resolve_required {
+        ConnectEvent::ResolveStarted
+    } else {
+        ConnectEvent::ResolveSkipped
+    });
+    let addrs = resolve
+        .await
+        .inspect_err(|_| observe(ConnectEvent::ResolveFailed))?;
+    if resolve_required {
+        observe(ConnectEvent::ResolveCompleted);
     }
-    Err(last_err.unwrap_or(ConnectError::Refused))
+    observe(ConnectEvent::ConnectStarted);
+    let result = async move {
+        let start = Instant::now();
+        let mut last_err: Option<ConnectError> = None;
+
+        for addr in addrs {
+            let remaining = deadline
+                .checked_sub(start.elapsed())
+                .unwrap_or_else(|| Duration::from_millis(0));
+            if remaining.is_zero() {
+                return Err(ConnectError::Timeout(deadline));
+            }
+            match timeout(remaining, dial(addr)).await {
+                Ok(Ok(stream)) => {
+                    let _ = stream.set_nodelay(true);
+                    return Ok((stream, addr));
+                }
+                Ok(Err(e)) => {
+                    last_err = Some(classify_io(&e, deadline));
+                }
+                Err(_elapsed) => {
+                    last_err = Some(ConnectError::Timeout(deadline));
+                }
+            }
+        }
+        Err(last_err.unwrap_or(ConnectError::Refused))
+    }
+    .await;
+    observe(if result.is_ok() {
+        ConnectEvent::ConnectCompleted
+    } else {
+        ConnectEvent::ConnectFailed
+    });
+    result
 }
 
 fn classify_io(e: &io::Error, active_deadline: Duration) -> ConnectError {
@@ -184,6 +232,8 @@ mod controlled_failures {
             async { Err(ConnectError::DnsFailed(io::Error::other("RESOLVER_CANARY"))) },
             LOCAL_CONNECT_TIMEOUT,
             |_| async { panic!("resolver failure must not dial") },
+            true,
+            |_| {},
         )
         .await
         .unwrap_err();
@@ -193,6 +243,8 @@ mod controlled_failures {
             async { Ok(vec!["127.0.0.1:1".parse().unwrap()]) },
             LOCAL_CONNECT_TIMEOUT,
             |_| std::future::pending::<io::Result<TcpStream>>(),
+            false,
+            |_| {},
         )
         .await
         .unwrap_err();
@@ -201,5 +253,116 @@ mod controlled_failures {
             ConnectError::Timeout(LOCAL_CONNECT_TIMEOUT)
         ));
         assert_eq!(started.elapsed(), LOCAL_CONNECT_TIMEOUT);
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn connect_timing_resolver_failure_never_starts_a_dial() {
+        let mut events = Vec::new();
+        let error = connect_using(
+            async { Err(ConnectError::DnsEmpty) },
+            LOCAL_CONNECT_TIMEOUT,
+            |_| async { panic!("must not dial") },
+            true,
+            |event| events.push(event),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ConnectError::DnsEmpty));
+        assert_eq!(
+            events,
+            [ConnectEvent::ResolveStarted, ConnectEvent::ResolveFailed]
+        );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn connect_timing_resolution_stays_outside_aggregate_dial_deadline() {
+        let mut events = Vec::new();
+        let started = Instant::now();
+        let error = connect_using(
+            async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                Ok(vec!["127.0.0.1:1".parse().unwrap()])
+            },
+            LOCAL_CONNECT_TIMEOUT,
+            |_| std::future::pending::<io::Result<TcpStream>>(),
+            true,
+            |event| events.push(event),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConnectError::Timeout(LOCAL_CONNECT_TIMEOUT)
+        ));
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(10) + LOCAL_CONNECT_TIMEOUT
+        );
+        assert_eq!(
+            events,
+            [
+                ConnectEvent::ResolveStarted,
+                ConnectEvent::ResolveCompleted,
+                ConnectEvent::ConnectStarted,
+                ConnectEvent::ConnectFailed
+            ]
+        );
+    }
+    #[tokio::test]
+    async fn connect_timing_numeric_address_skips_resolution_and_fallback_is_aggregate() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (client, server) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let stream = parking_lot::Mutex::new(Some(client.unwrap()));
+        let _server = server.unwrap();
+        let first = "127.0.0.1:1".parse().unwrap();
+        let second = "127.0.0.1:2".parse().unwrap();
+        let attempted = parking_lot::Mutex::new(Vec::new());
+        let mut events = Vec::new();
+        let (_, winning) = connect_using(
+            async { Ok(vec![first, second]) },
+            LOCAL_CONNECT_TIMEOUT,
+            |addr| {
+                attempted.lock().push(addr);
+                std::future::ready(if addr == first {
+                    Err(io::ErrorKind::ConnectionRefused.into())
+                } else {
+                    Ok(stream.lock().take().unwrap())
+                })
+            },
+            false,
+            |event| events.push(event),
+        )
+        .await
+        .unwrap();
+        assert_eq!(winning, second);
+        assert_eq!(*attempted.lock(), [first, second]);
+        assert_eq!(
+            events,
+            [
+                ConnectEvent::ResolveSkipped,
+                ConnectEvent::ConnectStarted,
+                ConnectEvent::ConnectCompleted
+            ]
+        );
+    }
+    #[tokio::test]
+    async fn connect_timing_cancellation_leaves_only_the_started_phase() {
+        let mut events = Vec::new();
+        {
+            let connect = connect_using(
+                std::future::pending::<Result<Vec<SocketAddr>, ConnectError>>(),
+                LOCAL_CONNECT_TIMEOUT,
+                |_| async { panic!("must not dial") },
+                true,
+                |event| events.push(event),
+            );
+            tokio::pin!(connect);
+            tokio::select! {biased; _=&mut connect=>panic!("resolver cannot finish"), ()=std::future::ready(())=>{}}
+        }
+        assert_eq!(events, [ConnectEvent::ResolveStarted]);
     }
 }

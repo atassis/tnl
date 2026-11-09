@@ -21,6 +21,27 @@ use crate::registry::Registry;
 pub struct SessionHandle {
     pub session: Arc<Mutex<Box<dyn tnl_protocol::transport::Session>>>,
     pub data_stream_protocol: tnl_protocol::request_metadata::DataStreamProtocol,
+    admission_cancel: tokio_util::sync::CancellationToken,
+}
+
+impl SessionHandle {
+    /// Every handle, including test fixtures, shares its registered session's
+    /// admission lifetime. This does not force or close healthy physical IO.
+    pub fn new(
+        owner: &crate::registry::SessionState,
+        session: Arc<Mutex<Box<dyn tnl_protocol::transport::Session>>>,
+        data_stream_protocol: tnl_protocol::request_metadata::DataStreamProtocol,
+    ) -> Self {
+        Self {
+            session,
+            data_stream_protocol,
+            admission_cancel: owner.admission_cancel.clone(),
+        }
+    }
+
+    pub async fn invalidated(&self) {
+        self.admission_cancel.cancelled().await;
+    }
 }
 
 impl std::fmt::Debug for SessionHandle {

@@ -4,6 +4,43 @@ use crate::replay::ReplayController;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+// A serialized output reserves its whole Vec even when the JSON is short.
+// Embedded static bundles have no per-handler allocation.
+#[allow(clippy::ptr_arg)] // A slice would hide the allocation variant and Vec capacity being tested.
+fn owned_body_capacity(body: &Cow<'static, [u8]>) -> usize {
+    match body {
+        Cow::Owned(bytes) => bytes.capacity(),
+        Cow::Borrowed(_) => 0,
+    }
+}
+
+#[test]
+fn static_assets_are_borrowed_and_json_accounts_reserved_capacity() {
+    let state = ServerState {
+        history: Inspection::new(PreviewMode::Off),
+        token: Arc::new([b'a'; 64]),
+        authority: "127.0.0.1:1234".into(),
+        origin: "http://127.0.0.1:1234".into(),
+        handlers: Semaphore::new(4),
+    };
+    for asset in super::super::assets::ASSETS {
+        let head = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\n\r\n",
+            asset.path, state.authority
+        );
+        let reply = route(head.as_bytes(), b"", &state);
+        assert_eq!(reply.status, 200);
+        assert_eq!(owned_body_capacity(&reply.body), 0);
+        let Cow::Borrowed(bytes) = reply.body else {
+            panic!("static asset allocated per handler")
+        };
+        assert!(std::ptr::eq(bytes.as_ptr(), asset.bytes.as_ptr()));
+    }
+    let reply = json(&serde_json::json!({"small": true}));
+    assert!(reply.body.len() < RESPONSE_LIMIT);
+    assert_eq!(owned_body_capacity(&reply.body), RESPONSE_LIMIT);
+}
+
 fn template(body: &[u8], response: bool) -> Vec<u8> {
     let mut head = if response {
         "HTTP/1.1 200 OK\r\n".to_owned()
@@ -15,6 +52,67 @@ fn template(body: &[u8], response: bool) -> Vec<u8> {
     }
     write!(head,"Authorization: HEADER_CANARY\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",body.len()).unwrap();
     [head.as_bytes(), body].concat()
+}
+fn maximal_timing() -> tnl_inspector_api::timing::Timing {
+    use tnl_inspector_api::timing::{
+        Interval, Intervals, Outcome, Snapshot, Timing, MAX_OFFSET_US,
+    };
+    let span = Interval {
+        outcome: Outcome::Completed,
+        start_offset_us: Some(MAX_OFFSET_US - 10),
+        end_offset_us: Some(MAX_OFFSET_US),
+    };
+    Timing::from_snapshot(Snapshot {
+        as_of_offset_us: MAX_OFFSET_US,
+        terminal: true,
+        intervals: Intervals {
+            metadata: span,
+            request_head: span,
+            resolve: span,
+            connect: span,
+            request_write: span,
+            response_read: span,
+            response_write: span,
+            upgraded: span,
+        },
+        backend_first_byte_offset_us: Some(MAX_OFFSET_US - 10),
+        backend_final_headers_offset_us: Some(MAX_OFFSET_US),
+        request_framing_end_offset_us: Some(MAX_OFFSET_US),
+        response_framing_end_offset_us: Some(MAX_OFFSET_US),
+        request_framing_valid: true,
+        response_framing_valid: true,
+    })
+}
+fn attach_active_timing(capture: &crate::inspection::Capture) {
+    use crate::inspection::timing::{Activity, Milestone, TimingState};
+    let mut timing = TimingState::new();
+    for activity in [
+        Activity::Metadata,
+        Activity::RequestHead,
+        Activity::Resolve,
+        Activity::Connect,
+        Activity::RequestWrite,
+        Activity::ResponseRead,
+        Activity::ResponseWrite,
+        Activity::Upgraded,
+    ] {
+        timing.start_at(activity, 0);
+    }
+    for milestone in [
+        Milestone::BackendFirstByte,
+        Milestone::BackendFinalHeaders,
+        Milestone::RequestFramingEnd,
+        Milestone::ResponseFramingEnd,
+    ] {
+        timing.milestone_at(milestone, 0);
+    }
+    capture.update_record(|record| {
+        record.counters = Some(crate::inspection::TransportCounters {
+            timing: Arc::new(parking_lot::Mutex::new(timing)),
+            to_backend: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            to_client: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        });
+    });
 }
 async fn get(addr: SocketAddr, path: &str) -> Vec<u8> {
     let mut socket = TcpStream::connect(addr).await.unwrap();
@@ -65,18 +163,23 @@ async fn combined_pressure() {
         capture.request(&request);
         capture.response(&response);
         capture.finish();
+        capture.update_record(|record| record.timing = maximal_timing());
     }
-    let detail_id = detail_id.unwrap();
+    let _terminal_detail_id = detail_id.unwrap();
+    let mut active_detail_id = None;
     let mut held = Vec::with_capacity(64);
     for _ in 0..64 {
         let mut capture = history
             .admit_backend(generation, None, backend_addr)
             .unwrap();
+        attach_active_timing(&capture);
+        active_detail_id = Some(capture.id());
         capture.request(b"POST /active HTTP/1.1\r\nHost: local\r\nContent-Type: application/json\r\nContent-Length: 1048576\r\n\r\n");
         capture.request(&[b'x'; 4096]);
         held.push(capture);
     }
     assert!(history.admit(generation, None).is_none());
+    let detail_id = active_detail_id.unwrap();
     let history_capacity = history.allocated_capacity();
     let scratch_capacity = held
         .iter()
@@ -87,10 +190,29 @@ async fn combined_pressure() {
     assert!(replay.raw_bytes() <= 16 * 1024 * 1024);
     assert!(replay.raw_bytes() >= 14 * 1024 * 1024);
     let detail = history.api_detail(detail_id).unwrap().unwrap();
+    let live_timing = detail.record.timing.snapshot().unwrap();
+    assert!(!live_timing.terminal);
+    assert!(live_timing.backend_first_byte_offset_us.is_some());
+    assert!(live_timing.backend_final_headers_offset_us.is_some());
+    assert!(live_timing.request_framing_end_offset_us.is_some());
+    assert!(live_timing.response_framing_end_offset_us.is_some());
+    assert!(live_timing.request_framing_valid && live_timing.response_framing_valid);
+    assert!([
+        live_timing.intervals.metadata,
+        live_timing.intervals.request_head,
+        live_timing.intervals.resolve,
+        live_timing.intervals.connect,
+        live_timing.intervals.request_write,
+        live_timing.intervals.response_read,
+        live_timing.intervals.response_write,
+        live_timing.intervals.upgraded,
+    ]
+    .into_iter()
+    .all(|interval| interval.outcome == tnl_inspector_api::timing::Outcome::Active));
     let detail_capacity = detail.record.allocated_capacity();
     let encoded = detail_json(detail);
     assert_eq!(encoded.status, 200);
-    assert!(encoded.body.capacity() <= RESPONSE_LIMIT);
+    assert!(owned_body_capacity(&encoded.body) <= RESPONSE_LIMIT);
     assert!(!String::from_utf8_lossy(&encoded.body).contains("CANARY"));
     let list = history
         .api_list(&Filter::parse("limit=100").unwrap())
@@ -105,7 +227,7 @@ async fn combined_pressure() {
     // allocated output + request-head/JSON + decoded filter/casefold + stack.
     let measured_handler_capacity = detail_capacity
         + summary_capacity
-        + encoded.body.capacity()
+        + owned_body_capacity(&encoded.body)
         + HEAD_LIMIT
         + JSON_LIMIT
         + 16384;
@@ -181,12 +303,15 @@ async fn combined_pressure() {
         held
     });
     let successes = Arc::new(AtomicUsize::new(0));
+    let detail_successes = Arc::new(AtomicUsize::new(0));
     let mut clients = JoinSet::new();
     for worker in 0..4 {
         let successes = successes.clone();
+        let detail_successes = detail_successes.clone();
         clients.spawn(async move {
             for turn in 0..10 {
-                let path = if (worker + turn) % 2 == 0 {
+                let is_detail = (worker + turn) % 2 == 0;
+                let path = if is_detail {
                     format!("/api/v1/requests/{}", detail_id.0)
                 } else {
                     format!("/api/v1/requests?limit=100&q={}", "z".repeat(256))
@@ -194,6 +319,40 @@ async fn combined_pressure() {
                 let bytes = get(addr, &path).await;
                 if bytes.starts_with(b"HTTP/1.1 200") {
                     successes.fetch_add(1, Ordering::Relaxed);
+                    if is_detail {
+                        let end = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                        let detail: serde_json::Value =
+                            serde_json::from_slice(&bytes[end..]).unwrap();
+                        assert_eq!(detail["capture_id"], detail_id.0.to_string());
+                        let timing = &detail["timing"];
+                        assert_eq!(timing["schema_version"], 1);
+                        assert_eq!(timing["availability"], "available");
+                        assert_eq!(timing["snapshot"]["terminal"], false);
+                        for activity in [
+                            "metadata",
+                            "request_head",
+                            "resolve",
+                            "connect",
+                            "request_write",
+                            "response_read",
+                            "response_write",
+                            "upgraded",
+                        ] {
+                            assert_eq!(
+                                timing["snapshot"]["intervals"][activity]["outcome"],
+                                "active"
+                            );
+                        }
+                        for milestone in [
+                            "backend_first_byte_offset_us",
+                            "backend_final_headers_offset_us",
+                            "request_framing_end_offset_us",
+                            "response_framing_end_offset_us",
+                        ] {
+                            assert!(timing["snapshot"][milestone].is_u64());
+                        }
+                        detail_successes.fetch_add(1, Ordering::Relaxed);
+                    }
                     assert!(!String::from_utf8_lossy(&bytes).contains("CANARY"));
                 }
                 tokio::task::yield_now().await;
@@ -204,6 +363,7 @@ async fn combined_pressure() {
         result.unwrap();
     }
     assert!(successes.load(Ordering::Relaxed) > 0);
+    assert!(detail_successes.load(Ordering::Relaxed) > 0);
     let held = observer.await.unwrap();
     assert!(history.allocated_capacity() <= 16 * 1024 * 1024);
     assert!(replay.allocated_capacity_without_execution() <= 16 * 1024 * 1024 + 8192);

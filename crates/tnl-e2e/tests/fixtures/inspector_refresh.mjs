@@ -1,78 +1,89 @@
-import {hasExited, stopChild} from "./browser_process.mjs";
-import {spawn,spawnSync} from 'node:child_process';
-import os from 'node:os';import fs from 'node:fs';import path from 'node:path';import http from 'node:http';import net from 'node:net';import assert from 'node:assert/strict';
-process.umask(0o077);
-const root=fs.mkdtempSync(path.join(process.platform==='win32'?os.tmpdir():'/tmp','tnl-inspector-refresh-'));
-const clientBin=process.env.TNL_TEST_CLIENT_BIN,daemonBin=process.env.TNL_TEST_DAEMON_BIN;
-assert(clientBin&&daemonBin,'explicit candidate binaries required');
-const envBase={...process.env,HOME:root,TMPDIR:root,XDG_CONFIG_HOME:path.join(root,'config')};
-for(const k of Object.keys(envBase))if(k.startsWith('TNL_')||k.startsWith('TNLD_'))delete envBase[k];
-const delay=ms=>new Promise(r=>setTimeout(r,ms));const children=[];let ws;const received=[];
-let publicRequestId;
-const server=http.createServer(async(req,res)=>{const chunks=[];for await(const b of req)chunks.push(b);received.push({method:req.method,url:req.url,headers:req.headers,body:Buffer.concat(chunks).toString()});res.writeHead(200,{'content-type':'application/json','connection':'close'});res.end('{"token":"RESPONSE_BODY_CANARY","public":"ok"}');});
-const listen=s=>new Promise(r=>s.listen(0,'127.0.0.1',()=>r(s.address().port)));
-async function until(fn,message,tries=200){for(let n=0;n<tries;n++){const v=await fn();if(v)return v;await delay(50);}throw new Error(message);}
-function child(name,args,env=envBase){const p=spawn(name,args,{env,stdio:['ignore','pipe','pipe']});children.push(p);let out='';p.on('error',()=>{out+='fixture process failed to start';});p.stdout.on('data',b=>out+=b);p.stderr.on('data',b=>out+=b);return {process:p,output:()=>out};}
-try{
- const backend=await listen(server);const reserve=net.createServer();const port=await listen(reserve);await new Promise(r=>reserve.close(r));
- const tokens=path.join(root,'tokens.toml');assert(!fs.existsSync(tokens),'use a fresh fixture directory');
- const tokenResult=spawnSync(daemonBin,['token','add','browser-test','--tokens-file',tokens],{encoding:'utf8'});assert.equal(tokenResult.status,0,tokenResult.stderr);const token=tokenResult.stdout.trim();assert(token.startsWith('tnl_'));
- const daemonConfig=path.join(root,'daemon.toml');fs.writeFileSync(daemonConfig,`listen = "127.0.0.1:${port}"\npublic_url = "http://127.0.0.1:${port}"\nhostname_root = "t.test"\ntokens_file = ${JSON.stringify(tokens)}\n`,{mode:0o600});
- const daemon=child(daemonBin,['serve','--config',daemonConfig]);await until(async()=>{try{return(await fetch(`http://127.0.0.1:${port}/healthz`,{signal:AbortSignal.timeout(1000)})).status===200;}catch{return false;}},'fixture daemon failed');
- const config=path.join(root,'client.toml');fs.writeFileSync(config,`endpoint = "http://127.0.0.1:${port}"\ntoken = ${JSON.stringify(token)}\n`,{mode:0o600});const env={...envBase,TNL_CONFIG:config};delete env.TNL_TOKEN;delete env.TNL_ENDPOINT;
- const cli=child(clientBin,['http',String(backend),'browser','--inspect','--inspect-bodies','json','--replay-retain-secrets','--quiet'],env);
- const link=await until(()=>cli.output().match(/http:\/\/127\.0\.0\.1:\d+\/#token=[a-f0-9]{64}/)?.[0],'inspector URL missing');const url=new URL(link),cap=url.hash.slice('#token='.length);
- await until(async()=>{try{const r=await fetch(url.origin+'/api/v1/stats',{headers:{Authorization:'Bearer '+cap},signal:AbortSignal.timeout(1000)});return(await r.json()).tunnel.connected;}catch{return false;}},'tunnel did not connect');
- const requestPath='/canary?secret=RAW_QUERY_CANARY';const body='{"token":"RAW_BODY_CANARY","public":"<svg/onload=globalThis.XSS=1>"}';
- await new Promise((resolve,reject)=>{const q=http.request({host:'127.0.0.1',port,path:requestPath,method:'POST',headers:{host:'browser.t.test',authorization:'Bearer RAW_AUTH_CANARY',cookie:'session=RAW_COOKIE_CANARY','content-type':'application/json','content-length':Buffer.byteLength(body),'connection':'close'}},r=>{publicRequestId=r.headers['x-tnl-request-id'];r.resume();r.on('end',()=>r.statusCode===200?resolve():reject(new Error('original request status '+r.statusCode)));});q.setTimeout(5000,()=>q.destroy(new Error('original request deadline')));q.on('error',reject);q.end(body);});
- assert.equal(received.length,1);
- const browser=child(process.env.TNL_TEST_BROWSER_BIN??'/usr/bin/brave',['--headless=new','--no-first-run','--no-default-browser-check','--disable-background-networking','--remote-debugging-address=127.0.0.1','--remote-debugging-port=0','--user-data-dir='+path.join(root,'profile'),'about:blank']);
- const debugPort=await until(()=>{if(hasExited(browser.process))throw new Error('isolated browser exited ('+browser.process.signalCode+'): '+browser.output().slice(-2500));try{return Number(fs.readFileSync(path.join(root,'profile/DevToolsActivePort'),'utf8').split('\n')[0]);}catch{return false;}},'isolated browser failed');
- const pages=await(await fetch(`http://127.0.0.1:${debugPort}/json/list`,{signal:AbortSignal.timeout(5000)})).json();ws=new WebSocket(pages.find(p=>p.type==='page').webSocketDebuggerUrl);await new Promise((r,j)=>{const timer=setTimeout(()=>j(new Error('CDP open deadline')),5000);ws.addEventListener('open',()=>{clearTimeout(timer);r();},{once:true});ws.addEventListener('error',e=>{clearTimeout(timer);j(e);},{once:true});});
- let id=0;const pending=new Map(),exceptions=[],mutations=[];let confirmationToken;
- ws.addEventListener('message',e=>{const m=JSON.parse(e.data);if(m.id){const p=pending.get(m.id);if(p){pending.delete(m.id);m.error?p.reject(new Error(JSON.stringify(m.error))):p.resolve(m.result);}}if(m.method==='Runtime.exceptionThrown')exceptions.push(m.params.exceptionDetails.text);if(m.method==='Network.requestWillBeSent'&&m.params.request.url.startsWith(url.origin)&&m.params.request.method==='POST'){const req=m.params.request;mutations.push(new URL(req.url).pathname);if(req.url.endsWith('/confirm'))confirmationToken=JSON.parse(req.postData).confirmation_token;}});
- function cdp(method,params={}){return new Promise((resolve,reject)=>{const n=++id;const timer=setTimeout(()=>{pending.delete(n);reject(new Error('CDP deadline: '+method));},5000);pending.set(n,{resolve:v=>{clearTimeout(timer);resolve(v);},reject:e=>{clearTimeout(timer);reject(e);}});ws.send(JSON.stringify({id:n,method,params}));});}
- async function evaluate(expression){const r=await cdp('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true});assert(!r.exceptionDetails,JSON.stringify(r.exceptionDetails));return r.result.value;}
- async function reload() {
-   const loaded=new Promise((resolve,reject)=>{
-     const listener=e=>{const m=JSON.parse(e.data);if(m.method==='Page.loadEventFired'){clearTimeout(timer);ws.removeEventListener('message',listener);resolve();}};
-     const timer=setTimeout(()=>{ws.removeEventListener('message',listener);reject(new Error('reload deadline'));},5000);
-     ws.addEventListener('message',listener);
-   });
-   await cdp('Page.reload');await loaded;
-   await until(()=>evaluate('document.querySelectorAll("#rows tr").length === 1'),'authenticated history lost after F5');
-   assert.equal(await evaluate('location.hash'),url.hash);
-   assert.equal(await evaluate('localStorage.length+sessionStorage.length'),0);assert.equal(await evaluate('document.cookie'),'');
- }
- for(const method of ['Page.enable','Runtime.enable','Network.enable'])await cdp(method);
- await cdp('Page.navigate',{url:link});await until(()=>evaluate('document.querySelectorAll("#rows tr").length === 1'),'capture did not render');
- assert.equal(await evaluate('location.hash'),url.hash);assert.equal(await evaluate('localStorage.length+sessionStorage.length'),0);assert.equal(await evaluate('document.cookie'),'');
- await reload();
- await evaluate('document.querySelector("#rows button").click()');await until(()=>evaluate('document.getElementById("replay-review").hidden === false'),'capture not replay eligible');
- assert(publicRequestId,'public request ID missing');assert.equal(received[0].headers['x-tnl-request-id'],publicRequestId);assert.equal(await evaluate('JSON.parse(document.getElementById("detail").textContent).request_id'),publicRequestId);
- let dom=await evaluate('document.body.innerText');for(const canary of ['RAW_QUERY_CANARY','RAW_AUTH_CANARY','RAW_COOKIE_CANARY','RAW_BODY_CANARY','RESPONSE_BODY_CANARY',cap])assert(!dom.includes(canary),'secret in DOM: '+canary);
- assert.equal(await evaluate('document.querySelectorAll("svg").length'),0);assert.equal(await evaluate('typeof globalThis.XSS'),'undefined');
- await evaluate('document.getElementById("replay-review").click()');await until(()=>evaluate('document.getElementById("replay-preview").textContent.includes("Review ONE attempt")'),'prepare did not render');
- assert.equal(received.length,1,'prepare sent a backend request');assert.equal(await evaluate('document.getElementById("replay-confirm").disabled'),true);
- await evaluate('document.getElementById("replay-ack").click()');assert.equal(await evaluate('document.getElementById("replay-confirm").disabled'),false);
- await reload();
- assert.equal(received.length,1,'F5 must not execute a prepared/acknowledged replay');
- assert.equal(await evaluate('document.getElementById("replay-ack").checked'),false);
- assert.equal(await evaluate('document.getElementById("replay-confirm").disabled'),true);
- assert.equal(mutations.length,1,'F5 must not prepare or confirm automatically');
- await evaluate('document.querySelector("#rows button").click()');await until(()=>evaluate('document.getElementById("replay-review").hidden === false'),'capture unavailable after refresh');
- await evaluate('document.getElementById("replay-review").click()');await until(()=>evaluate('document.getElementById("replay-preview").textContent.includes("Review ONE attempt")'),'fresh explicit review missing');
- assert.equal(await evaluate('document.getElementById("replay-confirm").disabled'),true);
- await evaluate('document.getElementById("replay-ack").click()');
- await evaluate('document.getElementById("replay-confirm").click();document.getElementById("replay-confirm").click()');
- await until(()=>received.length===2,'confirmed replay did not arrive');await until(()=>evaluate('document.getElementById("replay-outcome").textContent.includes("response_received")'),'linked replay outcome missing');
- assert.equal(received[1].method,received[0].method);assert.equal(received[1].url,received[0].url);assert.equal(received[1].body,received[0].body);for(const header of ['authorization','cookie','host'])assert.equal(received[1].headers[header],received[0].headers[header]);
- await delay(2300);assert.equal(received.length,2,'polling or duplicate click replayed automatically');assert.equal(mutations.length,3,'unexpected mutation count');
- dom=await evaluate('document.body.innerText');for(const canary of ['RAW_QUERY_CANARY','RAW_AUTH_CANARY','RAW_COOKIE_CANARY','RAW_BODY_CANARY','RESPONSE_BODY_CANARY',cap,confirmationToken])assert(!dom.includes(canary),'secret/ticket in DOM');assert.deepEqual(exceptions,[]);
- console.log(JSON.stringify({browser:'isolated headless Brave / local CDP; unmodified browser security headers',fragment_retained_for_refresh:true,authenticated_F5:true,F5_clears_confirmation_and_never_replays:true,authenticated_captured_record:true,backend_public_capture_ID_equal:true,secrets_absent_from_DOM:true,HTML_canary_not_executed:true,prepare_sent_nothing:true,explicit_acknowledgement_required:true,original_method_query_auth_cookie_host_body_replayed:true,duplicate_click_and_polling_no_retry:true,linked_outcome_response_received:true,POST_paths:mutations,backend_requests:received.length,JS_exceptions:exceptions},null,2));
-}finally{
- if(ws)ws.close();
- await Promise.all(children.map(p=>stopChild(p,p.spawnfile===clientBin?'SIGINT':'SIGTERM')));
- server.closeAllConnections();await new Promise(r=>server.close(r));
- fs.rmSync(root,{recursive:true,force:true});
-}
+import assert from 'node:assert/strict';
+import {withInspector, until, delay} from './inspector_browser.mjs';
+
+await withInspector(async fixture => {
+  const {client, first, received, mutations, responses, cdp, evaluate, click, tab, select, reload, privacy, inertBody, buttonExpression} = fixture;
+  await inertBody();
+  await tab('Response'); await inertBody();
+  await tab('Replay');
+  await click('Check replay availability');
+  await until(() => evaluate(`${buttonExpression('Prepare replay review')}?.disabled === false`), 'capture not eligible for replay');
+  await click('Prepare replay review');
+  await until(() => evaluate('Boolean(document.querySelector(".replay-review"))'), 'explicit prepare did not produce a review');
+  assert.equal(received.length, 1, 'prepare must send zero backend requests');
+  assert.equal(await evaluate(`${buttonExpression('Confirm replay')}.disabled`), true);
+  await privacy();
+  const accessibility = await cdp('Accessibility.getFullAXTree');
+  assert(accessibility.nodes.some(node => !node.ignored && node.role?.value === 'checkbox' && node.name?.value === 'I understand this can cause side effects'), 'replay acknowledgment must have an accessible label');
+  await evaluate('document.querySelector(".replay-ack input").focus()');
+  await cdp('Input.dispatchKeyEvent', {type: 'keyDown', key: ' ', code: 'Space', windowsVirtualKeyCode: 32});
+  await cdp('Input.dispatchKeyEvent', {type: 'keyUp', key: ' ', code: 'Space', windowsVirtualKeyCode: 32});
+  assert.equal(await evaluate('document.querySelector(".replay-ack input").checked'), true, 'keyboard acknowledgment did not toggle');
+  assert.equal(await evaluate(`${buttonExpression('Confirm replay')}.disabled`), false);
+  // Theme and remount preserve one live review, but cannot execute it.
+  await evaluate(`(() => {const theme = document.querySelector('[aria-label="Theme"]'); theme.value = 'dark'; theme.dispatchEvent(new Event('change', {bubbles: true}));})()`);
+  await tab('Request'); await tab('Replay');
+  assert.equal(await evaluate('document.querySelector(".replay-ack input").checked'), true);
+  await delay(2200);
+  assert.equal(await evaluate('document.querySelector("[data-testid=capture-id]").textContent'), first.record.capture_id, 'polling lost selection');
+  assert.equal(mutations.length, 1, 'theme/tab/remount/poll must not mutate');
+  await reload();
+  await until(() => evaluate('document.querySelectorAll("[data-capture-id]").length === 1'), 'authenticated F5 lost history');
+  assert.equal(await evaluate('new URLSearchParams(location.hash.slice(1)).get("token")'), client.cap);
+  assert.equal(await evaluate('new URLSearchParams(location.hash.slice(1)).get("theme")'), 'dark');
+  assert.equal(await evaluate('document.documentElement.dataset.theme'), 'dark');
+  assert.equal(await evaluate('Boolean(document.querySelector(".replay-ack input:checked"))'), false);
+  assert.equal(received.length, 1); assert.equal(mutations.length, 1, 'F5 must not prepare or confirm');
+  await select(first.record.capture_id); await tab('Replay');
+  assert.equal(await evaluate('Boolean(document.querySelector(".replay-review"))'), false, 'F5 restored confirmation authority');
+  assert.equal(await evaluate(`Boolean(${buttonExpression('Confirm replay')})`), false);
+  assert.equal(await evaluate(`${buttonExpression('Prepare replay review')}.disabled`), true, 'fresh availability check required');
+  await click('Check replay availability');
+  await until(() => evaluate(`${buttonExpression('Prepare replay review')}?.disabled === false`), 'fresh availability missing');
+  await click('Prepare replay review');
+  await until(() => evaluate('Boolean(document.querySelector(".replay-ack input"))'), 'fresh explicit review missing');
+  assert.equal(await evaluate('document.querySelector(".replay-ack input").checked'), false, 'fresh acknowledgment required');
+  assert.equal(await evaluate(`${buttonExpression('Confirm replay')}.disabled`), true);
+  assert.equal(received.length, 1);
+  await evaluate('document.querySelector(".replay-ack input").click()');
+  // Hold the same node and dispatch twice in one JS turn (before React can repaint).
+  await evaluate(`(() => {const confirm = ${buttonExpression('Confirm replay')}; confirm.click(); confirm.click();})()`);
+  await until(() => received.length === 2, 'confirmed replay did not arrive');
+  await until(async () => {
+    const response = await client.api('/api/v1/requests/' + first.record.capture_id);
+    return response.ok && (await response.json()).last_replay_outcome?.delivery === 'response_received';
+  }, 'server replay outcome missing');
+  await click('Check replay outcome');
+  await until(() => evaluate('document.querySelector(".replay-outcome")?.textContent.includes("response_received")'), 'linked outcome missing');
+  assert.equal(received[1].method, received[0].method);
+  assert.equal(received[1].url, received[0].url);
+  assert.deepEqual(received[1].body, received[0].body, 'replay changed original body bytes');
+  assert(received[0].wire.length > received[0].body.length, 'wire capture must include request head');
+  assert.deepEqual(received[1].wire, received[0].wire, 'replay changed the original HTTP wire bytes');
+  for (const header of ['authorization', 'cookie', 'host', 'content-type', 'content-length']) assert.equal(received[1].headers[header], received[0].headers[header]);
+  await tab('Metadata'); await tab('Replay');
+  await delay(2300);
+  const detailResponse = await client.api('/api/v1/requests/' + first.record.capture_id);
+  assert.equal(detailResponse.status, 200);
+  const detail = await detailResponse.json();
+  assert.equal(detail.last_replay_outcome.parent_capture_id, first.record.capture_id);
+  assert.equal(detail.last_replay_outcome.state, 'complete');
+  assert.equal(detail.last_replay_outcome.delivery, 'response_received');
+  assert.equal(detail.last_replay_outcome.tunnel_generation, first.record.generation);
+  await reload();
+  await until(() => evaluate('document.querySelectorAll("[data-capture-id]").length >= 1'), 'history missing after outcome F5');
+  await select(first.record.capture_id); await tab('Replay');
+  await until(() => evaluate('document.querySelector(".replay-outcome")?.textContent.includes("Last retained replay outcome (read-only)")'), 'retained linked result missing');
+  assert.equal(await evaluate('Boolean(document.querySelector(".replay-review, .replay-ack input:checked"))'), false);
+  assert.equal(received.length, 2, 'poll/theme/remount/reload or duplicate click replayed automatically');
+  assert.deepEqual(mutations, [
+    `/api/v1/requests/${first.record.capture_id}/replay/prepare`,
+    `/api/v1/requests/${first.record.capture_id}/replay/prepare`,
+    `/api/v1/requests/${first.record.capture_id}/replay/confirm`,
+  ]);
+  const posts = responses.filter(response => response.method === 'POST').map(response => ({operation: response.pathname.split('/').at(-1), status: response.status}));
+  assert.deepEqual(posts.map(response => response.operation), ['prepare', 'prepare', 'confirm']);
+  assert(posts.every(response => response.status >= 200 && response.status < 300));
+  await privacy();
+  console.log(JSON.stringify({scenario: 'replay', production_assets: true, public_backend_API_UI_ID_correlation: true, redaction_and_inert_captured_HTML_SVG: true, prepare_backend_requests: 0, fresh_ack_after_F5: true, same_turn_double_confirm_executions: 1, original_HTTP_wire_method_query_auth_cookie_host_body_bytes: true, retained_linked_outcome: true, no_automatic_mutations: true, POST_responses: posts, backend_requests: received.length}));
+});

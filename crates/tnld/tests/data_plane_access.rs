@@ -20,6 +20,9 @@ use tnld::{
 struct CountedSession(Arc<AtomicUsize>);
 #[async_trait::async_trait]
 impl Session for CountedSession {
+    fn termination(&self) -> tnl_protocol::transport::SessionTermination {
+        panic!("open-only data-plane fixture does not run a physical session owner")
+    }
     async fn open_stream(&mut self) -> anyhow::Result<Pin<Box<dyn Stream>>> {
         self.0.fetch_add(1, Ordering::SeqCst);
         anyhow::bail!("counted open failure")
@@ -54,12 +57,13 @@ async fn every_access_denial_is_before_stream_open_and_open_failure_releases_slo
     let opens = Arc::new(AtomicUsize::new(0));
     state.session_handles.insert(
         session.id.clone(),
-        SessionHandle {
-            session: Arc::new(tokio::sync::Mutex::new(Box::new(CountedSession(
+        SessionHandle::new(
+            &session,
+            Arc::new(tokio::sync::Mutex::new(Box::new(CountedSession(
                 opens.clone(),
             )))),
-            data_stream_protocol: DataStreamProtocol::Http1MetadataV1,
-        },
+            DataStreamProtocol::Http1MetadataV1,
+        ),
     );
     let basic = BasicVerifier::new(
         "user".into(),
@@ -174,12 +178,13 @@ async fn trusted_proxy_invalid_or_missing_forwarding_is_unavailable_not_proxy_al
     let opens = Arc::new(AtomicUsize::new(0));
     state.session_handles.insert(
         session.id.clone(),
-        SessionHandle {
-            session: Arc::new(tokio::sync::Mutex::new(Box::new(CountedSession(
+        SessionHandle::new(
+            &session,
+            Arc::new(tokio::sync::Mutex::new(Box::new(CountedSession(
                 opens.clone(),
             )))),
-            data_stream_protocol: DataStreamProtocol::Http1MetadataV1,
-        },
+            DataStreamProtocol::Http1MetadataV1,
+        ),
     );
     let access = Arc::new(
         CompiledAccess::new(Arc::new(

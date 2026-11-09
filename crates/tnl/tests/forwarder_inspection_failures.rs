@@ -57,6 +57,28 @@ async fn refused_connect_has_sanitized_preconnect_synth_and_zero_backend_writes(
     assert_eq!(row["request"]["headers_state"], "complete");
     assert_eq!(row["response"]["headers_state"], "complete");
     assert!(row["started_at_ms"].as_u64().unwrap() > 1_000_000);
+    let timing = &row["timing"];
+    assert_eq!(timing["availability"], "available");
+    let snapshot = &timing["snapshot"];
+    assert_eq!(snapshot["terminal"], true);
+    let intervals = &snapshot["intervals"];
+    assert_eq!(intervals["metadata"]["outcome"], "skipped");
+    assert_eq!(intervals["request_head"]["outcome"], "completed");
+    assert_eq!(intervals["resolve"]["outcome"], "skipped");
+    assert_eq!(
+        intervals["resolve"]["start_offset_us"],
+        serde_json::Value::Null
+    );
+    assert_eq!(intervals["connect"]["outcome"], "failed");
+    assert_eq!(intervals["request_write"]["outcome"], "not_started");
+    assert_eq!(
+        snapshot["backend_first_byte_offset_us"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        snapshot["backend_final_headers_offset_us"],
+        serde_json::Value::Null
+    );
 }
 #[tokio::test]
 async fn backend_malformed_probe_is_client_synth_not_a_backend_502() {
@@ -94,7 +116,63 @@ async fn backend_malformed_probe_is_client_synth_not_a_backend_502() {
     assert_eq!(row["state"], "failed");
     assert_eq!(row["status"], 502);
     assert_eq!(row["bytes_from_backend"], 0);
+    let timing = &row["timing"]["snapshot"];
+    assert!(timing["backend_first_byte_offset_us"].as_u64().is_some());
+    assert_eq!(
+        timing["backend_final_headers_offset_us"],
+        serde_json::Value::Null
+    );
+    assert_eq!(timing["intervals"]["response_read"]["outcome"], "failed");
+    assert_eq!(
+        timing["intervals"]["response_write"]["outcome"],
+        "completed"
+    );
 }
+#[tokio::test]
+async fn partial_http_looking_backend_prefix_eof_keeps_first_byte_without_final_header() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let history = Inspection::new(PreviewMode::Off);
+    let ctx = context(&history);
+    let (mut visitor, stream) = tokio::io::duplex(8192);
+    let backend = async {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 1024];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        socket.write_all(b"HTTP/1.").await.unwrap();
+    };
+    let client = async {
+        visitor
+            .write_all(b"GET / HTTP/1.1\r\nHost: local\r\n\r\n")
+            .await
+            .unwrap();
+        visitor.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        visitor.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, b"HTTP/1.");
+    };
+    let (result, (), ()) = tokio::join!(
+        forward(Box::pin(stream), Target::Explicit(addr), ctx),
+        backend,
+        client
+    );
+    result.unwrap();
+    let row = record(&history);
+    assert_eq!(row["response_source"], "backend");
+    assert_eq!(row["state"], "incomplete");
+    let timing = &row["timing"]["snapshot"];
+    assert!(timing["backend_first_byte_offset_us"].as_u64().is_some());
+    assert_eq!(
+        timing["backend_final_headers_offset_us"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        timing["response_framing_end_offset_us"],
+        serde_json::Value::Null
+    );
+    assert_eq!(timing["intervals"]["response_read"]["outcome"], "completed");
+}
+
 #[tokio::test]
 async fn cancellation_publishes_incomplete_transport_and_monotonic_duration() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -229,6 +307,19 @@ async fn no_head_and_probe_read_error_still_publish_one_record() {
             assert_eq!(row["request_boundary"], "preconnect_unavailable");
             assert_eq!(row["request"]["headers_state"], "unavailable");
             assert_eq!(row["response_source"], "client_synth");
+            let timing = &row["timing"]["snapshot"];
+            assert_eq!(
+                timing["backend_first_byte_offset_us"],
+                serde_json::Value::Null
+            );
+            assert_eq!(
+                timing["backend_final_headers_offset_us"],
+                serde_json::Value::Null
+            );
+            assert_eq!(
+                timing["response_framing_end_offset_us"],
+                serde_json::Value::Null
+            );
         } else {
             assert!(result.is_err());
             assert_eq!(row["failure_kind"], "response-probe");

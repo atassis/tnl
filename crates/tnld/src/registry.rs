@@ -52,6 +52,7 @@ pub struct TunnelBinding {
 pub struct SessionState {
     pub id: SessionId,
     pub token_name: String,
+    pub(crate) admission_cancel: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Debug, Default)]
@@ -77,6 +78,14 @@ pub enum RegistryError {
     Unavailable,
 }
 
+/// Result of checking the original control binding under the lifecycle lock.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HeartbeatStatus {
+    Active,
+    Removed,
+    InvalidSession,
+}
+
 impl Registry {
     pub fn new(hostname_root: impl Into<String>) -> Self {
         Self {
@@ -90,6 +99,7 @@ impl Registry {
         let s = Arc::new(SessionState {
             id: id.clone(),
             token_name: token_name.into(),
+            admission_cancel: tokio_util::sync::CancellationToken::new(),
         });
         self.sessions.insert(id, s.clone());
         s
@@ -116,7 +126,11 @@ impl Registry {
             .lifecycle
             .lock()
             .map_err(|_| RegistryError::Unavailable)?;
-        self.sessions.remove(session_id);
+        if let Some((_, session)) = self.sessions.remove(session_id) {
+            // Revoke all cloned data handles before cleanup can await physical IO.
+            // This cancels pending admission, not already accepted healthy streams.
+            session.admission_cancel.cancel();
+        }
 
         if grace_sec == 0 {
             // Immediate removal: collect tunnel ids first, then remove.
@@ -245,6 +259,45 @@ impl Registry {
         Ok(tunnel)
     }
 
+    pub(crate) fn heartbeat_status(
+        &self,
+        tunnel_id: &str,
+        session_id: &str,
+    ) -> Result<HeartbeatStatus, RegistryError> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| RegistryError::Unavailable)?;
+        // Session invalidation wins over absence: expiry/late cleanup is not an
+        // administrative stop notification, even after the tunnel is removed.
+        if !self.sessions.contains_key(session_id) {
+            return Ok(HeartbeatStatus::InvalidSession);
+        }
+        if !self.by_id.contains_key(tunnel_id) {
+            return Ok(HeartbeatStatus::Removed);
+        }
+        Ok(
+            if self.tunnel_state.get(tunnel_id).is_some_and(|binding| {
+                binding.session_id == session_id && matches!(binding.state, TunnelState::Active)
+            }) {
+                HeartbeatStatus::Active
+            } else {
+                HeartbeatStatus::InvalidSession
+            },
+        )
+    }
+
+    /// Linearizes wire admission against stop, expiry and ownership changes.
+    /// A successful check admits this request on its ORIGINAL binding; removal
+    /// after this point may race network writes, just like any admitted request.
+    /// No lifecycle lock is held over metadata, HTTP or other asynchronous IO.
+    pub(crate) fn admit_data_request(&self, tunnel_id: &str, session_id: &str) -> bool {
+        matches!(
+            self.heartbeat_status(tunnel_id, session_id),
+            Ok(HeartbeatStatus::Active)
+        )
+    }
+
     /// Returns the current (possibly re-attached) session id for a tunnel.
     /// Returns `None` if the tunnel doesn't exist or has no binding.
     pub fn current_session_id(&self, tunnel_id: &str) -> Option<SessionId> {
@@ -362,8 +415,9 @@ impl Registry {
     /// Remove a tunnel from the registry by subdomain.
     ///
     /// Returns `Err("not_found")` if no such tunnel exists, `Err("not_owner")`
-    /// if the caller's token doesn't match. Sessions linger; clients discover
-    /// the closure naturally on their next request.
+    /// if the caller's token doesn't match. Keep the registered control session
+    /// alive so it can deliver `RemoteStop` at the next heartbeat. If that response
+    /// is not delivered before disconnection, automatic recreation is permitted.
     pub fn close_by_subdomain(&self, subdomain: &str, owner: &str) -> Result<(), &'static str> {
         let _lifecycle = self.lifecycle.lock().map_err(|_| "unavailable")?;
         // Clone Arc so we don't hold the DashMap guard while mutating.
@@ -431,6 +485,69 @@ mod tests {
             Err(RegistryError::Unavailable)
         ));
         assert_eq!(reg.find_by_subdomain("demo").unwrap().id, tunnel.id);
+    }
+
+    #[test]
+    fn heartbeat_lookup_is_read_only_and_invalid_session_wins_over_absence() {
+        let reg = Registry::new("t.x");
+        let owner = reg.register_session("owner");
+        let other = reg.register_session("owner");
+        let tunnel = reg.create_tunnel("original", &owner.id, "owner").unwrap();
+        let snapshot = || {
+            let mut bindings: Vec<_> = reg
+                .tunnel_state
+                .iter()
+                .map(|kv| {
+                    (
+                        kv.key().clone(),
+                        kv.session_id.clone(),
+                        matches!(kv.state, TunnelState::Active),
+                    )
+                })
+                .collect();
+            bindings.sort();
+            let mut sessions: Vec<_> = reg.sessions.iter().map(|kv| kv.key().clone()).collect();
+            sessions.sort();
+            let mut names: Vec<_> = reg
+                .by_subdomain
+                .iter()
+                .map(|kv| (kv.key().clone(), kv.id.clone()))
+                .collect();
+            names.sort();
+            (bindings, sessions, names, reg.by_id.len())
+        };
+        let before = snapshot();
+        assert_eq!(
+            reg.heartbeat_status(&tunnel.id, &owner.id).unwrap(),
+            HeartbeatStatus::Active
+        );
+        assert_eq!(
+            reg.heartbeat_status(&tunnel.id, &other.id).unwrap(),
+            HeartbeatStatus::InvalidSession
+        );
+        assert_eq!(
+            reg.heartbeat_status(&tunnel.id, "unregistered").unwrap(),
+            HeartbeatStatus::InvalidSession
+        );
+        assert_eq!(snapshot(), before, "lookup mutated lifecycle state");
+        reg.close_by_subdomain("original", "owner").unwrap();
+        let before = snapshot();
+        assert_eq!(
+            reg.heartbeat_status(&tunnel.id, &owner.id).unwrap(),
+            HeartbeatStatus::Removed
+        );
+        assert_eq!(
+            reg.heartbeat_status(&tunnel.id, "unregistered").unwrap(),
+            HeartbeatStatus::InvalidSession
+        );
+        assert_eq!(snapshot(), before);
+        reg.drop_session(&owner.id, 0);
+        let before = snapshot();
+        assert_eq!(
+            reg.heartbeat_status(&tunnel.id, &owner.id).unwrap(),
+            HeartbeatStatus::InvalidSession
+        );
+        assert_eq!(snapshot(), before);
     }
 
     #[test]
@@ -626,5 +743,57 @@ mod tests {
             .sum::<usize>();
         assert_eq!(successes, 1);
         assert_eq!(registry.snapshot_infos().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn control_version_rejection_creates_no_registry_session_or_tunnel() {
+        use crate::auth::{hash_plaintext, TokenEntry, TokensFile};
+        let tokens = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tokens.path(),
+            toml::to_string(&TokensFile {
+                tokens: vec![TokenEntry {
+                    name: "version".into(),
+                    hash: hash_plaintext("tnl_VERSION").unwrap(),
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let (server, state) = crate::serve::spawn_server_with_state(crate::config::Config {
+            listen: "127.0.0.1:0".into(),
+            public_url: "http://x".into(),
+            hostname_root: "t.x".into(),
+            tokens_file: tokens.path().to_string_lossy().into_owned(),
+            session_grace_sec: 30,
+            trusted_proxies: vec![],
+        })
+        .await
+        .unwrap();
+        for version in [None, Some("future")] {
+            let mut request = reqwest::Client::new()
+                .get(format!("http://{}/control", server.local_addr))
+                .header("authorization", "Bearer tnl_VERSION")
+                .header("connection", "upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
+            if let Some(version) = version {
+                request = request.header(tnl_protocol::control::CONTROL_PROTOCOL_HEADER, version);
+            }
+            assert_eq!(
+                request.send().await.unwrap().status(),
+                http::StatusCode::UPGRADE_REQUIRED
+            );
+            assert!(
+                state.registry.sessions.is_empty(),
+                "version rejection registered a session"
+            );
+            assert!(state.registry.by_id.is_empty());
+            assert!(state.registry.by_subdomain.is_empty());
+            assert!(state.registry.tunnel_state.is_empty());
+            assert!(state.session_handles.is_empty());
+        }
+        server.join.abort();
     }
 }

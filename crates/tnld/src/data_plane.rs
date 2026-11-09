@@ -10,7 +10,7 @@ use tnl_protocol::request_metadata::{
     REQUEST_METADATA_TIMEOUT,
 };
 use tracing::Instrument as _;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::serve::AppState;
 
@@ -96,8 +96,65 @@ fn response_trailer_declaration(headers: &HeaderMap) -> Option<HeaderValue> {
     }
 }
 
+const DATA_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const WEBSOCKET_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const WEBSOCKET_RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Debug)]
+enum DataOpenFailure {
+    Timeout,
+    StaleSession,
+    Transport,
+}
+
+impl DataOpenFailure {
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::Timeout => "yamux-open-timeout",
+            Self::StaleSession => "stale-session",
+            Self::Transport => "yamux-open-failed",
+        }
+    }
+}
+
+async fn open_data_stream(
+    handle: &crate::serve::SessionHandle,
+    registry: &crate::registry::Registry,
+    tunnel_id: &str,
+    session_id: &str,
+) -> Result<std::pin::Pin<Box<dyn tnl_protocol::Stream>>, DataOpenFailure> {
+    // One budget spans BOTH acquiring the mutex and queued transport admission.
+    // Dropping either wait cancels this request only, never the physical session.
+    let deadline = tokio::time::Instant::now() + DATA_OPEN_TIMEOUT;
+    let stream = tokio::select! {
+        biased;
+        () = handle.invalidated() => return Err(DataOpenFailure::StaleSession),
+        result = tokio::time::timeout_at(deadline, async {
+            let mut session = handle.session.lock().await;
+            session.open_stream().await
+        }) => match result {
+            Err(_) => return Err(DataOpenFailure::Timeout),
+            Ok(Err(error)) => {
+                warn!(?error, "open_stream failed");
+                return Err(DataOpenFailure::Transport);
+            }
+            Ok(Ok(stream)) => stream,
+        }
+    };
+    // Tokio timeout polls a ready inner future first. Late readiness must not
+    // admit bytes merely because the opener and timer became ready together.
+    if tokio::time::Instant::now() >= deadline {
+        return Err(DataOpenFailure::Timeout);
+    }
+    // Wire-admission linearization: early protected policy/quota reservation
+    // already happened, but NO metadata/application bytes have been admitted.
+    // Check the original IDs under the lifecycle fence, never resolve the name
+    // again or retarget a visitor to a new owner. No lock crosses network IO.
+    if !registry.admit_data_request(tunnel_id, session_id) {
+        return Err(DataOpenFailure::StaleSession);
+    }
+    Ok(stream)
+}
 
 struct WebSocketHandshake {
     expected_accept: String,
@@ -535,39 +592,37 @@ async fn handle_request(
     let downstream_upgrade = websocket.as_ref().map(|_| hyper::upgrade::on(&mut req));
 
     // ---- Open a fresh substream to the client session -----------------------
-    let mut session_guard = handle.session.lock().await;
-    let mut substream = match session_guard.open_stream().await {
-        Ok(s) => s,
-        Err(e) => {
-            error!(?e, "open_stream failed");
-            warn!(
-                target: "tnl::data_plane::server_failure",
-                component = "transport",
-                method = %req.method(),
-                path = %req.uri().path(),
-                tunnel = %tunnel.subdomain,
-                req_id = %req_id,
-                "served 502 from daemon: open_stream"
-            );
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                Component::Transport,
-                &ErrorContext {
-                    component: Component::Transport,
-                    kind: Some("yamux-open-failed"),
-                    tunnel: Some(&tunnel.subdomain),
-                    target: None,
-                    reason: &format!("Could not open a tunnel substream: {e}"),
-                    hint: "Daemon transport is degraded; check `tnld` logs.",
-                    req_id,
-                    version,
-                },
-                accept,
-                None,
-            );
-        }
-    };
-    drop(session_guard);
+    let mut substream =
+        match open_data_stream(&handle, &state.registry, &tunnel.id, &session_id).await {
+            Ok(s) => s,
+            Err(failure) => {
+                warn!(
+                    target: "tnl::data_plane::server_failure",
+                    component = "transport",
+                    method = %req.method(),
+                    path = %req.uri().path(),
+                    tunnel = %tunnel.subdomain,
+                    req_id = %req_id,
+                    "served 502 from daemon: open_stream"
+                );
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    Component::Transport,
+                    &ErrorContext {
+                        component: Component::Transport,
+                        kind: Some(failure.kind()),
+                        tunnel: Some(&tunnel.subdomain),
+                        target: None,
+                        reason: "Could not admit a request on the tunnel session.",
+                        hint: "Daemon transport is degraded; check `tnld` logs.",
+                        req_id,
+                        version,
+                    },
+                    accept,
+                    None,
+                );
+            }
+        };
 
     if handle.data_stream_protocol == DataStreamProtocol::Http1MetadataV1 {
         let metadata = RequestMetadataV1 {

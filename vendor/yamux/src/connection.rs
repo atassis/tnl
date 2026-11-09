@@ -399,7 +399,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
 
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<Stream>> {
         loop {
-            if self.socket.poll_ready_unpin(cx).is_ready() {
+            let write_ready = match self.socket.poll_ready_unpin(cx) {
+                Poll::Ready(Ok(())) => true,
+                Poll::Ready(Err(error)) => {
+                    return Poll::Ready(Err(self.write_error_or_ready_goaway(cx, error)));
+                }
+                Poll::Pending => false,
+            };
+            if write_ready {
                 // Note `next_ping` does not register a waker and thus if not called regularly (idle
                 // connection) no ping is sent. This is deliberate as an idle connection does not
                 // need RTT measurements to increase its stream receive window.
@@ -420,9 +427,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                 }
             }
 
-            match self.socket.poll_flush_unpin(cx)? {
-                Poll::Ready(()) => {}
-                Poll::Pending => {}
+            match self.socket.poll_flush_unpin(cx) {
+                Poll::Ready(Err(error)) => {
+                    return Poll::Ready(Err(self.write_error_or_ready_goaway(cx, error)));
+                }
+                Poll::Ready(Ok(())) | Poll::Pending => {}
             }
 
             if self.pending_write_frame.is_none() {
@@ -487,6 +496,30 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
             // If we make it this far, at least one of the above must have registered a waker.
             return Poll::Pending;
         }
+    }
+
+    // tnl local patch: a peer can flush GoAway and close its reader before our
+    // next ping/write. Qualify only an exact, ready normal GoAway, not
+    // arbitrary BrokenPipe errors. Never wait or scan past an earlier frame,
+    // and leave healthy read/write polling order and backpressure unchanged.
+    fn write_error_or_ready_goaway(
+        &mut self,
+        cx: &mut Context<'_>,
+        error: std::io::Error,
+    ) -> ConnectionError {
+        if self.pending_read_frame.is_none() {
+            if let Poll::Ready(Some(Ok(frame))) = self.socket.poll_next_unpin(cx) {
+                let header = frame.header();
+                if header.tag() == Tag::GoAway
+                    && header.flags().val() == 0
+                    && header.stream_id().is_session()
+                    && header.len().val() == 0
+                {
+                    return ConnectionError::Closed;
+                }
+            }
+        }
+        error.into()
     }
 
     fn poll_new_outbound(&mut self, cx: &mut Context<'_>) -> Poll<Result<Stream>> {

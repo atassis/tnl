@@ -12,6 +12,7 @@
 
 use std::time::Duration;
 
+use crate::client::control::SHUTDOWN_TIMEOUT;
 use tracing::{info, warn};
 
 /// Optional hooks used in tests to inject behaviour without spawning real
@@ -102,6 +103,8 @@ pub(crate) async fn run_until_shutdown(
     shutdown: impl std::future::Future<Output = anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
     let tasks = crate::client::ForwardTasks::default();
+    #[cfg(test)]
+    tasks.observe_resources();
     let _cleanup = StopTasksOnDrop(tasks.clone());
     let result = run_loop(
         endpoint,
@@ -133,7 +136,7 @@ async fn run_loop(
 ) -> anyhow::Result<()> {
     tokio::pin!(shutdown);
     let _availability = AvailabilityGuard(hooks.inspection.clone());
-    let mut backoff_ms: u64 = 1_000;
+    let mut backoff = RetryBackoff::new();
     let mut last_tunnel: Option<(ulid::Ulid, String)> = None;
     let mut generation = crate::inspection::TunnelGeneration::new();
     let mut create_subdomain = subdomain.map(str::to_owned);
@@ -146,9 +149,10 @@ async fn run_loop(
 
     loop {
         let previous = last_tunnel.clone();
+        let attempt = crate::client::ConnectionAttempt::new();
         let result = {
             let started = std::sync::atomic::AtomicBool::new(false);
-            let mut connect = Box::pin(async {
+            let mut connect = Box::pin(attempt.finish(async {
                 started.store(true, std::sync::atomic::Ordering::Relaxed);
                 if let Some((tid, sub)) = &last_tunnel {
                     // Clone the subdomain before the borrow on `last_tunnel` ends so
@@ -156,8 +160,8 @@ async fn run_loop(
                     let tid = *tid;
                     let sub = sub.clone();
                     // Try to reattach within the grace window.
-                    match crate::client::connect_and_reattach_with_options(
-                        endpoint, token, tid, &sub, options,
+                    match crate::client::connect_and_reattach_in_attempt(
+                        endpoint, token, tid, &sub, options, &attempt,
                     )
                     .await
                     {
@@ -169,16 +173,13 @@ async fn run_loop(
                             if is_tunnel_lost(&e, options.access.is_some()) {
                                 eprintln!("info: grace window elapsed; recreating tunnel");
                                 last_tunnel = None;
-                                retain_protected_recreation_name(
-                                    &mut create_subdomain,
-                                    &sub,
-                                    options.access.is_some(),
-                                );
-                                crate::client::connect_and_create_with_options(
+                                retain_recreation_name(&mut create_subdomain, &sub);
+                                crate::client::connect_and_create_in_attempt(
                                     endpoint,
                                     token,
                                     Some(&sub),
                                     options,
+                                    &attempt,
                                 )
                                 .await
                             } else {
@@ -187,18 +188,21 @@ async fn run_loop(
                         }
                     }
                 } else if let Some(s) = create_subdomain.as_deref() {
-                    crate::client::connect_and_create_with_options(
+                    crate::client::connect_and_create_in_attempt(
                         endpoint,
                         token,
                         Some(s),
                         options,
+                        &attempt,
                     )
                     .await
                 } else {
-                    crate::client::connect_and_create_with_options(endpoint, token, None, options)
-                        .await
+                    crate::client::connect_and_create_in_attempt(
+                        endpoint, token, None, options, &attempt,
+                    )
+                    .await
                 }
-            });
+            }));
             tokio::select! {
                 biased;
                 signal = &mut shutdown => {
@@ -206,13 +210,16 @@ async fn run_loop(
                     begin_shutdown(hooks.inspection.as_ref(), tasks);
                     let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
                     if started.load(std::sync::atomic::Ordering::Relaxed) {
-                        // Retain the in-flight registration long enough to close a late ACK.
-                        let released = tokio::time::timeout_at(deadline, async {
-                            let mut connected = connect.await?;
-                            crate::client::close_control(&mut connected.control).await
-                        }).await;
-                        report_shutdown(matches!(released, Ok(Ok(()))));
+                        let released = tokio::time::timeout_at(deadline, &mut connect).await;
+                        drop(connect);
+                        if let Ok(Ok(connected)) = released {
+                            release_connected(connected, deadline).await;
+                        } else {
+                            attempt.terminate_pending().await;
+                            report_shutdown(false);
+                        }
                     } else {
+                        drop(connect);
                         release_disconnected(endpoint, token, previous.as_ref(), options).await;
                     }
                     return Ok(());
@@ -234,10 +241,11 @@ async fn run_loop(
                 if !is_recoverable(&e, options.access.is_some()) {
                     return Err(e);
                 }
-                warn!(%e, "connection failed; reconnecting in {}s", backoff_ms / 1000);
+                let delay = backoff.sample_delay()?;
+                warn!(%e, delay_ms = delay.as_millis(), "connection failed; reconnecting");
                 eprintln!(
                     "warning: connection lost ({e:#}); reconnecting in {}s",
-                    backoff_ms / 1_000
+                    delay.as_secs_f32()
                 );
                 tokio::select! {
                     biased;
@@ -247,15 +255,14 @@ async fn run_loop(
                         release_disconnected(endpoint, token, last_tunnel.as_ref(), options).await;
                         return Ok(());
                     }
-                    () = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {},
+                    () = tokio::time::sleep(delay) => {},
                 }
-                backoff_ms = (backoff_ms * 2).min(30_000);
                 continue;
             }
         };
 
-        // Successful connect: reset backoff, remember tunnel for the next reattach.
-        backoff_ms = 1_000;
+        // Registration alone is not evidence of a stable control session.
+        let established_at = tokio::time::Instant::now();
         generation = generation_for_session(
             last_tunnel.as_ref().map(|(id, _)| *id),
             session.tunnel_id,
@@ -285,7 +292,10 @@ async fn run_loop(
         }
         let cancel = hooks.cancel_first_session.take();
         // Keep the control stream alive for the duration of the session.
-        let mut control = session.control;
+        let control_shutdown = tokio_util::sync::CancellationToken::new();
+        let control = crate::client::control::ControlOwner::new(session.control, session.tunnel_id);
+        let control_run = control.run(control_shutdown.clone());
+        tokio::pin!(control_run);
         let ctx = crate::forwarder::ForwardCtx {
             #[cfg(test)]
             inspection_ownership_check: None,
@@ -306,41 +316,153 @@ async fn run_loop(
         };
         let mut accept = tasks.accept(session.session, target.clone(), ctx);
 
+        let mut failed = false;
+        let mut control_error = None;
+        tokio::select! {
+            biased;
+            result = &mut control_run => {
+                match result {
+                    Ok(crate::client::control::ControlEnd::RemoteStop) => {
+                        begin_shutdown(hooks.inspection.as_ref(), tasks);
+                        accept.stop_and_join().await;
+                        return Ok(());
+                    }
+                    Ok(crate::client::control::ControlEnd::Shutdown { .. }) => unreachable!("only this run requests shutdown"),
+                    Err(error) => {
+                        failed = is_physical_session_failure(&error);
+                        control_error = Some(error);
+                    }
+                }
+            }
+            signal = &mut shutdown => {
+                signal?;
+                begin_shutdown(hooks.inspection.as_ref(), tasks);
+                control_shutdown.cancel();
+                match control_run.await {
+                    Ok(crate::client::control::ControlEnd::RemoteStop) => {},
+                    Ok(crate::client::control::ControlEnd::Shutdown { acknowledged, unhealthy }) => {
+                        report_shutdown(acknowledged);
+                        failed = unhealthy;
+                    }
+                    Err(error) => {
+                        report_shutdown(false);
+                        failed = is_physical_session_failure(&error);
+                    }
+                }
+                accept.stop_and_join().await;
+                if failed { accept.terminate_failed().await; }
+                return Ok(());
+            }
+            r = accept.result() => {
+                match r {
+                    Ok(Ok(())) => info!("accept loop ended cleanly; reconnecting"),
+                    Ok(Err(e)) => {
+                        failed = is_physical_session_failure(&e);
+                        warn!(%e, "accept loop ended with error; reconnecting");
+                    }
+                    Err(e) => warn!(%e, "accept loop task panicked; reconnecting"),
+                }
+            }
+            () = async {
+                if let Some(rx) = cancel { let _ = rx.await; }
+                else { std::future::pending::<()>().await; }
+            } => { eprintln!("[test hook] forced disconnect"); }
+        }
+        let established_duration = established_at.elapsed();
+        if let Some(inspection) = &hooks.inspection {
+            inspection.disconnected();
+        }
+        if control_error.as_ref().is_some_and(|error| {
+            error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof)
+        }) {
+            // Driver cleanup can wake the control reader before publishing its
+            // physical cause. Observe that cause before accept cancellation can
+            // win its biased select and replace the accept result with Ok(()).
+            let cause = tokio::select! {
+                biased;
+                cause = accept.close_and_observe_cause() => Some(cause),
+                signal = &mut shutdown => {
+                    signal?;
+                    None
+                }
+            };
+            let Some(cause) = cause else {
+                // Healthy poll_close may be blocked indefinitely. Cancelling a
+                // cause watch is safe; never force an unknown/healthy outcome or
+                // wait for physical completion on this intentional-stop path.
+                begin_shutdown(hooks.inspection.as_ref(), tasks);
+                accept.stop_and_join().await;
+                report_shutdown(false);
+                return Ok(());
+            };
+            failed = matches!(
+                cause,
+                tnl_protocol::OpenStreamError::Io
+                    | tnl_protocol::OpenStreamError::Protocol
+                    | tnl_protocol::OpenStreamError::InboundOverflow
+                    | tnl_protocol::OpenStreamError::Capacity
+            );
+        }
+        // Revoke availability before cleanup and join this generation's accept
+        // owner. Ordinary reconnect (including the test hook) leaves accepted
+        // forwards run-owned; only proven physical failure cancels this generation.
+        accept.stop_and_join().await;
+        if failed {
+            accept.terminate_failed().await;
+        }
+        if let Some(error) = control_error {
+            if !is_recoverable(&error, options.access.is_some()) {
+                return Err(error);
+            }
+        }
+        backoff.observe_session(established_duration);
+        let delay = backoff.sample_delay()?;
         tokio::select! {
             biased;
             signal = &mut shutdown => {
                 signal?;
                 begin_shutdown(hooks.inspection.as_ref(), tasks);
-                let released = tokio::time::timeout(SHUTDOWN_TIMEOUT, crate::client::close_control(&mut control)).await;
-                report_shutdown(matches!(released, Ok(Ok(()))));
+                release_disconnected(endpoint, token, last_tunnel.as_ref(), options).await;
                 return Ok(());
             }
-            r = &mut accept => {
-                match r {
-                    Ok(Ok(())) => info!("accept loop ended cleanly; reconnecting"),
-                    Ok(Err(e)) => warn!(%e, "accept loop ended with error; reconnecting"),
-                    Err(e) => warn!(%e, "accept loop task panicked; reconnecting"),
-                }
-            }
-            () = async {
-                if let Some(rx) = cancel {
-                    let _ = rx.await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } => {
-                eprintln!("[test hook] forced disconnect");
-            }
+            () = tokio::time::sleep(delay) => {},
         }
-        if let Some(inspection) = &hooks.inspection {
-            inspection.disconnected();
-        }
-        // Availability is not a claim that detached forwarding tasks ended.
         // Loop restarts; next iteration tries ReattachTunnel.
     }
 }
 
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) fn is_physical_session_failure(error: &anyhow::Error) -> bool {
+    error.is::<crate::client::control::LifecycleDeadline>()
+        || matches!(
+            error.downcast_ref::<crate::client::ControlError>(),
+            Some(
+                crate::client::ControlError::Framing
+                    | crate::client::ControlError::Schema
+                    | crate::client::ControlError::Acknowledgment
+            )
+        )
+        || matches!(
+            error.downcast_ref::<crate::client::ProtectedControlError>(),
+            Some(
+                crate::client::ProtectedControlError::Framing
+                    | crate::client::ProtectedControlError::Schema
+            )
+        )
+        || matches!(
+            error.downcast_ref::<tnl_protocol::OpenStreamError>(),
+            Some(
+                tnl_protocol::OpenStreamError::Io
+                    | tnl_protocol::OpenStreamError::Protocol
+                    | tnl_protocol::OpenStreamError::InboundOverflow
+                    | tnl_protocol::OpenStreamError::Capacity
+            )
+        )
+        || error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() != std::io::ErrorKind::UnexpectedEof)
+}
 
 struct StopTasksOnDrop(crate::client::ForwardTasks);
 impl Drop for StopTasksOnDrop {
@@ -374,17 +496,49 @@ async fn release_disconnected(
     previous: Option<&(ulid::Ulid, String)>,
     options: &crate::client::TunnelOptions,
 ) {
-    let released = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
-        let (id, subdomain) = previous.ok_or_else(|| anyhow::anyhow!("no confirmed session"))?;
-        // Reattach only: cleanup must never create or delete by a reusable name.
-        let mut connected = crate::client::connect_and_reattach_with_options(
-            endpoint, token, *id, subdomain, options,
-        )
-        .await?;
-        crate::client::close_control(&mut connected.control).await
-    })
+    let Some((id, subdomain)) = previous else {
+        report_shutdown(false);
+        return;
+    };
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
+    let attempt = crate::client::ConnectionAttempt::new();
+    // Reattach only: cleanup never creates or deletes by a reusable name.
+    let released = tokio::time::timeout_at(
+        deadline,
+        crate::client::connect_and_reattach_in_attempt(
+            endpoint, token, *id, subdomain, options, &attempt,
+        ),
+    )
     .await;
-    report_shutdown(matches!(released, Ok(Ok(()))));
+    if let Ok(Ok(connected)) = released {
+        release_connected(connected, deadline).await;
+    } else {
+        attempt.terminate_pending().await;
+        report_shutdown(false);
+    }
+}
+
+async fn release_connected(
+    mut connected: crate::client::ConnectedSession,
+    deadline: tokio::time::Instant,
+) {
+    let termination = connected.session.termination();
+    let released = tokio::time::timeout_at(
+        deadline,
+        crate::client::close_control(&mut connected.control),
+    )
+    .await;
+    let confirmed = matches!(released, Ok(Ok(())));
+    let unhealthy = match released {
+        Err(_) => true,
+        Ok(Err(error)) => is_physical_session_failure(&error),
+        Ok(Ok(())) => false,
+    };
+    drop(connected);
+    if unhealthy {
+        termination.terminate_failed().await;
+    }
+    report_shutdown(confirmed);
 }
 
 struct AvailabilityGuard(Option<crate::inspection::Inspection>);
@@ -397,52 +551,59 @@ impl Drop for AvailabilityGuard {
 }
 
 /// Returns `false` for errors that cannot be fixed by retrying (bad token, etc.).
-fn retain_protected_recreation_name(
-    requested: &mut Option<String>,
-    assigned: &str,
-    protected: bool,
-) {
-    // A failed recreation after an originally random protected create must not
-    // turn the next retry into another random-hostname request.
-    if protected {
-        *requested = Some(assigned.to_owned());
-    }
+fn retain_recreation_name(requested: &mut Option<String>, assigned: &str) {
+    // A failed recreation must not turn an originally assigned name into a
+    // random-name request on the next retry, in either access mode.
+    *requested = Some(assigned.to_owned());
 }
 
-fn is_tunnel_lost(e: &anyhow::Error, protected: bool) -> bool {
-    if protected {
-        matches!(
-            e.downcast_ref::<crate::client::ProtectedControlError>(),
-            Some(crate::client::ProtectedControlError::Server(
-                tnl_protocol::ErrorCode::TunnelLost
-            ))
-        )
-    } else {
-        format!("{e:#}").contains("TunnelLost")
-    }
+fn reattach_disposition(
+    e: &anyhow::Error,
+) -> Option<tnl_protocol::control::ReattachErrorDisposition> {
+    let code = match e.downcast_ref::<crate::client::ControlError>() {
+        Some(crate::client::ControlError::Server(code)) => Some(*code),
+        _ => match e.downcast_ref::<crate::client::ProtectedControlError>() {
+            Some(crate::client::ProtectedControlError::Server(code)) => Some(*code),
+            _ => None,
+        },
+    }?;
+    Some(code.reattach_disposition())
 }
 
-fn is_recoverable(e: &anyhow::Error, protected: bool) -> bool {
-    if protected {
-        if e.downcast_ref::<crate::client::ProtectedControlError>()
+fn is_tunnel_lost(e: &anyhow::Error, _protected: bool) -> bool {
+    matches!(
+        reattach_disposition(e),
+        Some(tnl_protocol::control::ReattachErrorDisposition::Recreate)
+    )
+}
+
+fn is_recoverable(e: &anyhow::Error, _protected: bool) -> bool {
+    if e.is::<crate::client::control::LifecycleDeadline>() {
+        return true;
+    }
+    if let Some(error) = e.downcast_ref::<tnl_protocol::OpenStreamError>() {
+        return error.is_retryable_transport();
+    }
+    if let Some(disposition) = reattach_disposition(e) {
+        return disposition == tnl_protocol::control::ReattachErrorDisposition::Retry;
+    }
+    if e.downcast_ref::<crate::client::ControlError>().is_some()
+        || e.downcast_ref::<crate::client::ProtectedControlError>()
             .is_some()
-        {
-            return false;
-        }
-        if e.downcast_ref::<std::io::Error>().is_some() {
-            return true;
-        }
-        return matches!(
-            e.downcast_ref::<async_tungstenite::tungstenite::Error>(),
-            Some(
-                async_tungstenite::tungstenite::Error::Io(_)
-                    | async_tungstenite::tungstenite::Error::ConnectionClosed
-                    | async_tungstenite::tungstenite::Error::AlreadyClosed
-            )
-        );
+    {
+        return false;
     }
-    let s = format!("{e:#}").to_lowercase();
-    !(s.contains("unauthor") || s.contains("token rejected"))
+    if e.downcast_ref::<std::io::Error>().is_some() {
+        return true;
+    }
+    matches!(
+        e.downcast_ref::<async_tungstenite::tungstenite::Error>(),
+        Some(
+            async_tungstenite::tungstenite::Error::Io(_)
+                | async_tungstenite::tungstenite::Error::ConnectionClosed
+                | async_tungstenite::tungstenite::Error::AlreadyClosed
+        )
+    )
 }
 
 fn generation_for_session(
@@ -459,6 +620,39 @@ fn generation_for_session(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_session_cleanup_requires_physical_failure_not_eof_or_server_rejection() {
+        assert!(super::is_physical_session_failure(
+            &tnl_protocol::OpenStreamError::Io.into()
+        ));
+        assert!(super::is_physical_session_failure(
+            &tnl_protocol::OpenStreamError::Protocol.into()
+        ));
+        assert!(!super::is_physical_session_failure(
+            &tnl_protocol::OpenStreamError::ConnectionClosed.into()
+        ));
+        // Native yamux Capacity is fatal Cleanup/Closed, not local queue pressure.
+        for cause in [
+            tnl_protocol::OpenStreamError::Capacity,
+            tnl_protocol::OpenStreamError::InboundOverflow,
+        ] {
+            assert!(super::is_physical_session_failure(&cause.into()));
+        }
+        assert!(!super::is_physical_session_failure(
+            &std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into()
+        ));
+        for code in [
+            tnl_protocol::ErrorCode::TunnelAlreadyActive,
+            tnl_protocol::ErrorCode::TunnelLost,
+            tnl_protocol::ErrorCode::Unauthorized,
+            tnl_protocol::ErrorCode::AccessPolicyMismatch,
+        ] {
+            assert!(!super::is_physical_session_failure(&anyhow::Error::new(
+                crate::client::ControlError::Server(code)
+            )));
+        }
+    }
+
     use super::generation_for_session;
     #[test]
     fn generation_survives_reattach_but_not_recreation() {
@@ -475,9 +669,134 @@ mod tests {
 }
 
 #[cfg(test)]
+mod bootstrap_retry_tests {
+    use std::pin::Pin;
+    use std::time::Duration;
+
+    use tnl_protocol::{
+        ClosingReason, ControlMsg, CreateTunnelReq, Session as _, Stream, TunnelCreatedResp,
+    };
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    async fn read_control(stream: &mut Pin<Box<dyn Stream>>) -> ControlMsg {
+        let length = stream.read_u32().await.unwrap();
+        let mut payload = vec![0; length as usize];
+        stream.read_exact(&mut payload).await.unwrap();
+        serde_json::from_slice(&payload).unwrap()
+    }
+
+    async fn write_control(stream: &mut Pin<Box<dyn Stream>>, message: &ControlMsg) {
+        let payload = serde_json::to_vec(message).unwrap();
+        stream
+            .write_u32(u32::try_from(payload.len()).unwrap())
+            .await
+            .unwrap();
+        stream.write_all(&payload).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::result_large_err)] // tungstenite fixes the callback error type.
+    async fn run_loop_retries_after_a_control_bootstrap_transport_close() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (first_closed_tx, first_closed_rx) = oneshot::channel();
+        let (registered_tx, registered_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            // The first accepted WebSocket closes before it can provide a
+            // control stream. The second attempt is an ordered recovery proof.
+            let (first, _) = listener.accept().await.unwrap();
+            let first = async_tungstenite::tokio::accept_hdr_async(
+                first,
+                |_: &http::Request<()>, mut response: http::Response<()>| {
+                    response.headers_mut().insert(
+                        tnl_protocol::control::CONTROL_PROTOCOL_HEADER,
+                        http::HeaderValue::from_static(
+                            tnl_protocol::control::CONTROL_PROTOCOL_VERSION,
+                        ),
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            first_closed_tx.send(()).unwrap();
+            drop(first);
+
+            let (second, _) = listener.accept().await.unwrap();
+            let second = async_tungstenite::tokio::accept_hdr_async(
+                second,
+                |_: &http::Request<()>, mut response: http::Response<()>| {
+                    response.headers_mut().insert(
+                        tnl_protocol::control::CONTROL_PROTOCOL_HEADER,
+                        http::HeaderValue::from_static(
+                            tnl_protocol::control::CONTROL_PROTOCOL_VERSION,
+                        ),
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            let mut session = tnl_protocol::server_session_from_ws_generic(second);
+            let mut control = session.accept_stream().await.unwrap().unwrap();
+            assert!(matches!(
+                read_control(&mut control).await,
+                ControlMsg::CreateTunnel(CreateTunnelReq { .. })
+            ));
+            write_control(
+                &mut control,
+                &ControlMsg::TunnelCreated(TunnelCreatedResp {
+                    tunnel_id: ulid::Ulid::new(),
+                    hostname: "retry.t.test".into(),
+                    subdomain: "retry".into(),
+                }),
+            )
+            .await;
+            registered_tx.send(()).unwrap();
+            assert_eq!(read_control(&mut control).await, ControlMsg::Close);
+            write_control(
+                &mut control,
+                &ControlMsg::Closing {
+                    reason: ClosingReason::ClientShutdown,
+                },
+            )
+            .await;
+        });
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let run = tokio::spawn(async move {
+            run_until_shutdown(
+                &endpoint,
+                "tnl_TEST",
+                Some("retry"),
+                crate::target::Target::Explicit("127.0.0.1:1".parse().unwrap()),
+                crate::host_header::HostHeader::Preserve,
+                &crate::client::TunnelOptions::default(),
+                Hooks::default(),
+                async { shutdown_rx.await.map_err(anyhow::Error::from) },
+            )
+            .await
+        });
+
+        first_closed_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), registered_rx)
+            .await
+            .expect("run loop did not reach a second registration attempt")
+            .unwrap();
+        shutdown_tx.send(()).unwrap();
+        run.await.unwrap().unwrap();
+        server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
 mod protected_tests {
     use super::*;
-    use crate::client::ProtectedControlError;
+    use crate::client::{ControlError, ProtectedControlError};
     use tnl_protocol::ErrorCode;
 
     #[test]
@@ -494,6 +813,41 @@ mod protected_tests {
             )),
             true
         ));
+    }
+
+    #[test]
+    fn public_and_protected_active_owner_retries_are_typed_only() {
+        for error in [
+            anyhow::Error::new(ControlError::Server(ErrorCode::TunnelAlreadyActive)),
+            anyhow::Error::new(ProtectedControlError::Server(
+                ErrorCode::TunnelAlreadyActive,
+            )),
+        ] {
+            assert!(is_recoverable(&error, false));
+            assert!(!is_tunnel_lost(&error, false));
+        }
+        for error in [
+            anyhow::Error::new(tnl_protocol::OpenStreamError::Protocol),
+            anyhow::Error::new(tnl_protocol::OpenStreamError::Capacity),
+            anyhow::Error::new(ControlError::Server(ErrorCode::Unauthorized)),
+            anyhow::Error::new(ProtectedControlError::Server(
+                ErrorCode::AccessPolicyMismatch,
+            )),
+            anyhow::anyhow!("server message says TunnelAlreadyActive"),
+        ] {
+            assert!(!is_recoverable(&error, false));
+            assert!(!is_tunnel_lost(&error, false));
+        }
+        for error in [
+            anyhow::Error::new(tnl_protocol::OpenStreamError::ConnectionClosed),
+            anyhow::Error::new(tnl_protocol::OpenStreamError::Io).context("open control substream"),
+        ] {
+            assert!(is_recoverable(&error, false));
+            assert!(is_recoverable(&error, true));
+        }
+        let lost = anyhow::Error::new(ControlError::Server(ErrorCode::TunnelLost));
+        assert!(is_tunnel_lost(&lost, false));
+        assert!(!is_recoverable(&lost, false));
     }
 
     #[test]
@@ -529,10 +883,63 @@ mod protected_tests {
     #[test]
     fn protected_random_run_recreation_retry_retains_assigned_hostname() {
         let mut requested = None;
-        retain_protected_recreation_name(&mut requested, "assigned-random", true);
+        retain_recreation_name(&mut requested, "assigned-random");
         assert_eq!(requested.as_deref(), Some("assigned-random"));
         let mut public = None;
-        retain_protected_recreation_name(&mut public, "assigned-random", false);
-        assert!(public.is_none());
+        retain_recreation_name(&mut public, "assigned-random");
+        assert_eq!(public.as_deref(), Some("assigned-random"));
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests;
+
+#[cfg(test)]
+mod control_tests;
+
+struct RetryBackoff {
+    base_ms: u64,
+}
+impl RetryBackoff {
+    const fn new() -> Self {
+        Self { base_ms: 1_000 }
+    }
+    fn next_delay(&mut self, sample: u64) -> Duration {
+        // The capped base and 32-bit sample keep this product within u64.
+        let jitter = (self.base_ms * 2 / 5) * (sample >> 32) / u64::from(u32::MAX);
+        let delay = (self.base_ms * 4 / 5 + jitter).min(30_000);
+        self.base_ms = (self.base_ms * 2).min(30_000);
+        Duration::from_millis(delay)
+    }
+    fn observe_session(&mut self, elapsed: Duration) {
+        // Two complete heartbeat intervals distinguish a stable session from
+        // successful registration followed by immediate loss.
+        if elapsed >= Duration::from_secs(30) {
+            self.base_ms = 1_000;
+        }
+    }
+    fn sample_delay(&mut self) -> anyhow::Result<Duration> {
+        let mut bytes = [0; 8];
+        getrandom::fill(&mut bytes).map_err(|_| anyhow::anyhow!("retry jitter unavailable"))?;
+        Ok(self.next_delay(u64::from_ne_bytes(bytes)))
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+    #[test]
+    fn bounded_jitter_and_only_stable_session_resets_backoff() {
+        let mut backoff = RetryBackoff::new();
+        assert_eq!(backoff.next_delay(0), Duration::from_millis(800));
+        backoff.observe_session(Duration::from_secs(29));
+        assert_eq!(backoff.next_delay(u64::MAX), Duration::from_millis(2400));
+        for _ in 0..10 {
+            backoff.next_delay(0);
+        }
+        assert_eq!(backoff.next_delay(0), Duration::from_secs(24));
+        assert_eq!(backoff.next_delay(u64::MAX), Duration::from_secs(30));
+        backoff.observe_session(Duration::from_secs(30));
+        assert_eq!(backoff.next_delay(u64::MAX), Duration::from_millis(1200));
     }
 }

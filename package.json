@@ -1,0 +1,18 @@
+{
+  "name": "tnl-build",
+  "private": true,
+  "packageManager": "pnpm@12.18.0",
+  "engines": {
+    "node": "24.14.x"
+  },
+  "scripts": {
+    "ui:test": "pnpm --filter @tnl/inspector test",
+    "ui:lint": "pnpm --filter @tnl/inspector lint",
+    "ui:typecheck": "pnpm --filter @tnl/inspector typecheck",
+    "ui:prepare": "node tools/build-inspector.mjs",
+    "build": "node tools/build.mjs release",
+    "build:dev": "node tools/build.mjs dev",
+    "ui:contract-test": "node --test tools/generate-inspector-contract.test.mjs",
+    "ui:manifest-test": "node --test tools/inspector-manifest.test.mjs"
+  }
+}

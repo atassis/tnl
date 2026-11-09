@@ -1,9 +1,11 @@
 //! Bounded local sanitized inspection; never an executable replay snapshot.
+mod assets;
 mod history;
 mod model;
 mod observe;
 mod redact;
 mod server;
+pub(crate) mod timing;
 pub use history::Inspection;
 pub use model::{
     BodyPreview, BodyState, CaptureId, GenerationState, Header, HeadersState, InspectionRecord,

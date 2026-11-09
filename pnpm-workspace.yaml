@@ -1,0 +1,5 @@
+packages:
+  - frontend/inspector
+# GHSA-g3hv-75wg-m249; remove when tooling accepts the fixed major itself.
+overrides:
+  minimatch@10.2.6: 11.0.5

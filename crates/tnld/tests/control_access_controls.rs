@@ -42,6 +42,10 @@ async fn protected_control_exact_ack_and_basic_denial_before_any_stream_open() {
             "Sec-WebSocket-Key",
             async_tungstenite::tungstenite::handshake::client::generate_key(),
         )
+        .header(
+            tnl_protocol::control::CONTROL_PROTOCOL_HEADER,
+            tnl_protocol::control::CONTROL_PROTOCOL_VERSION,
+        )
         .header("Sec-WebSocket-Version", "13")
         .header("x-tnl-data-stream-protocol", "http1-metadata-v1")
         .body(())

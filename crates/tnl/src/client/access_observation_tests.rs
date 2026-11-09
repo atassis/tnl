@@ -70,10 +70,12 @@ async fn connect(fixture: &Fixture, options: &TunnelOptions) -> ConnectedSession
     }
     // Public control uses the same certificate-verified test edge, not a
     // plaintext shortcut or a verifier-disabled TLS connector.
+    let attempt = ConnectionAttempt::new();
     let (session, mut control, data_stream_protocol) = dial_and_open_control_with_connector(
         &fixture.endpoint,
         "tnl_TEST",
         Some(fixture.connector.clone()),
+        &attempt,
     )
     .await
     .unwrap();
@@ -156,9 +158,18 @@ async fn assert_capture(
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_access_http_ws_ids_and_raw_capture_obey_credential_boundary() {
+    // Only admission behind independent fixtures is outside the scenario budget.
+    // Keep one of the existing four reservations across all sequential modes so
+    // a later mode cannot queue behind long-clock recovery fixtures again.
+    let admission = Arc::new(
+        tokio::time::timeout(Duration::from_secs(300), FIXTURE_SLOTS.acquire())
+            .await
+            .expect("combined access/identity/capture fixture admission stalled")
+            .unwrap(),
+    );
     tokio::time::timeout(Duration::from_secs(30), async {
         for mode in 0..3 {
-            let mut fixture = fixture().await;
+            let mut fixture = fixture_with_admission(admission.clone()).await;
             let options = if mode == 2 {
                 TunnelOptions::default()
             } else {

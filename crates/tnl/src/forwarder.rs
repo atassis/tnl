@@ -30,7 +30,8 @@ use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use crate::connect::{connect_local, LOCAL_CONNECT_TIMEOUT};
+use crate::connect::{connect_local_observed, ConnectEvent, LOCAL_CONNECT_TIMEOUT};
+use crate::inspection::timing::{offset_us, Activity, Milestone, Outcome, TimingState};
 use crate::inspector::LogLine;
 use crate::peek::{
     peek_request_head, peek_response_first_line, RequestHeadProbe, ResponseProbe,
@@ -228,24 +229,40 @@ pub async fn forward(
     }
     let mut substream = CountedIo {
         inner: substream,
+        timing: None,
         counter: display.counters.as_ref().map(|c| c.to_client.clone()),
     };
     let request = RequestContext {
         metadata: match ctx.data_stream_protocol {
-            DataStreamProtocol::RawHttp1 => None,
-            DataStreamProtocol::Http1MetadataV1 => Some(
-                tokio::time::timeout(
+            DataStreamProtocol::RawHttp1 => {
+                display
+                    .timing(|state, at| state.finish_at(Activity::Metadata, Outcome::Skipped, at));
+                None
+            }
+            DataStreamProtocol::Http1MetadataV1 => {
+                display.timing(|state, at| state.start_at(Activity::Metadata, at));
+                let metadata = tokio::time::timeout(
                     REQUEST_METADATA_TIMEOUT,
                     read_request_metadata(&mut substream),
                 )
                 .await
                 .inspect_err(|_| {
                     display.failure = Some("metadata-invalid");
+                    display.timing(|state, at| {
+                        state.finish_at(Activity::Metadata, Outcome::Failed, at);
+                    });
                 })?
                 .inspect_err(|_| {
                     display.failure = Some("metadata-invalid");
-                })?,
-            ),
+                    display.timing(|state, at| {
+                        state.finish_at(Activity::Metadata, Outcome::Failed, at);
+                    });
+                })?;
+                display.timing(|state, at| {
+                    state.finish_at(Activity::Metadata, Outcome::Completed, at);
+                });
+                Some(metadata)
+            }
         },
     };
 
@@ -257,6 +274,7 @@ pub async fn forward(
         .map_or_else(ulid::Ulid::new, |m| m.request_id);
     display.metadata = request.metadata.clone();
     // Phase 1: peek request head.
+    display.timing(|state, at| state.start_at(Activity::RequestHead, at));
     let probe = peek_request_head(
         &mut substream,
         REQUEST_HEAD_PROBE_MAX,
@@ -265,8 +283,20 @@ pub async fn forward(
     .await
     .inspect_err(|_| {
         display.failure = Some("request-read");
+        display.timing(|state, at| state.finish_at(Activity::RequestHead, Outcome::Failed, at));
     })?;
     let complete_head = matches!(probe, RequestHeadProbe::Complete { .. });
+    display.timing(|state, at| {
+        state.finish_at(
+            Activity::RequestHead,
+            if complete_head {
+                Outcome::Completed
+            } else {
+                Outcome::Failed
+            },
+            at,
+        );
+    });
     let (head_bytes, leftover) = match probe {
         RequestHeadProbe::Complete { head, leftover } => (head, leftover),
         RequestHeadProbe::Capped(buf)
@@ -283,12 +313,18 @@ pub async fn forward(
     // Phase 1: connect.
     display.failure = Some("cancelled");
     #[cfg(not(test))]
-    let connect_outcome = connect_local(&target, LOCAL_CONNECT_TIMEOUT).await;
+    let connect_outcome = connect_local_observed(&target, LOCAL_CONNECT_TIMEOUT, |event| {
+        display.connect_event(event);
+    })
+    .await;
     #[cfg(test)]
     let connect_outcome = if let Some(failure) = ctx.connect_failure {
         Err(failure())
     } else {
-        connect_local(&target, LOCAL_CONNECT_TIMEOUT).await
+        connect_local_observed(&target, LOCAL_CONNECT_TIMEOUT, |event| {
+            display.connect_event(event);
+        })
+        .await
     };
     let (tcp, resolved_addr) = match connect_outcome {
         Ok((s, a)) => (s, a),
@@ -301,6 +337,7 @@ pub async fn forward(
             display.failure = Some(e.to_kind());
             display.preconnect(Some(&head_bytes));
             substream.counter = display.counters.as_ref().map(|c| c.to_client.clone());
+            substream.timing = display.io_timing(IoSide::Tunnel);
             let reason_str = e.to_string();
             let synth = synth_response_bytes(&SynthInput {
                 kind: e.to_kind(),
@@ -341,6 +378,7 @@ pub async fn forward(
     display.resolved = Some(resolved_addr);
     let mut tcp = CountedIo {
         inner: tcp,
+        timing: None,
         counter: display.counters.as_ref().map(|c| c.to_backend.clone()),
     };
     // Decide what `Host` the backend sees (dev-server allowlist smoothing).
@@ -379,6 +417,8 @@ pub async fn forward(
         display.preconnect(Some(&head_bytes));
     }
     substream.counter = display.counters.as_ref().map(|c| c.to_client.clone());
+    substream.timing = display.io_timing(IoSide::Tunnel);
+    tcp.timing = display.io_timing(IoSide::Backend);
     tcp.counter = display.counters.as_ref().map(|c| c.to_backend.clone());
     #[cfg(test)]
     if let Some(check) = ctx.inspection_ownership_check {
@@ -687,6 +727,7 @@ async fn synth_phase2<W: AsyncWrite + Unpin>(
         warn!(%req_id, error = %log_reason_for_warn, %kind, "phase-2 failure → synth");
     }
     display.failure = Some(kind);
+    display.timing(|state, at| state.finish_at(Activity::ResponseRead, Outcome::Failed, at));
     let synth = synth_response_bytes(&SynthInput {
         kind,
         reason,
@@ -789,8 +830,84 @@ fn emit_log(ctx: &ForwardCtx, mut line: LogLine) {
 
 // Counts only accepted write results, including partial writes before errors.
 // It neither observes payloads nor claims receipt by the remote application.
+#[derive(Clone, Copy)]
+enum IoSide {
+    Backend,
+    Tunnel,
+}
+struct IoTiming {
+    state: Arc<Mutex<TimingState>>,
+    started: Instant,
+    side: IoSide,
+}
+impl IoTiming {
+    fn observe(&self, operation: impl FnOnce(&mut TimingState, u64)) {
+        let mut state = self.state.lock();
+        operation(&mut state, offset_us(self.started));
+    }
+    const fn write_activity(&self) -> Activity {
+        match self.side {
+            IoSide::Backend => Activity::RequestWrite,
+            IoSide::Tunnel => Activity::ResponseWrite,
+        }
+    }
+    fn write_start(&self) {
+        self.observe(|state, at| state.start_at(self.write_activity(), at));
+    }
+    const fn direction(&self) -> crate::inspection::Direction {
+        match self.side {
+            IoSide::Backend => crate::inspection::Direction::Request,
+            IoSide::Tunnel => crate::inspection::Direction::Response,
+        }
+    }
+    fn write_error(&self) {
+        self.observe(|state, at| {
+            let activity = if state.is_upgraded() {
+                Activity::Upgraded
+            } else {
+                self.write_activity()
+            };
+            state.io_failure_at(activity, at);
+        });
+    }
+    fn read_start(&self) {
+        if matches!(self.side, IoSide::Backend) {
+            self.observe(|state, at| {
+                if !state.is_upgraded() {
+                    state.start_at(Activity::ResponseRead, at);
+                }
+            });
+        }
+    }
+    fn read_result(&self, result: &std::task::Poll<std::io::Result<()>>, nonempty: bool) {
+        if !matches!(self.side, IoSide::Backend) {
+            return;
+        }
+        self.observe(|state, at| {
+            if state.is_upgraded() {
+                if matches!(result, std::task::Poll::Ready(Err(_))) {
+                    state.io_failure_at(Activity::Upgraded, at);
+                }
+                return;
+            }
+            match result {
+                std::task::Poll::Ready(Ok(())) if nonempty => {
+                    state.milestone_at(Milestone::BackendFirstByte, at);
+                }
+                std::task::Poll::Ready(Ok(())) => {
+                    state.finish_at(Activity::ResponseRead, Outcome::Completed, at);
+                }
+                std::task::Poll::Ready(Err(_)) => {
+                    state.finish_at(Activity::ResponseRead, Outcome::Failed, at);
+                }
+                std::task::Poll::Pending => {}
+            }
+        });
+    }
+}
 struct CountedIo<T> {
     inner: T,
+    timing: Option<IoTiming>,
     counter: Option<Arc<AtomicU64>>,
 }
 impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CountedIo<T> {
@@ -799,7 +916,21 @@ impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CountedIo<T> {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let has_capacity = buf.remaining() != 0;
+        if has_capacity {
+            if let Some(timing) = &this.timing {
+                timing.read_start();
+            }
+        }
+        let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if has_capacity {
+            if let Some(timing) = &this.timing {
+                timing.read_result(&result, buf.filled().len() > before);
+            }
+        }
+        result
     }
 }
 impl<T: AsyncWrite + Unpin> AsyncWrite for CountedIo<T> {
@@ -809,8 +940,29 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for CountedIo<T> {
         bytes: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
+        if !bytes.is_empty() {
+            if let Some(timing) = &this.timing {
+                timing.write_start();
+            }
+        }
         let result = Pin::new(&mut this.inner).poll_write(cx, bytes);
+        if let Some(timing) = &this.timing {
+            if matches!(&result, std::task::Poll::Ready(Err(_)))
+                || (!bytes.is_empty() && matches!(&result, std::task::Poll::Ready(Ok(0))))
+            {
+                timing.write_error();
+            }
+        }
         if let std::task::Poll::Ready(Ok(n)) = &result {
+            if let Some(timing) = &this.timing {
+                timing.observe(|state, at| {
+                    state.accepted_at(
+                        timing.direction(),
+                        u64::try_from(*n).unwrap_or(u64::MAX),
+                        at,
+                    );
+                });
+            }
             if let Some(counter) = &this.counter {
                 let n = u64::try_from(*n).unwrap_or(u64::MAX);
                 let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -824,13 +976,31 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for CountedIo<T> {
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_flush(cx);
+        if matches!(&result, std::task::Poll::Ready(Err(_))) {
+            if let Some(timing) = &this.timing {
+                timing.write_error();
+            }
+        }
+        result
     }
     fn poll_shutdown(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_shutdown(cx);
+        if let Some(timing) = &this.timing {
+            match &result {
+                std::task::Poll::Ready(Ok(())) => {
+                    timing.observe(|state, at| state.write_shutdown_at(timing.direction(), at));
+                }
+                std::task::Poll::Ready(Err(_)) => timing.write_error(),
+                std::task::Poll::Pending => {}
+            }
+        }
+        result
     }
 }
 struct ForwardDisplay<'a> {
@@ -840,6 +1010,7 @@ struct ForwardDisplay<'a> {
     capture: Option<Arc<Mutex<crate::inspection::Capture>>>,
     attempted: bool,
     counters: Option<crate::inspection::TransportCounters>,
+    timing_state: TimingState,
     started: Instant,
     wall: u64,
     resolved: Option<std::net::SocketAddr>,
@@ -855,6 +1026,7 @@ impl<'a> ForwardDisplay<'a> {
             capture: None,
             attempted: false,
             counters: None,
+            timing_state: TimingState::new(),
             started,
             wall: crate::inspection::wall_ms(),
             resolved: None,
@@ -866,10 +1038,43 @@ impl<'a> ForwardDisplay<'a> {
     const fn owns_allocated_state(&self) -> bool {
         self.counters.is_some() || self.capture.is_some()
     }
+    fn timing(&mut self, operation: impl FnOnce(&mut TimingState, u64)) {
+        if let Some(counters) = &self.counters {
+            let mut timing = counters.timing.lock();
+            operation(&mut timing, offset_us(self.started));
+        } else {
+            operation(&mut self.timing_state, offset_us(self.started));
+        }
+    }
+    fn connect_event(&mut self, event: ConnectEvent) {
+        self.timing(|state, at| match event {
+            ConnectEvent::ResolveStarted => state.start_at(Activity::Resolve, at),
+            ConnectEvent::ResolveSkipped => {
+                state.finish_at(Activity::Resolve, Outcome::Skipped, at);
+            }
+            ConnectEvent::ResolveCompleted => {
+                state.finish_at(Activity::Resolve, Outcome::Completed, at);
+            }
+            ConnectEvent::ResolveFailed => state.finish_at(Activity::Resolve, Outcome::Failed, at),
+            ConnectEvent::ConnectStarted => state.start_at(Activity::Connect, at),
+            ConnectEvent::ConnectCompleted => {
+                state.finish_at(Activity::Connect, Outcome::Completed, at);
+            }
+            ConnectEvent::ConnectFailed => state.finish_at(Activity::Connect, Outcome::Failed, at),
+        });
+    }
+    fn io_timing(&self, side: IoSide) -> Option<IoTiming> {
+        self.counters.as_ref().map(|counters| IoTiming {
+            state: counters.timing.clone(),
+            started: self.started,
+            side,
+        })
+    }
     fn configure(&mut self, capture: &crate::inspection::Capture) {
         // Capture owns the active admission permit before any counter or label
         // allocation. A declined/closed attempt retains only borrowed context.
         self.counters = Some(crate::inspection::TransportCounters {
+            timing: Arc::new(Mutex::new(self.timing_state)),
             to_backend: Arc::new(AtomicU64::new(0)),
             to_client: Arc::new(AtomicU64::new(0)),
         });
@@ -901,6 +1106,7 @@ impl<'a> ForwardDisplay<'a> {
     }
     fn synth(&mut self, bytes: &[u8]) {
         self.source = crate::inspection::ResponseSource::ClientSynth;
+        self.timing(|state, at| state.synth_at(u64::try_from(bytes.len()).unwrap_or(u64::MAX), at));
         if let Some(capture) = &self.capture {
             capture.lock().client_synth(bytes);
         }
@@ -928,6 +1134,14 @@ impl Drop for ForwardDisplay<'_> {
                     }
                 }
                 if let Some(counters) = &self.counters {
+                    let mut timing = counters.timing.lock();
+                    let at = offset_us(self.started);
+                    if self.failure.is_none() {
+                        timing.finish_at(Activity::Upgraded, Outcome::Completed, at);
+                    }
+                    timing.finalize_at(at);
+                    r.timing = timing.snapshot_at(at);
+                    drop(timing);
                     r.bytes_to_backend = counters.to_backend.load(Ordering::Relaxed);
                     r.bytes_to_client = counters.to_client.load(Ordering::Relaxed);
                     r.bytes_from_backend =
@@ -977,12 +1191,97 @@ mod transport_count_tests {
     async fn partial_write_then_error_counts_only_accepted_bytes_and_saturates() {
         for initial in [0, u64::MAX - 1] {
             let counter = Arc::new(AtomicU64::new(initial));
+            let timing = Arc::new(Mutex::new(TimingState::new()));
             let mut writer = CountedIo {
                 inner: PartialWriter(false),
+                timing: Some(IoTiming {
+                    state: timing.clone(),
+                    started: Instant::now(),
+                    side: IoSide::Backend,
+                }),
                 counter: Some(counter.clone()),
             };
             assert!(writer.write_all(b"SECRET_PAYLOAD").await.is_err());
             assert_eq!(counter.load(Ordering::Relaxed), initial.saturating_add(3));
+            let snapshot = timing.lock().snapshot_at(1_000_000).snapshot().unwrap();
+            assert_eq!(snapshot.intervals.request_write.outcome, Outcome::Failed);
+            assert!(snapshot.intervals.request_write.start_offset_us.is_some());
+        }
+    }
+    #[derive(Clone, Copy)]
+    enum LaterWriteFailure {
+        Flush,
+        Shutdown,
+    }
+    struct CompleteThenFail(LaterWriteFailure);
+    impl AsyncWrite for CompleteThenFail {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(match self.0 {
+                LaterWriteFailure::Flush => Err(std::io::ErrorKind::BrokenPipe.into()),
+                LaterWriteFailure::Shutdown => Ok(()),
+            })
+        }
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(match self.0 {
+                LaterWriteFailure::Flush => Ok(()),
+                LaterWriteFailure::Shutdown => Err(std::io::ErrorKind::BrokenPipe.into()),
+            })
+        }
+    }
+    #[tokio::test]
+    async fn flush_or_shutdown_failure_preserves_completed_accepted_write_timing() {
+        for failure in [LaterWriteFailure::Flush, LaterWriteFailure::Shutdown] {
+            let state = Arc::new(Mutex::new(TimingState::new()));
+            {
+                let mut timing = state.lock();
+                timing.milestone_at(Milestone::RequestFramingEnd, 0);
+                timing.expect_write_end_at(crate::inspection::Direction::Request, 3, 0);
+            }
+            let origin = Instant::now();
+            let mut writer = CountedIo {
+                inner: CompleteThenFail(failure),
+                timing: Some(IoTiming {
+                    state: state.clone(),
+                    started: origin,
+                    side: IoSide::Backend,
+                }),
+                counter: None,
+            };
+            writer.write_all(b"abc").await.unwrap();
+            let completed_end = state
+                .lock()
+                .snapshot_at(offset_us(origin))
+                .snapshot()
+                .unwrap()
+                .intervals
+                .request_write
+                .end_offset_us;
+            match failure {
+                LaterWriteFailure::Flush => assert!(writer.flush().await.is_err()),
+                LaterWriteFailure::Shutdown => assert!(writer.shutdown().await.is_err()),
+            }
+            let write = state
+                .lock()
+                .snapshot_at(offset_us(origin))
+                .snapshot()
+                .unwrap()
+                .intervals
+                .request_write;
+            assert_eq!(write.outcome, Outcome::Completed);
+            assert_eq!(write.end_offset_us, completed_end);
         }
     }
 }
@@ -1116,6 +1415,108 @@ mod controlled_connect_tests {
             assert_eq!(record.bytes_to_backend, 0);
             assert!(!format!("{record:?}").contains("CANARY"));
             assert!(!serde_json::to_string(record).unwrap().contains("CANARY"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod timing_io_tests {
+    use super::*;
+    use tokio::io::AsyncRead;
+    struct FirstByteThenPending(bool);
+    impl tokio::io::AsyncRead for FirstByteThenPending {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.0 {
+                return std::task::Poll::Pending;
+            }
+            self.0 = true;
+            buf.put_slice(b"H");
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    #[tokio::test]
+    async fn timing_first_nonempty_backend_read_precedes_the_nine_byte_probe() {
+        let state = Arc::new(Mutex::new(TimingState::new()));
+        let origin = Instant::now();
+        let mut stream = CountedIo {
+            inner: FirstByteThenPending(false),
+            counter: None,
+            timing: Some(IoTiming {
+                state: state.clone(),
+                started: origin,
+                side: IoSide::Backend,
+            }),
+        };
+        {
+            let probe = peek_response_first_line(&mut stream, Duration::from_secs(30));
+            tokio::pin!(probe);
+            tokio::select! {biased; _=&mut probe=>panic!("one byte cannot finish the nine-byte prefix"), ()=std::future::ready(())=>{}}
+        }
+        let snapshot = state
+            .lock()
+            .snapshot_at(offset_us(origin))
+            .snapshot()
+            .unwrap();
+        assert!(snapshot.backend_first_byte_offset_us.is_some());
+        assert_eq!(snapshot.backend_final_headers_offset_us, None);
+        assert_eq!(snapshot.intervals.response_read.outcome, Outcome::Active);
+        assert_eq!(
+            snapshot.intervals.response_write.outcome,
+            Outcome::NotStarted
+        );
+    }
+    #[tokio::test]
+    async fn timing_empty_or_failed_reads_do_not_turn_prefilled_buffers_into_first_bytes() {
+        for fail in [false, true] {
+            let state = Arc::new(Mutex::new(TimingState::new()));
+            let origin = Instant::now();
+            let mut stream = CountedIo {
+                inner: NoProgress(fail),
+                counter: None,
+                timing: Some(IoTiming {
+                    state: state.clone(),
+                    started: origin,
+                    side: IoSide::Backend,
+                }),
+            };
+            let mut storage = [b'X'; 8];
+            let mut buf = tokio::io::ReadBuf::new(&mut storage);
+            buf.advance(1);
+            let result =
+                std::future::poll_fn(|cx| Pin::new(&mut stream).poll_read(cx, &mut buf)).await;
+            assert_eq!(result.is_err(), fail);
+            let snapshot = state
+                .lock()
+                .snapshot_at(offset_us(origin))
+                .snapshot()
+                .unwrap();
+            assert_eq!(snapshot.backend_first_byte_offset_us, None);
+            assert_eq!(
+                snapshot.intervals.response_read.outcome,
+                if fail {
+                    Outcome::Failed
+                } else {
+                    Outcome::Completed
+                }
+            );
+        }
+    }
+    struct NoProgress(bool);
+    impl tokio::io::AsyncRead for NoProgress {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(if self.0 {
+                Err(std::io::ErrorKind::ConnectionReset.into())
+            } else {
+                Ok(())
+            })
         }
     }
 }

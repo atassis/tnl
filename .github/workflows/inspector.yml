@@ -1,0 +1,83 @@
+name: Inspector checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: locked inspector and workspace checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Set up Node 24.14.1
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 24.14.1
+
+      - name: Install the rust-toolchain.toml toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)"
+          test "$toolchain" = "1.94"
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
+          rustup run "$toolchain" rustc --version | grep -E '^rustc 1\.94\.'
+
+      - name: Check formatting before generating assets
+        shell: bash
+        run: rustup run 1.94 cargo fmt --all -- --check
+
+      - name: Install locked frontend dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v24.14.1"
+          corepack enable
+          test "$(corepack pnpm --version)" = "12.18.0"
+          corepack pnpm install --frozen-lockfile
+
+      - name: Generate and check the embedded frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack pnpm ui:prepare
+          corepack pnpm ui:lint
+          corepack pnpm ui:typecheck
+          corepack pnpm ui:test
+          corepack pnpm ui:contract-test
+          corepack pnpm ui:manifest-test
+          node tools/run-inspector-guard-tests.mjs
+
+      - name: Run locked Rust checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup run 1.94 cargo clippy --locked --workspace --all-targets -- -D warnings
+          rustup run 1.94 cargo test --locked --workspace
+          corepack pnpm build
+
+      - name: Run opted-in production browser scenarios on Linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          browser=""
+          for candidate in /usr/bin/google-chrome /usr/bin/google-chrome-stable /usr/bin/chromium /usr/bin/chromium-browser; do
+            if test -x "$candidate"; then browser="$candidate"; break; fi
+          done
+          if test -z "$browser"; then
+            echo "A Chromium browser is required for inspector production scenarios; none found at the documented Ubuntu paths." >&2
+            exit 1
+          fi
+          "$browser" --version
+          TNL_TEST_CLIENT_BIN="$GITHUB_WORKSPACE/target/release/tnl" \
+          TNL_TEST_DAEMON_BIN="$GITHUB_WORKSPACE/target/release/tnld" \
+          TNL_TEST_BROWSER_BIN="$browser" \
+          rustup run 1.94 cargo test --locked -p tnl-e2e --test inspector_refresh_browser -- --ignored

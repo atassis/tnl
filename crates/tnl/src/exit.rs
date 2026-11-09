@@ -15,14 +15,27 @@ pub const EX_SERVER_UNREACHABLE: i32 = 68;
 pub const EX_SERVER_ERROR: i32 = 70;
 pub const EX_PAIRING_FAILURE: i32 = 75;
 
-/// Classify an `anyhow::Error` chain into a sysexits-style code by
-/// inspecting the rendered error string. Coarse but predictable for v0.1.0-beta;
-/// structured error variants land in 1.0.
+/// Classify an `anyhow::Error` chain into a sysexits-style code using typed
+/// errors first, with legacy rendered-message heuristics for other failures.
 pub fn classify(e: &anyhow::Error) -> i32 {
     if e.downcast_ref::<crate::access::AccessInputError>()
         .is_some()
     {
         return EX_USAGE;
+    }
+    if let Some(error) = e.downcast_ref::<crate::client::ControlError>() {
+        return match error {
+            crate::client::ControlError::Server(tnl_protocol::ErrorCode::Unauthorized) => {
+                EX_TOKEN_REJECTED
+            }
+            crate::client::ControlError::Server(tnl_protocol::ErrorCode::SubdomainTaken) => {
+                EX_SUBDOMAIN_CONFLICT
+            }
+            crate::client::ControlError::Server(_) => EX_SERVER_ERROR,
+            crate::client::ControlError::Framing
+            | crate::client::ControlError::Schema
+            | crate::client::ControlError::Acknowledgment => EX_GENERIC,
+        };
     }
     if let Some(error) = e.downcast_ref::<crate::client::ProtectedControlError>() {
         return match error {
@@ -59,6 +72,63 @@ pub fn classify(e: &anyhow::Error) -> i32 {
         return EX_PAIRING_FAILURE;
     }
     EX_GENERIC
+}
+
+#[cfg(test)]
+mod public_control_tests {
+    use crate::client::ControlError;
+    use tnl_protocol::ErrorCode;
+
+    use super::*;
+
+    const SERVER_EXIT_CODES: [(ErrorCode, i32); 11] = [
+        (ErrorCode::Internal, EX_SERVER_ERROR),
+        (ErrorCode::Unauthorized, EX_TOKEN_REJECTED),
+        (ErrorCode::SubdomainTaken, EX_SUBDOMAIN_CONFLICT),
+        (ErrorCode::InvalidSubdomain, EX_SERVER_ERROR),
+        (ErrorCode::TunnelNotFound, EX_SERVER_ERROR),
+        (ErrorCode::TunnelLost, EX_SERVER_ERROR),
+        (ErrorCode::TunnelAlreadyActive, EX_SERVER_ERROR),
+        (ErrorCode::InvalidAccessPolicy, EX_SERVER_ERROR),
+        (ErrorCode::AccessPolicyMismatch, EX_SERVER_ERROR),
+        (ErrorCode::UnsupportedProtocol, EX_SERVER_ERROR),
+        (ErrorCode::AccessUnavailable, EX_SERVER_ERROR),
+    ];
+
+    #[test]
+    fn public_server_errors_preserve_exit_codes() {
+        for (code, expected) in SERVER_EXIT_CODES {
+            let error = anyhow::Error::new(ControlError::Server(code));
+            assert_eq!(classify(&error), expected, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn context_wrapped_public_server_errors_use_codes_not_context_text() {
+        for (code, expected) in SERVER_EXIT_CODES {
+            for context in [
+                "create public tunnel",
+                "not authenticated; already in use; server error",
+            ] {
+                let error = anyhow::Error::new(ControlError::Server(code)).context(context);
+                assert_eq!(classify(&error), expected, "{code:?}: {context}");
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_public_control_responses_remain_generic_protocol_failures() {
+        for error in [
+            ControlError::Framing,
+            ControlError::Schema,
+            ControlError::Acknowledgment,
+        ] {
+            let error = anyhow::Error::new(error);
+            assert_eq!(classify(&error), EX_GENERIC);
+            let error = error.context("not authenticated; already in use; server error");
+            assert_eq!(classify(&error), EX_GENERIC);
+        }
+    }
 }
 
 #[cfg(test)]

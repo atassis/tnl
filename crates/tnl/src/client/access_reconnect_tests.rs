@@ -568,3 +568,137 @@ async fn observed_request(
     assert!(!backend.contains("authorization:"));
     captured_record(history, &request_id).await
 }
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn protected_recreation_timeout_retries_exact_policy_and_previously_assigned_name() {
+    let mut fixture = fixture().await;
+    let mut events = recording_edge(&mut fixture).await;
+    let options = options(true);
+    let original = options.access.as_ref().unwrap().clone();
+    let fingerprint = original.fingerprint().unwrap();
+    let run_options = options.clone();
+    let endpoint = fixture.endpoint.clone();
+    let backend = fixture.backend;
+    let history = crate::inspection::Inspection::new(crate::inspection::PreviewMode::Off);
+    let run_history = history.clone();
+    let (shutdown, shutdown_rx) = oneshot::channel();
+    let run = tokio::spawn(
+        TEST_TLS_CONNECTOR.scope(fixture.connector.clone(), async move {
+            crate::reconnect::run_until_shutdown(
+                &endpoint,
+                "tnl_TEST",
+                None,
+                crate::target::Target::Explicit(backend),
+                crate::host_header::HostHeader::Preserve,
+                &run_options,
+                crate::reconnect::Hooks {
+                    inspection: Some(run_history),
+                    ..crate::reconnect::Hooks::default()
+                },
+                async {
+                    shutdown_rx.await?;
+                    Ok(())
+                },
+            )
+            .await
+        }),
+    );
+    let (proceed, cut) = ready(&mut events, 1).await;
+    proceed.send(()).unwrap();
+    client_message(
+        &mut events,
+        1,
+        Lifecycle::Create {
+            subdomain: None,
+            fingerprint: fingerprint.clone(),
+        },
+        true,
+    )
+    .await;
+    let Lifecycle::Created {
+        tunnel_id: id,
+        subdomain: assigned,
+        fingerprint: ack,
+    } = server_message(&mut events, 1).await
+    else {
+        panic!("initial ACK")
+    };
+    assert_eq!(ack, fingerprint);
+    let session = fixture
+        .state
+        .registry
+        .current_session_id(&id.to_string())
+        .unwrap();
+    let before = observed_request(&mut fixture, &assigned, &history).await;
+    cut.send(()).unwrap();
+    let (proceed, _cut) = ready(&mut events, 2).await;
+    disconnected(&fixture, &session).await;
+    fixture.state.registry.gc_disconnected(Duration::ZERO);
+    proceed.send(()).unwrap();
+    client_message(
+        &mut events,
+        2,
+        Lifecycle::Reattach {
+            tunnel_id: id,
+            subdomain: assigned.clone(),
+            fingerprint: fingerprint.clone(),
+        },
+        true,
+    )
+    .await;
+    assert_eq!(
+        server_message(&mut events, 2).await,
+        Lifecycle::Error(tnl_protocol::ErrorCode::TunnelLost)
+    );
+    // Stall the verified-TLS/WS edge during the SAME reattach→create attempt.
+    let (_held_proceed, _cut) = ready(&mut events, 3).await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(20)).await;
+    tokio::time::resume();
+    let (proceed, _cut) = ready(&mut events, 4).await;
+    assert!(fixture
+        .state
+        .registry
+        .find_by_subdomain(&assigned)
+        .is_none());
+    let retained = history.get(before.capture_id).unwrap();
+    assert_eq!(
+        retained.connection,
+        crate::inspection::GenerationState::Disconnected
+    );
+    proceed.send(()).unwrap();
+    client_message(
+        &mut events,
+        4,
+        Lifecycle::Create {
+            subdomain: Some(assigned.clone()),
+            fingerprint: fingerprint.clone(),
+        },
+        true,
+    )
+    .await;
+    let Lifecycle::Created {
+        tunnel_id: recreated,
+        subdomain,
+        fingerprint: ack,
+    } = server_message(&mut events, 4).await
+    else {
+        panic!("recreated ACK")
+    };
+    assert_ne!(recreated, id);
+    assert_eq!(subdomain, assigned);
+    assert_eq!(ack, fingerprint);
+    let after = observed_request(&mut fixture, &assigned, &history).await;
+    assert_ne!(before.generation, after.generation);
+    assert_eq!(after.tunnel_id, Some(recreated));
+    assert!(Arc::ptr_eq(&original, options.access.as_ref().unwrap()));
+    shutdown.send(()).unwrap();
+    client_message(&mut events, 4, Lifecycle::Other, true).await;
+    assert_eq!(server_message(&mut events, 4).await, Lifecycle::Other);
+    run.await.unwrap().unwrap();
+    drop(fixture);
+}
+
+#[path = "recovery_qualification_tests.rs"]
+mod recovery_qualification_tests;

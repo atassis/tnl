@@ -244,6 +244,10 @@ async fn manual_session(
         .header("Authorization", "Bearer tnl_TEST")
         .header("Upgrade", "websocket")
         .header("Connection", "Upgrade")
+        .header(
+            tnl_protocol::control::CONTROL_PROTOCOL_HEADER,
+            tnl_protocol::control::CONTROL_PROTOCOL_VERSION,
+        )
         .header("Sec-WebSocket-Version", "13")
         .header(
             "Sec-WebSocket-Key",

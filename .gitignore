@@ -9,3 +9,8 @@ Cargo.lock.bak
 .DS_Store
 .worktrees/
 deploy/.env
+
+node_modules/
+frontend/inspector/dist/
+frontend/inspector/src/api/generated/
+crates/tnl/src/inspection/assets/

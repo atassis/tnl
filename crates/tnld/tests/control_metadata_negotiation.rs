@@ -40,6 +40,10 @@ async fn control_metadata_negotiation_requires_one_matching_authenticated_offer(
             .header("Authorization", "Bearer tnl_TEST")
             .header("Upgrade", "websocket")
             .header("Connection", "Upgrade")
+            .header(
+                tnl_protocol::control::CONTROL_PROTOCOL_HEADER,
+                tnl_protocol::control::CONTROL_PROTOCOL_VERSION,
+            )
             .header("Sec-WebSocket-Version", "13")
             .header(
                 "Sec-WebSocket-Key",
@@ -68,5 +72,65 @@ async fn control_metadata_negotiation_requires_one_matching_authenticated_offer(
         .unwrap();
     assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
     assert!(!response.headers().contains_key(DATA_STREAM_PROTOCOL_HEADER));
+    handle.join.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_version_rejects_missing_wrong_and_duplicate_before_upgrade() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        file.path(),
+        toml::to_string(&TokensFile {
+            tokens: vec![TokenEntry {
+                name: "test".into(),
+                hash: hash_plaintext("tnl_TEST").unwrap(),
+            }],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let (handle, state) = tnld::serve::spawn_server_with_state(Config {
+        listen: "127.0.0.1:0".into(),
+        public_url: "http://x".into(),
+        hostname_root: "t.x".into(),
+        tokens_file: file.path().to_string_lossy().into_owned(),
+        session_grace_sec: 30,
+        trusted_proxies: vec![],
+    })
+    .await
+    .unwrap();
+    for offers in [
+        vec![],
+        vec!["future"],
+        vec!["heartbeat-v1", "heartbeat-v1"],
+        vec!["heartbeat-v1, future"],
+    ] {
+        let mut request = http::Request::builder()
+            .uri(format!("ws://{}/control", handle.local_addr))
+            .header("Host", handle.local_addr.to_string())
+            .header("Authorization", "Bearer tnl_TEST")
+            .header("Upgrade", "websocket")
+            .header("Connection", "Upgrade")
+            .header("Sec-WebSocket-Version", "13")
+            .header(
+                "Sec-WebSocket-Key",
+                async_tungstenite::tungstenite::handshake::client::generate_key(),
+            );
+        for offer in offers {
+            request = request.header(tnl_protocol::control::CONTROL_PROTOCOL_HEADER, offer);
+        }
+        let result = async_tungstenite::tokio::connect_async(request.body(()).unwrap()).await;
+        let error = result.expect_err("incompatible control must not upgrade");
+        let async_tungstenite::tungstenite::Error::Http(response) = error else {
+            panic!("expected HTTP incompatibility")
+        };
+        assert_eq!(response.status(), http::StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(
+            response.headers()[tnl_protocol::control::CONTROL_PROTOCOL_HEADER],
+            tnl_protocol::control::CONTROL_PROTOCOL_VERSION
+        );
+        assert!(state.session_handles.is_empty());
+        assert!(state.registry.snapshot_infos().is_empty());
+    }
     handle.join.abort();
 }

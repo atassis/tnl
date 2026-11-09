@@ -154,10 +154,10 @@ async fn control_write(
     stream.flush().await.unwrap();
 }
 
-#[allow(clippy::too_many_lines)] // Real CLI registration, signal and delayed-control boundaries.
+#[allow(clippy::too_many_lines, clippy::result_large_err)] // Real CLI registration, signal and delayed-control boundaries.
 async fn assert_registration_shutdown(acknowledge: bool) {
     use std::io::{BufRead, BufReader, Read};
-    use tnl_protocol::{ControlMsg, Session as _};
+    use tnl_protocol::{ClosingReason, ControlMsg, Session as _};
     tokio::time::timeout(Duration::from_secs(10), async {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let cfg = tempfile::NamedTempFile::new().unwrap();
@@ -174,7 +174,20 @@ async fn assert_registration_shutdown(acknowledge: bool) {
         let (closing, closed) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (io, _) = listener.accept().await.unwrap();
-            let ws = async_tungstenite::tokio::accept_async(io).await.unwrap();
+            let ws = async_tungstenite::tokio::accept_hdr_async(
+                io,
+                |_: &http::Request<()>, mut response: http::Response<()>| {
+                    response.headers_mut().insert(
+                        tnl_protocol::control::CONTROL_PROTOCOL_HEADER,
+                        http::HeaderValue::from_static(
+                            tnl_protocol::control::CONTROL_PROTOCOL_VERSION,
+                        ),
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
             let mut session = tnl_protocol::transport::server_session_from_ws_generic(ws);
             let mut control = session.accept_stream().await.unwrap().unwrap();
             assert!(matches!(
@@ -198,7 +211,7 @@ async fn assert_registration_shutdown(acknowledge: bool) {
                 control_write(
                     &mut control,
                     &ControlMsg::Closing {
-                        reason: "client_shutdown".into(),
+                        reason: ClosingReason::ClientShutdown,
                     },
                 )
                 .await;

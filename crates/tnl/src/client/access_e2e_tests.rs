@@ -16,7 +16,7 @@ use tokio::net::{TcpListener, TcpStream};
 static FIXTURE_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 struct Fixture {
-    _auth_slot: tokio::sync::SemaphorePermit<'static>,
+    _auth_slot: Arc<tokio::sync::SemaphorePermit<'static>>,
     server: tnld::serve::ServerHandle,
     state: tnld::serve::AppState,
     endpoint: String,
@@ -28,7 +28,7 @@ struct Fixture {
     seen: tokio::sync::mpsc::UnboundedReceiver<String>,
     count: Arc<AtomicUsize>,
     release: tokio::sync::watch::Sender<bool>,
-    _tokens: tempfile::NamedTempFile,
+    tokens: tempfile::NamedTempFile,
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -47,9 +47,14 @@ async fn head(io: &mut TcpStream) -> String {
     String::from_utf8(bytes).unwrap()
 }
 
-#[allow(clippy::too_many_lines)]
 async fn fixture() -> Fixture {
-    let auth_slot = FIXTURE_SLOTS.acquire().await.unwrap();
+    let admission = Arc::new(FIXTURE_SLOTS.acquire().await.unwrap());
+    fixture_with_admission(admission).await
+}
+
+// A reservation may be reused across sequential fixtures, never concurrent ones.
+#[allow(clippy::too_many_lines)]
+async fn fixture_with_admission(auth_slot: Arc<tokio::sync::SemaphorePermit<'static>>) -> Fixture {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let tokens = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(
@@ -195,7 +200,7 @@ async fn fixture() -> Fixture {
         seen,
         count,
         release,
-        _tokens: tokens,
+        tokens,
     }
 }
 

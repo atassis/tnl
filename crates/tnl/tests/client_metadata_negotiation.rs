@@ -18,6 +18,12 @@ async fn server(echoes: Vec<Vec<&'static str>>) -> (String, tokio::task::JoinHan
             let ws = async_tungstenite::tokio::accept_hdr_async(
                 socket,
                 move |req: &http::Request<()>, mut response: http::Response<()>| {
+                    response.headers_mut().insert(
+                        tnl_protocol::control::CONTROL_PROTOCOL_HEADER,
+                        http::HeaderValue::from_static(
+                            tnl_protocol::control::CONTROL_PROTOCOL_VERSION,
+                        ),
+                    );
                     assert_eq!(
                         req.headers()
                             .get_all(DATA_STREAM_PROTOCOL_HEADER)
@@ -116,4 +122,66 @@ async fn client_metadata_negotiation_invalid_echo_is_connection_error() {
             .contains("invalid data stream protocol echo"));
         task.await.unwrap();
     }
+}
+
+#[tokio::test]
+#[allow(clippy::result_large_err)]
+async fn control_version_echo_is_required_before_any_yamux_or_registration_bytes() {
+    use futures::StreamExt as _;
+    for echoes in [vec![], vec!["future"], vec!["heartbeat-v1", "heartbeat-v1"]] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = async_tungstenite::tokio::accept_hdr_async(
+                socket,
+                move |_: &http::Request<()>, mut response: http::Response<()>| {
+                    for echo in &echoes {
+                        response.headers_mut().append(
+                            tnl_protocol::control::CONTROL_PROTOCOL_HEADER,
+                            echo.parse().unwrap(),
+                        );
+                    }
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            // Rejection must happen before constructing the yamux session (even
+            // its bootstrap ping would be evidence of mutation past the echo).
+            matches!(
+                ws.next().await,
+                Some(Ok(async_tungstenite::tungstenite::Message::Binary(_)))
+            )
+        });
+        let error = tnl::client::connect_and_create(&endpoint, "tnl_TEST", "demo")
+            .await
+            .unwrap_err();
+        let sent_data = server.await.unwrap();
+        assert!(!sent_data, "incompatible echo sent control transport bytes");
+        assert!(
+            error.to_string().contains("incompatible control protocol"),
+            "{error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn public_registration_rejects_changed_requested_name_or_reattach_identity() {
+    let (endpoint, task) = server(vec![vec![]]).await;
+    assert!(
+        tnl::client::connect_and_create(&endpoint, "tnl_TEST", "other")
+            .await
+            .is_err(),
+        "create silently changed the requested name"
+    );
+    task.await.unwrap();
+    let (endpoint, task) = server(vec![vec![]]).await;
+    assert!(
+        tnl::client::connect_and_reattach(&endpoint, "tnl_TEST", ulid::Ulid::new(), "demo")
+            .await
+            .is_err(),
+        "reattach silently changed tunnel identity"
+    );
+    task.await.unwrap();
 }
